@@ -1,11 +1,11 @@
 //
-//  Tweak.x — RunningDotIndicator v1.4.3
-//  v1.4.3 紧急修复：
-//    ✅ 所有重量级初始化延迟 15 秒（避免阻塞 SpringBoard 启动导致黑屏）
-//    ✅ %ctor 只做最轻量工作：注册通知 + 写日志
-//    ✅ 移除 SBApplicationController.runningApplications（已知崩溃）
-//    ✅ 移除 SBApplication._noteProcess:didChangeToState: hook（未验证）
-//    ✅ 移除测试蓝点（减少干扰）
+//  Tweak.x — RunningDotIndicator v1.4.4
+//  v1.4.4 紧急修复：
+//    ✅ 移除 SBMainWorkspace hook（arg2/arg3 是 NSInteger 枚举不是 id 对象 → EXC_BAD_ACCESS）
+//    ✅ 保留延迟初始化（15秒后执行重量级工作）
+//    ✅ 保留 NSFileManager path cache（1033 apps 缓存成功）
+//    ✅ 保留 proc_listallpids 进程枚举
+//    ✅ 保留生命周期通知（SBApplicationDidExitNotification 等）
 //  紧急开关：/var/mobile/Documents/rd_disabled 存在则整机不生效。
 //
 
@@ -29,17 +29,8 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 - (NSString *)applicationBundleID;
 @end
 
-// SBMainWorkspace — iOS 16 进程状态变更入口
-@interface SBMainWorkspace : NSObject
-@end
-
 // ─── 常量 ──────────────────────────────────────────────────
 static NSInteger const kDotTag  = 9999;
-
-// ─── taskState 枚举 ──────────────────────────────────────────
-static int const kTaskStateDead      = 1;  // 进程已终止
-static int const kTaskStateRunning   = 2;  // 进程正在运行（前台）
-static int const kTaskStateSuspended = 3;  // 进程已挂起（后台）
 
 // ─── 全局状态 ─────────────────────────────────────────────
 static int   sCallCount    = 0;
@@ -231,7 +222,7 @@ static NSString *MKBidFromPath(NSString *fullPath) {
     return nil;
 }
 
-// ─── 进程枚举（回退策略）──────────────────
+// ─── 进程枚举 ──────────
 static void MKComputeRunningSet() {
     @try {
         int pidBuf[512];
@@ -305,6 +296,17 @@ static void MKComputeRunningSet() {
             if (![sRunningSet containsObject:bid]) {
                 MKAddToRunningSet(bid);
                 supplemented++;
+            }
+        }
+
+        // 也清理不在进程列表中的 App（除非刚通过通知添加）
+        // 只在 sInitDone 之后才清理，避免误删通知添加的
+        if (sInitDone && sRunningSet.count > 0) {
+            for (NSString *bid in [sRunningSet copy]) {
+                if (![procSet containsObject:bid]) {
+                    MKRemoveFromRunningSet(bid);
+                    RDLog(@"PROC cleanup: removed %@ (not in process list)", bid);
+                }
             }
         }
 
@@ -491,7 +493,7 @@ static void MKRefreshAllIcons() {
 }
 
 // ====================================================================
-// 延迟初始化（核心修复：15 秒后执行，不阻塞 SpringBoard 启动）
+// 延迟初始化（15 秒后执行，不阻塞 SpringBoard 启动）
 // ====================================================================
 
 static void MKDelayedInit() {
@@ -505,10 +507,6 @@ static void MKDelayedInit() {
     MKComputeRunningSet();
 
     RDLog(@"DELAYED INIT: runningSet has %lu items", (unsigned long)sRunningSet.count);
-
-    // ─── 步骤 3：检查 SBMainWorkspace hook 是否已触发 ──────
-    // 如果 SBMainWorkspace hook 已经在延迟期间收到了状态变更通知，
-    // runningSet 可能已经有内容了。进程枚举只是补充。
 
     // ─── 标记初始化完成 ──────
     sInitDone = YES;
@@ -569,148 +567,29 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %end
 
 // ====================================================================
-// Hook — SBMainWorkspace（实时进程状态检测）
-// process:stateDidChangeFromState:toState:
-// arg1 = 进程对象（有 bundleIdentifier 或 applicationInfo.bundleIdentifier）
-// arg3 = 状态对象（有 taskState: 1=Dead, 2=Running, 3=Suspended）
+// ⚠️ v1.4.4 已移除 SBMainWorkspace hook
+// 崩溃原因：process:stateDidChangeFromState:toState: 的 arg2/arg3
+// 是 FBProcessState 枚举值（NSInteger），不是 id 对象。
+// 对整数 2 调用 respondsToSelector: → objc_msgSend(0x2, ...) → EXC_BAD_ACCESS
 // ====================================================================
 
-%hook SBMainWorkspace
-
-- (void)process:(id)arg1 stateDidChangeFromState:(id)arg2 toState:(id)arg3 {
-    %orig;
-
-    @try {
-        // ─── 提取 bundleIdentifier ──────────
-        NSString *bid = nil;
-        if ([arg1 respondsToSelector:NSSelectorFromString(@"bundleIdentifier")]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            bid = [arg1 performSelector:NSSelectorFromString(@"bundleIdentifier")];
-#pragma clang diagnostic pop
-        }
-        if (!bid && [arg1 respondsToSelector:NSSelectorFromString(@"applicationInfo")]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            id appInfo = [arg1 performSelector:NSSelectorFromString(@"applicationInfo")];
-            if (appInfo && [appInfo respondsToSelector:NSSelectorFromString(@"bundleIdentifier")]) {
-                bid = [appInfo performSelector:NSSelectorFromString(@"bundleIdentifier")];
-            }
-#pragma clang diagnostic pop
-        }
-
-        // ─── 提取 taskState ──────────────────
-        int newState = 0;
-        if ([arg3 respondsToSelector:NSSelectorFromString(@"taskState")]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            newState = [[arg3 performSelector:NSSelectorFromString(@"taskState")] intValue];
-#pragma clang diagnostic pop
-        }
-        // taskState 不响应时，尝试描述字符串解析
-        if (newState == 0 && arg3) {
-            NSString *desc = [arg3 description];
-            if ([desc containsString:@"Running"]) newState = kTaskStateRunning;
-            else if ([desc containsString:@"Suspended"]) newState = kTaskStateSuspended;
-            else if ([desc containsString:@"Dead"] || [desc containsString:@"NotRunning"]) newState = kTaskStateDead;
-        }
-
-        static int sHookLogs = 0;
-        if (sHookLogs < 50) {
-            sHookLogs++;
-            RDLog(@"SBWS: %@ state=%d (arg1=%s arg3=%s)",
-                  bid ?: @"(nil)", newState,
-                  arg1 ? NSStringFromClass([arg1 class]).UTF8String : "nil",
-                  arg3 ? NSStringFromClass([arg3 class]).UTF8String : "nil");
-        }
-
-        if (!bid.length) return;
-
-        // ─── 更新 runningSet ──────────────
-        if (newState == kTaskStateRunning || newState == kTaskStateSuspended) {
-            MKAddToRunningSet(bid);
-            RDLog(@"SBWS: + %@ (state=%d)", bid, newState);
-            if (sInitDone) MKRefreshAllIcons();
-        } else if (newState == kTaskStateDead) {
-            MKRemoveFromRunningSet(bid);
-            RDLog(@"SBWS: - %@ (state=%d)", bid, newState);
-            if (sInitDone) MKRefreshAllIcons();
-        }
-
-    } @catch (NSException *e) {
-        RDLog(@"SBWS exception: %@", e.reason);
-    }
-}
-
-%end
-
 // ====================================================================
-// Hook — SBMainSwitcherController（补充检测入口）
-// ====================================================================
-
-%hook SBMainSwitcherController
-
-- (void)_appActivationStateDidChange:(NSNotification *)notification {
-    %orig;
-    @try {
-        NSString *bid = MKBidFromNote(notification);
-        if (!bid.length) return;
-
-        id stateVal = notification.userInfo[@"applicationState"];
-        if (!stateVal) stateVal = notification.userInfo[@"activationState"];
-        if (!stateVal) stateVal = notification.userInfo[@"state"];
-
-        if (stateVal && [stateVal isKindOfClass:[NSNumber class]]) {
-            int state = [(NSNumber *)stateVal intValue];
-            if (state > 0) {
-                MKAddToRunningSet(bid);
-                RDLog(@"_appActState: ADD %@ state=%d", bid, state);
-            } else {
-                MKRemoveFromRunningSet(bid);
-                RDLog(@"_appActState: REMOVE %@ state=%d", bid, state);
-            }
-            if (sInitDone) MKRefreshAllIcons();
-        }
-    } @catch (NSException *e) {
-        RDLog(@"_appActState exception: %@", e.reason);
-    }
-}
-
-%end
-
-%hook SBSceneSwitcherController
-
-- (void)_appActivationStateDidChange:(NSNotification *)notification {
-    %orig;
-    @try {
-        NSString *bid = MKBidFromNote(notification);
-        if (bid.length) {
-            MKAddToRunningSet(bid);
-            RDLog(@"_appActState(SBScene): %@", bid);
-            if (sInitDone) MKRefreshAllIcons();
-        }
-    } @catch (NSException *e) {}
-}
-
-%end
-
-// ====================================================================
-// 构造函数（v1.4.3 核心修复：只做最轻量工作）
+// 构造函数（只做最轻量工作）
 // ====================================================================
 
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.4.3 ctor: minimal init (heavy work delayed 15s)");
-    RDLog(@"======== v1.4.3 loading (minimal ctor) ========");
+    NSLog(@"[RunningDotIndicator] v1.4.4 ctor: minimal init (SBMainWorkspace hook REMOVED)");
+    RDLog(@"======== v1.4.4 loading (SBWS hook removed, safe) ========");
 
-    // ⚠️ 紧急开关检查（最轻量，只检查文件是否存在）
+    // ⚠️ 紧急开关检查
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
         return;
     }
 
-    // ─── 只注册最轻量的通知（不执行任何重量级操作）──────────
+    // ─── 只注册最轻量的通知 ──────────
     CFNotificationCenterAddObserver(
         CFNotificationCenterGetDarwinNotifyCenter(),
         NULL, MKPrefsChangedCallback,
@@ -723,7 +602,7 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
         CFSTR("com.mk.runningdotindicator.respring"),
         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
-    // ─── 生命周期通知（轻量注册，不执行扫描）──────────
+    // ─── 生命周期通知 ──────────
     if (!sLifecycleObservers) sLifecycleObservers = [NSMutableArray array];
     NSDictionary *lifecycleActions = @{
         @"SBApplicationDidFinishLaunchingNotification":      @"add",
@@ -766,18 +645,17 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 
     RDLog(@"======== ctor done (heavy work pending) ========");
 
-    // ─── 延迟 15 秒执行重量级初始化 ──────────────────────
-    // SpringBoard 启动约需 5-8 秒，15 秒延迟确保它完全加载后才开始扫描
+    // ─── 延迟 15 秒执行重量级初始化 ──────────
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
         MKSafe(^{ MKDelayedInit(); });
     });
 
-    // ─── 定时刷新：每 8 秒（延迟初始化后才生效）───────
+    // ─── 定时刷新：每 8 秒 ──────────
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                                       dispatch_get_main_queue());
     dispatch_source_set_timer(timer,
-                              dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC),  // 首次 20 秒后
+                              dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC),
                               8 * NSEC_PER_SEC, 1.0 * NSEC_PER_SEC);
     dispatch_source_set_event_handler(timer, ^{
         MKSafe(^{ if (sInitDone) { MKComputeRunningSet(); MKRefreshAllIcons(); } });
