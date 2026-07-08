@@ -2,7 +2,8 @@
 //  MKIndicatorDotView.h
 //  RunningDotIndicator
 //
-//  自绘指示点视图, 支持圆形/方形/三角形/菱形/五角星/心形。
+//  v1.4.8: 简化为两种形状 — 圆点 (Dot) 和横条 (Bar/Pill)
+//  位置固定：替换 App 名字标签区域
 //
 
 #import <UIKit/UIKit.h>

@@ -10,9 +10,9 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>RunningDotIndicator 1.2.0</string>
+			<string>RunningDotIndicator 1.4.8</string>
 			<key>footerText</key>
-			<string>在桌面上为「运行中」的 App(仍在多任务里)添加指示点, 一眼看出哪些 App 在后台运行。修改后即时生效, 无需注销。</string>
+			<string>为运行中的 App 图标添加指示器。App 运行时自动替换图标下方的名称文字，退出后恢复原名称。灵感来自 Lynx2 Dock 指示器。</string>
 		</dict>
 
 		<!-- ===== 总开关 ===== -->
@@ -31,14 +31,142 @@
 			<string>com.mk.runningdotindicator.reload</string>
 		</dict>
 
-		<!-- ===== 颜色(预设) ===== -->
+		<!-- ===== 形状 ===== -->
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>形状</string>
+			<key>footerText</key>
+			<string>圆点：经典圆形指示器。横条：圆角矩形(pill)条形指示器。指示器会替换 App 图标下方的名称文字。</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSLinkListCell</string>
+			<key>detail</key>
+			<string>PSListItemsController</string>
+			<key>label</key>
+			<string>指示器形状</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>shape</string>
+			<key>default</key>
+			<integer>0</integer>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+			<key>validTitles</key>
+			<array>
+				<string>圆点</string>
+				<string>横条</string>
+			</array>
+			<key>validValues</key>
+			<array>
+				<integer>0</integer>
+				<integer>1</integer>
+			</array>
+		</dict>
+
+		<!-- ===== 圆点大小 ===== -->
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>圆点大小</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>label</key>
+			<string>圆点直径</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>dotSize</string>
+			<key>default</key>
+			<real>6</real>
+			<key>min</key>
+			<real>3</real>
+			<key>max</key>
+			<real>12</real>
+			<key>isSegmented</key>
+			<true/>
+			<key>segmentCount</key>
+			<integer>9</integer>
+			<key>showValue</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+		</dict>
+
+		<!-- ===== 横条尺寸 ===== -->
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>横条尺寸</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>label</key>
+			<string>横条宽度</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>barWidth</string>
+			<key>default</key>
+			<real>24</real>
+			<key>min</key>
+			<real>12</real>
+			<key>max</key>
+			<real>48</real>
+			<key>isSegmented</key>
+			<true/>
+			<key>segmentCount</key>
+			<integer>12</integer>
+			<key>showValue</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>label</key>
+			<string>横条高度</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>barHeight</string>
+			<key>default</key>
+			<real>4</real>
+			<key>min</key>
+			<real>2</real>
+			<key>max</key>
+			<real>8</real>
+			<key>isSegmented</key>
+			<true/>
+			<key>segmentCount</key>
+			<integer>6</integer>
+			<key>showValue</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+		</dict>
+
+		<!-- ===== 颜色 ===== -->
 		<dict>
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
 			<string>颜色</string>
 			<key>footerText</key>
-			<string>从预设中选择, 或在下方输入自定义十六进制颜色。自定义颜色优先于预设。</string>
+			<string>从预设中选择，或在下方输入自定义十六进制颜色。自定义颜色优先。</string>
 		</dict>
 
 		<dict>
@@ -90,7 +218,7 @@
 			</array>
 		</dict>
 
-		<!-- ===== 自定义十六进制颜色 ===== -->
+		<!-- ===== 自定义颜色 ===== -->
 		<dict>
 			<key>cell</key>
 			<string>PSEditTextCell</string>
@@ -114,115 +242,14 @@
 			<string>No</string>
 		</dict>
 
-		<!-- ===== 形状 ===== -->
-		<dict>
-			<key>cell</key>
-			<string>PSGroupCell</string>
-			<key>label</key>
-			<string>外观</string>
-		</dict>
-
-		<dict>
-			<key>cell</key>
-			<string>PSLinkListCell</string>
-			<key>detail</key>
-			<string>PSListItemsController</string>
-			<key>label</key>
-			<string>指示点形状</string>
-			<key>defaults</key>
-			<string>com.mk.runningdotindicatorprefs</string>
-			<key>key</key>
-			<string>shape</string>
-			<key>default</key>
-			<integer>0</integer>
-			<key>PostNotification</key>
-			<string>com.mk.runningdotindicator.reload</string>
-			<key>validTitles</key>
-			<array>
-				<string>圆形</string>
-				<string>方形</string>
-				<string>三角形</string>
-				<string>菱形</string>
-				<string>五角星</string>
-				<string>心形</string>
-			</array>
-			<key>validValues</key>
-			<array>
-				<integer>0</integer>
-				<integer>1</integer>
-				<integer>2</integer>
-				<integer>3</integer>
-				<integer>4</integer>
-				<integer>5</integer>
-			</array>
-		</dict>
-
-		<!-- ===== 大小 ===== -->
-		<dict>
-			<key>cell</key>
-			<string>PSSliderCell</string>
-			<key>label</key>
-			<string>指示点大小</string>
-			<key>defaults</key>
-			<string>com.mk.runningdotindicatorprefs</string>
-			<key>key</key>
-			<string>size</string>
-			<key>default</key>
-			<real>6</real>
-			<key>min</key>
-			<real>3</real>
-			<key>max</key>
-			<real>14</real>
-			<key>isSegmented</key>
-			<true/>
-			<key>segmentCount</key>
-			<integer>11</integer>
-			<key>showValue</key>
-			<true/>
-			<key>PostNotification</key>
-			<string>com.mk.runningdotindicator.reload</string>
-		</dict>
-
-		<!-- ===== 位置 ===== -->
-		<dict>
-			<key>cell</key>
-			<string>PSGroupCell</string>
-			<key>label</key>
-			<string>位置</string>
-			<key>footerText</key>
-			<string>替换名称: App 运行中时隐藏图标下方的文字, 直接用指示点替代。停止运行后自动恢复名称。</string>
-		</dict>
-
-		<dict>
-			<key>cell</key>
-			<string>PSLinkListCell</string>
-			<key>detail</key>
-			<string>PSListItemsController</string>
-			<key>label</key>
-			<string>指示点位置</string>
-			<key>defaults</key>
-			<string>com.mk.runningdotindicatorprefs</string>
-			<key>key</key>
-			<string>position</string>
-			<key>default</key>
-			<integer>0</integer>
-			<key>PostNotification</key>
-			<string>com.mk.runningdotindicator.reload</string>
-			<key>validTitles</key>
-			<array>
-				<string>名称左侧</string>
-				<string>名称右侧</string>
-				<string>替换名称</string>
-			</array>
-			<key>validValues</key>
-			<array>
-				<integer>0</integer>
-				<integer>1</integer>
-				<integer>2</integer>
-			</array>
-		</dict>
-
 		<!-- ===== 不透明度 ===== -->
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>不透明度</string>
+		</dict>
+
 		<dict>
 			<key>cell</key>
 			<string>PSSliderCell</string>
@@ -255,7 +282,7 @@
 			<key>label</key>
 			<string>操作</string>
 			<key>footerText</key>
-			<string>修改后无需手动刷新, 指示点会自动更新。如遇异常可注销重启 SpringBoard。</string>
+			<string>修改后即时生效无需注销。如遇异常可注销重启 SpringBoard。</string>
 		</dict>
 
 		<dict>
@@ -272,6 +299,6 @@
 	</array>
 
 	<key>title</key>
-	<string>运行指示点</string>
+	<string>运行指示器</string>
 </dict>
 </plist>

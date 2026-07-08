@@ -1,10 +1,10 @@
 //
-//  Tweak.x — RunningDotIndicator v1.4.7
-//  v1.4.7: ✅ 核心检测已验证成功！优化版：
-//    - 黑名单精简：只过滤无桌面图标的纯后台服务（用户手动打开的系统App也显示绿点）
-//    - 移除 com.apple.weather/camera 黑名单（_setInternalProcState 更准确）
-//    - 移除 8秒定时器（hook 已实时检测，不需要补充扫描）
-//    - 日志级别降低（检测稳定后减少刷屏）
+//  Tweak.x — RunningDotIndicator v1.4.8
+//  v1.4.8: Lynx2 风格重构 — 两种形状（圆点/横条），固定替换 App 名字位置
+//    ✅ 核心检测已验证成功（_setInternalProcessState hook）
+//    ✅ 简化 UI：只有圆点(Dot)和横条(Bar/Pill)两种形状
+//    ✅ 位置固定：替换 App 名字标签区域（运行中→指示器，退出→恢复名字）
+//    ✅ 移除 6 种复杂形状、3 种位置选项
 //  紧急开关：/var/mobile/Documents/rd_disabled 存在则整机不生效。
 //
 
@@ -458,12 +458,14 @@ static int MKGetIntFromState(id stateObj, NSString *propName) {
 }
 
 // ====================================================================
-// 渲染辅助
+// 渲染辅助 — Lynx2 风格：替换 App 名字标签区域
 // ====================================================================
 
+// 找到 SBIconView 中的名字标签视图
 static UIView *MKFindLabelView(SBIconView *iconView) {
     for (UIView *sv in iconView.subviews) {
         NSString *cls = NSStringFromClass([sv class]);
+        // iOS 16 的 App 名字标签可能是 UILabel 或 SBIconLabelView
         if ([sv isKindOfClass:[UILabel class]] ||
             [cls containsString:@"Label"] || [cls containsString:@"label"]) {
             return sv;
@@ -473,7 +475,7 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
 }
 
 // ====================================================================
-// 主更新函数
+// 主更新函数 — Lynx2 风格：运行中→指示器替换名字，退出→恢复名字
 // ====================================================================
 
 static void MKUpdate(SBIconView *self) {
@@ -482,6 +484,7 @@ static void MKUpdate(SBIconView *self) {
 
         sCallCount++;
         if (MKIsDisabled()) {
+            // 禁用时：移除指示器，恢复名字标签
             [[self viewWithTag:kDotTag] removeFromSuperview];
             UIView *label = MKFindLabelView(self);
             if (label) label.hidden = NO;
@@ -490,6 +493,7 @@ static void MKUpdate(SBIconView *self) {
 
         MKConfig *cfg = [MKConfig sharedConfig];
         if (!cfg || !cfg.enabled) {
+            // 未启用：移除指示器，恢复名字标签
             [[self viewWithTag:kDotTag] removeFromSuperview];
             UIView *label = MKFindLabelView(self);
             if (label) label.hidden = NO;
@@ -504,56 +508,61 @@ static void MKUpdate(SBIconView *self) {
         if (!bundleID || bundleID.length == 0) return;
 
         BOOL running = MKIsAppRunning(bundleID);
+
+        UIView *label = MKFindLabelView(self);
+
         if (!running) {
+            // ── App 不在运行 → 移除指示器，恢复名字 ──
             [[self viewWithTag:kDotTag] removeFromSuperview];
-            if (cfg.position == MKPositionReplaceName) {
-                UIView *label = MKFindLabelView(self);
-                if (label) label.hidden = NO;
-            }
+            if (label) label.hidden = NO;
             return;
         }
 
         RDLogRunning(bundleID);
 
-        CGFloat sz = cfg.size;
+        // ── App 正在运行 → 隐藏名字，显示指示器 ──
+        if (label) label.hidden = YES;
+
+        CGSize mySize = self.bounds.size;
+        if (mySize.width < 10 || mySize.height < 10) return;
+
+        // 计算指示器尺寸和位置
+        CGFloat indicatorW, indicatorH;
+        if (cfg.shape == MKShapeDot) {
+            indicatorW = cfg.dotSize;
+            indicatorH = cfg.dotSize;
+        } else {
+            // Bar/Pill 形状
+            indicatorW = cfg.barWidth;
+            indicatorH = cfg.barHeight;
+        }
+
+        // 指示器放在名字标签区域：图标底部，居中
+        // 标签通常在图标底部 ~30pt 区域
+        CGFloat labelAreaY = mySize.height - indicatorH - 2.0f;
+        CGFloat indicatorX = (mySize.width - indicatorW) / 2.0f;
+
         UIView *existing = [self viewWithTag:kDotTag];
         if (existing && ![existing isKindOfClass:[MKIndicatorDotView class]]) {
             [existing removeFromSuperview];
             existing = nil;
         }
+
         if (!existing) {
-            MKIndicatorDotView *dot = [[MKIndicatorDotView alloc] initWithFrame:CGRectMake(0, 0, sz, sz)];
-            dot.tag = kDotTag;
-            dot.backgroundColor = cfg.color;
-            dot.layer.cornerRadius = (cfg.shape == MKShapeCircle) ? sz / 2.0 : 0;
-            dot.clipsToBounds = (cfg.shape != MKShapeCircle);
-            [self addSubview:dot];
+            MKIndicatorDotView *indicator = [[MKIndicatorDotView alloc]
+                initWithFrame:CGRectMake(indicatorX, labelAreaY, indicatorW, indicatorH)];
+            indicator.tag = kDotTag;
+            [indicator applyConfig];
+            [self addSubview:indicator];
         }
-        UIView *dot = [self viewWithTag:kDotTag];
-        if (!dot) return;
-        dot.backgroundColor = cfg.color;
-        dot.layer.cornerRadius = (cfg.shape == MKShapeCircle) ? sz / 2.0 : 0;
-        dot.alpha = cfg.opacity;
 
-        CGSize mySize = self.bounds.size;
-        if (mySize.width < sz || mySize.height < sz) return;
+        UIView *indicator = [self viewWithTag:kDotTag];
+        if (!indicator) return;
 
-        UIView *label = MKFindLabelView(self);
-        switch (cfg.position) {
-            case MKPositionLeft:
-                dot.frame = CGRectMake(4, (mySize.height - sz) / 2.0, sz, sz);
-                if (label) label.hidden = NO;
-                break;
-            case MKPositionRight:
-                dot.frame = CGRectMake(mySize.width - sz - 4, (mySize.height - sz) / 2.0, sz, sz);
-                if (label) label.hidden = NO;
-                break;
-            case MKPositionReplaceName:
-                dot.frame = CGRectMake((mySize.width - sz) / 2.0, mySize.height - sz - 4, sz, sz);
-                if (label) label.hidden = YES;
-                break;
-        }
-        dot.hidden = NO;
+        // 更新位置和外观
+        indicator.frame = CGRectMake(indicatorX, labelAreaY, indicatorW, indicatorH);
+        [(MKIndicatorDotView *)indicator applyConfig];
+        indicator.hidden = NO;
     });
 }
 
@@ -796,8 +805,8 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.4.7 ctor: 3 SBApplication hooks (optimized blacklist + no timer)");
-    RDLog(@"======== v1.4.7 loading (optimized: refined blacklist, removed timer, hooks handle all detection) ========");
+    NSLog(@"[RunningDotIndicator] v1.4.8 ctor: Lynx2 style - dot/bar shapes, replace-name position");
+    RDLog(@"======== v1.4.8 loading (Lynx2 style: dot + bar shapes, fixed replace-name position) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");

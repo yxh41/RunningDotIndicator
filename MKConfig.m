@@ -1,5 +1,8 @@
 //
 //  MKConfig.m
+//  RunningDotIndicator
+//
+//  v1.4.8: 简化配置 — 圆点/横条两种形状，固定替换名字位置
 //
 
 #import "MKConfig.h"
@@ -28,7 +31,6 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
 }
 
 - (void)reload {
-    // 使用 CFPreferences API 而非直接读文件, 兼容 rootless/rootful 路径差异
     CFPreferencesAppSynchronize((__bridge CFStringRef)kPrefsDomain);
     CFArrayRef keys = CFPreferencesCopyKeyList(
         (__bridge CFStringRef)kPrefsDomain,
@@ -46,9 +48,10 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
         _prefs = @{};
     }
 
-    NSLog(@"[RunningDotIndicator] MKConfig reload, keys: %lu, enabled=%@, color=%@",
+    NSLog(@"[RunningDotIndicator] MKConfig reload, keys: %lu, enabled=%@, shape=%@, color=%@",
           (unsigned long)[_prefs count],
           _prefs[@"enabled"],
+          _prefs[@"shape"],
           _prefs[@"color"] ?: @"(default)");
 }
 
@@ -61,18 +64,25 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
 
 - (MKShape)shape {
     id v = _prefs[@"shape"];
-    return v ? (MKShape)[v integerValue] : MKShapeCircle;
+    return v ? (MKShape)[v integerValue] : MKShapeDot;
 }
 
-- (CGFloat)size {
-    id v = _prefs[@"size"];
+- (CGFloat)dotSize {
+    id v = _prefs[@"dotSize"];
     CGFloat s = v ? [v floatValue] : 6.0f;
-    return (s < 3.0f) ? 3.0f : (s > 14.0f ? 14.0f : s);
+    return (s < 3.0f) ? 3.0f : (s > 12.0f ? 12.0f : s);
 }
 
-- (MKPosition)position {
-    id v = _prefs[@"position"];
-    return v ? (MKPosition)[v integerValue] : MKPositionLeft;
+- (CGFloat)barWidth {
+    id v = _prefs[@"barWidth"];
+    CGFloat w = v ? [v floatValue] : 24.0f;
+    return (w < 12.0f) ? 12.0f : (w > 48.0f ? 48.0f : w);
+}
+
+- (CGFloat)barHeight {
+    id v = _prefs[@"barHeight"];
+    CGFloat h = v ? [v floatValue] : 4.0f;
+    return (h < 2.0f) ? 2.0f : (h > 8.0f ? 8.0f : h);
 }
 
 - (CGFloat)opacity {
@@ -82,12 +92,9 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
 }
 
 - (UIColor *)color {
-    // 优先使用自定义十六进制颜色; 为空或非法时回退到预设颜色
     NSString *custom = _prefs[@"customColor"];
     if ([custom isKindOfClass:[NSString class]] && [custom length]) {
         UIColor *c = [[self class] colorFromHex:custom];
-        // colorFromHex 对非法输入会返回 systemGreenColor, 此处视为"解析失败"
-        // 只要能解析出非默认值就用自定义色
         return c;
     }
     NSString *hex = _prefs[@"color"];
@@ -102,12 +109,10 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
     NSMutableString *s = [NSMutableString stringWithString:hex];
     [s replaceOccurrencesOfString:@"#" withString:@""
                            options:0 range:NSMakeRange(0, s.length)];
-    // 去除可能的前缀 0x
     [s replaceOccurrencesOfString:@"0x" withString:@""
                            options:0 range:NSMakeRange(0, s.length)];
     NSString *clean = [s uppercaseString];
 
-    // #RGB -> #RRGGBB
     if (clean.length == 3) {
         NSMutableString *expanded = [NSMutableString string];
         for (NSUInteger i = 0; i < clean.length; i++) {
