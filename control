@@ -1,8 +1,8 @@
 Package: com.mk.runningdotindicator
 Name: RunningDotIndicator
-Version: 1.4.2
+Version: 1.4.3
 Architecture: iphoneos-arm64
-Description: Adds a customizable indicator dot beside app icons on the home screen to show which apps are currently running (v1.4.2: SBMainWorkspace hook + NSFileManager path cache + SBAppCtrl sync).
+Description: Adds a customizable indicator dot beside app icons on the home screen to show which apps are currently running (v1.4.3: delayed init fix + SBMainWorkspace hook).
 Maintainer: 口非口
 Author: 口非口
 Section: Tweaks
