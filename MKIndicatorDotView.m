@@ -46,15 +46,14 @@
             // 圆形指示点
             CGContextFillEllipseInRect(ctx, r);
             break;
-        case MKShapeBar:
+        case MKShapeBar: {
             // 横条（pill 形状 — 圆角矩形）
             CGFloat cornerR = r.size.height / 2.0f;
-            CGContextFillRect(ctx, r);  // fallback
-            // 用 UIBezierPath 画圆角矩形更精确
             UIBezierPath *pillPath = [UIBezierPath bezierPathWithRoundedRect:r cornerRadius:cornerR];
             [color setFill];
             [pillPath fill];
             break;
+        }
     }
 }
 
