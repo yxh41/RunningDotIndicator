@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RunningDotIndicator · 概念预览</title>
+<style>
+  :root{
+    --bg:#f2f3f7; --panel:#ffffff; --ink:#1c1c1e; --sub:#8e8e93;
+    --line:#e5e5ea; --accent:#34c759; --shadow:0 12px 40px rgba(0,0,0,.12);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",sans-serif;
+       background:var(--bg);color:var(--ink);min-height:100vh;display:flex;
+       align-items:center;justify-content:center;gap:48px;padding:32px;flex-wrap:wrap}
+
+  /* ===== 手机 ===== */
+  .phone{width:320px;height:660px;background:#000;border-radius:48px;padding:14px;
+         box-shadow:var(--shadow);position:relative}
+  .screen{width:100%;height:100%;border-radius:36px;overflow:hidden;position:relative;
+          background:linear-gradient(160deg,#9ec5ff 0%,#d9b7ff 55%,#ffc4d9 100%)}
+  .notch{position:absolute;top:14px;left:50%;transform:translateX(-50%);
+         width:120px;height:30px;background:#000;border-radius:16px;z-index:10}
+  .statusbar{display:flex;justify-content:space-between;align-items:center;
+             padding:18px 26px 0;color:#fff;font-size:13px;font-weight:600}
+  .statusbar .right{display:flex;gap:6px;align-items:center}
+  .page{padding:30px 18px 0;height:calc(100% - 60px);position:relative}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:22px 8px}
+  .app{display:flex;flex-direction:column;align-items:center;gap:6px}
+  .icon{width:58px;height:58px;border-radius:14px;display:flex;align-items:center;
+        justify-content:center;font-size:26px;color:#fff;position:relative;
+        box-shadow:0 4px 12px rgba(0,0,0,.18)}
+  .label{font-size:11px;color:#fff;text-align:center;line-height:1.2;
+         text-shadow:0 1px 3px rgba(0,0,0,.4);position:relative}
+  /* 指示点容器:相对 label 定位 */
+  .label-wrap{position:relative;display:flex;align-items:center;justify-content:center;min-height:14px}
+  .dot{position:absolute;background:var(--accent);transition:all .25s ease}
+
+  /* dock */
+  .dock{position:absolute;bottom:14px;left:14px;right:14px;height:88px;
+        background:rgba(255,255,255,.28);backdrop-filter:blur(20px);
+        border-radius:28px;display:flex;align-items:center;justify-content:space-around;padding:0 22px}
+  .dock .icon{width:52px;height:52px}
+
+  .home-ind{position:absolute;bottom:6px;left:50%;transform:translateX(-50%);
+            width:120px;height:4px;background:rgba(255,255,255,.8);border-radius:2px}
+
+  /* ===== 控制面板 ===== */
+  .controls{width:360px;background:var(--panel);border-radius:22px;padding:26px;
+            box-shadow:var(--shadow);height:fit-content}
+  .controls h1{font-size:19px;margin-bottom:4px}
+  .controls p.lead{color:var(--sub);font-size:13px;margin-bottom:22px;line-height:1.6}
+  .group{margin-bottom:20px}
+  .group label{display:block;font-size:13px;font-weight:600;margin-bottom:9px}
+  .row{display:flex;gap:8px;flex-wrap:wrap}
+  .swatch{width:30px;height:30px;border-radius:50%;cursor:pointer;border:2px solid transparent;
+          transition:transform .15s}
+  .swatch:hover{transform:scale(1.12)}
+  .swatch.active{border-color:#1c1c1e;transform:scale(1.12)}
+  .shapes{display:flex;gap:8px}
+  .shape-btn{width:38px;height:38px;border-radius:10px;border:1.5px solid var(--line);
+             background:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;
+             transition:all .15s}
+  .shape-btn.active{border-color:var(--accent);background:#f0fff3}
+  .shape-btn svg{width:18px;height:18px}
+  input[type=range]{width:100%;accent-color:var(--accent)}
+  .pos-toggle{display:flex;background:#f2f3f7;border-radius:10px;padding:3px}
+  .pos-toggle button{flex:1;border:none;background:transparent;padding:8px;border-radius:8px;
+                     cursor:pointer;font-size:13px;color:var(--sub);font-weight:600}
+  .pos-toggle button.active{background:#fff;color:var(--ink);box-shadow:0 1px 4px rgba(0,0,0,.1)}
+  .val{color:var(--accent);font-weight:700}
+  .hint{margin-top:6px;font-size:12px;color:var(--sub)}
+
+  .legend{display:flex;gap:14px;margin-top:18px;font-size:12px;color:var(--sub)}
+  .legend span{display:flex;align-items:center;gap:5px}
+  .legend i{width:9px;height:9px;border-radius:50%;display:inline-block}
+</style>
+</head>
+<body>
+
+<!-- ============ 手机 ============ -->
+<div class="phone">
+  <div class="screen">
+    <div class="notch"></div>
+    <div class="statusbar">
+      <span>9:41</span>
+      <div class="right"><span>●●●●</span><span>📶</span><span>🔋</span></div>
+    </div>
+    <div class="page">
+      <div class="grid" id="grid"></div>
+    </div>
+    <div class="dock" id="dock"></div>
+    <div class="home-ind"></div>
+  </div>
+</div>
+
+<!-- ============ 控制面板 ============ -->
+<div class="controls">
+  <h1>运行指示点 · 概念预览</h1>
+  <p class="lead">下方为运行中的 App 名称旁添加指示点。拖动控件即时预览效果（与真实插件设置项一一对应）。</p>
+
+  <div class="group">
+    <label>显示范围</label>
+    <div class="pos-toggle" id="fgToggle">
+      <button data-fg="false" class="active">全部运行中</button>
+      <button data-fg="true">仅前台运行</button>
+    </div>
+    <div class="hint" id="fgHint">显示所有在多任务中的 App(前台+后台)</div>
+  </div>
+
+  <div class="group">
+    <label>颜色</label>
+    <div class="row" id="colors"></div>
+  </div>
+
+  <div class="group">
+    <label>自定义颜色 <span class="val" id="hexPreview" style="background:#34c759;color:#fff;padding:1px 6px;border-radius:4px;font-size:11px;">●</span></label>
+    <input type="text" id="customColor" placeholder="#FF6B00 或 FF6B00" maxlength="7"
+           style="width:100%;padding:8px 10px;border:1.5px solid var(--line);border-radius:10px;font-size:14px;font-family:monospace;">
+    <div class="hint" id="hexHint">留空使用上方预设颜色。输入后优先生效。</div>
+  </div>
+
+  <div class="group">
+    <label>形状</label>
+    <div class="shapes" id="shapes"></div>
+  </div>
+
+  <div class="group">
+    <label>大小 <span class="val" id="sizeVal">6</span> pt</label>
+    <input type="range" id="size" min="3" max="14" value="6">
+  </div>
+
+  <div class="group">
+    <label>位置</label>
+    <div class="pos-toggle" id="pos">
+      <button data-pos="left" class="active">名称左侧</button>
+      <button data-pos="right">名称右侧</button>
+    </div>
+  </div>
+
+  <div class="group">
+    <label>不透明度 <span class="val" id="opVal">1.0</span></label>
+    <input type="range" id="op" min="0.1" max="1" step="0.1" value="1">
+  </div>
+
+  <div class="legend">
+    <span><i style="background:#34c759"></i>运行中</span>
+    <span><i style="background:#c7c7cc"></i>未运行</span>
+    <span class="hint" id="runningCount"></span>
+  </div>
+</div>
+
+<script>
+// ===== App 数据 =====
+const apps = [
+  {name:"信息",emoji:"💬",bg:"#34c759",run:true,fg:true},
+  {name:"邮件",emoji:"✉️",bg:"#0a84ff",run:false,fg:false},
+  {name:"Safari",emoji:"🧭",bg:"#1d70f0",run:true,fg:true},
+  {name:"音乐",emoji:"🎵",bg:"#fb233b",run:true,fg:false},
+  {name:"地图",emoji:"🗺️",bg:"#34c759",run:false,fg:false},
+  {name:"相机",emoji:"📷",bg:"#8e8e93",run:false,fg:false},
+  {name:"天气",emoji:"🌤️",bg:"#5ac8fa",run:true,fg:false},
+  {name:"提醒",emoji:"✅",bg:"#ff9f0a",run:false,fg:false},
+  {name:"时钟",emoji:"⏰",bg:"#000000",run:true,fg:true},
+  {name:"备忘",emoji:"📝",bg:"#ffd60a",run:false,fg:false},
+  {name:"计算器",emoji:"🧮",bg:"#ff9f0a",run:false,fg:false},
+  {name:"设置",emoji:"⚙️",bg:"#8e8e93",run:true,fg:true},
+];
+const dockApps = [
+  {name:"电话",emoji:"📞",bg:"#34c759",run:true,fg:true},
+  {name:"Safari",emoji:"🧭",bg:"#1d70f0",run:true,fg:true},
+  {name:"信息",emoji:"💬",bg:"#34c759",run:true,fg:true},
+  {name:"音乐",emoji:"🎵",bg:"#fb233b",run:true,fg:false},
+];
+
+// ===== 状态 =====
+let state = {color:"#34c759", customColor:"", shape:"circle", size:6, pos:"left", opacity:1, foregroundOnly:false};
+
+const colors = [
+  {n:"绿",v:"#34c759"},{n:"红",v:"#ff3b30"},{n:"橙",v:"#ff9500"},
+  {n:"黄",v:"#ffcc00"},{n:"蓝",v:"#007aff"},{n:"紫",v:"#af52de"},
+  {n:"粉",v:"#ff2d55"},{n:"青",v:"#5ac8fa"},{n:"白",v:"#ffffff"},
+  {n:"黑",v:"#000000"},
+];
+
+// 形状 SVG 路径
+const shapePaths = {
+  circle:`<circle cx="9" cy="9" r="8" fill="currentColor"/>`,
+  square:`<rect x="1" y="1" width="16" height="16" rx="2" fill="currentColor"/>`,
+  triangle:`<polygon points="9,1 17,17 1,17" fill="currentColor"/>`,
+  diamond:`<polygon points="9,1 17,9 9,17 1,9" fill="currentColor"/>`,
+  star:`<polygon points="9,1 11.2,6.6 17,7.3 12.7,11.4 14,17 9,14.1 4,17 5.3,11.4 1,7.3 6.8,6.6" fill="currentColor"/>`,
+  heart:`<path d="M9 17 C1 11 1 4 5 4 C7 4 9 6 9 8 C9 6 11 4 13 4 C17 4 17 11 9 17 Z" fill="currentColor"/>`,
+};
+
+// ===== 渲染 =====
+// 当前生效颜色: 自定义颜色优先, 为空回退预设
+function currentColor(){
+  if(state.customColor){
+    const c=hexToColor(state.customColor);
+    if(c) return c;
+  }
+  return state.color;
+}
+// 解析 #RRGGBB / RRGGBB / #RGB, 非法返回 null
+function hexToColor(h){
+  if(!h) return null;
+  let s=h.trim().replace(/^#/,'').replace(/^0x/i,'');
+  if(s.length===3) s=s.split('').map(c=>c+c).join('');
+  if(!/^[0-9a-fA-F]{6}$/.test(s)) return null;
+  return '#'+s;
+}
+
+function makeDotSVG(){
+  const s = state.size * 2; // 放大显示
+  const col=currentColor();
+  return `<svg class="dot" viewBox="0 0 18 18" style="width:${s}px;height:${s}px;color:${col};opacity:${state.opacity};">
+    ${shapePaths[state.shape]}</svg>`;
+}
+
+function renderApp(container, app){
+  const el = document.createElement('div');
+  el.className='app';
+  // foregroundOnly 模式: 只显示曾到前台的 App; 否则显示所有运行中 App
+  const show = state.foregroundOnly ? (app.fg) : (app.run);
+  el.innerHTML = `
+    <div class="icon" style="background:${app.bg}">${app.emoji}</div>
+    <div class="label-wrap">
+      ${show ? makeDotSVG() : ''}
+      <span class="label">${app.name}</span>
+    </div>`;
+  // 定位指示点
+  const dot = el.querySelector('.dot');
+  if(dot){
+    if(state.pos==='left'){
+      dot.style.right='calc(100% + 3px)';
+    } else {
+      dot.style.left='calc(100% + 3px)';
+    }
+    dot.style.top='50%';
+    dot.style.transform='translateY(-50%)';
+  }
+  container.appendChild(el);
+}
+
+function renderAll(){
+  const grid=document.getElementById('grid'); grid.innerHTML='';
+  apps.forEach(a=>renderApp(grid,a));
+  const dock=document.getElementById('dock'); dock.innerHTML='';
+  dockApps.forEach(a=>renderApp(dock,a));
+  const all=[...apps,...dockApps];
+  const shown = state.foregroundOnly ? all.filter(a=>a.fg).length : all.filter(a=>a.run).length;
+  const label = state.foregroundOnly ? '前台' : '运行中';
+  document.getElementById('runningCount').textContent=`· 共 ${shown} 个${label}`;
+}
+
+// ===== 控件 =====
+function buildControls(){
+  // 显示范围(前台/全部)
+  document.querySelectorAll('#fgToggle button').forEach(btn=>{
+    btn.onclick=()=>{
+      state.foregroundOnly=(btn.dataset.fg==='true');
+      document.querySelectorAll('#fgToggle button').forEach(b=>b.classList.remove('active'));
+      btn.classList.add('active');
+      document.getElementById('fgHint').textContent=state.foregroundOnly
+        ? '仅显示曾到过前台的 App, 纯后台服务不显示'
+        : '显示所有在多任务中的 App(前台+后台)';
+      renderAll();
+    };
+  });
+
+  // 预设颜色
+  const cw=document.getElementById('colors');
+  colors.forEach(c=>{
+    const b=document.createElement('div');
+    b.className='swatch'+(c.v===state.color?' active':'');
+    b.style.background=c.v;
+    if(c.v==='#ffffff'||c.v==='#ffcc00') b.style.boxShadow='inset 0 0 0 1px #d8d8de';
+    b.title=c.n;
+    b.onclick=()=>{
+      state.color=c.v;
+      state.customColor=''; // 选预设时清空自定义
+      document.getElementById('customColor').value='';
+      document.getElementById('hexHint').textContent='留空使用上方预设颜色。输入后优先生效。';
+      document.getElementById('hexHint').style.color='';
+      document.querySelectorAll('.swatch').forEach(s=>s.classList.remove('active'));
+      b.classList.add('active');
+      updateHexPreview(c.v);
+      renderAll();
+    };
+    cw.appendChild(b);
+  });
+
+  // 自定义十六进制颜色
+  const hexInput=document.getElementById('customColor');
+  hexInput.oninput=()=>{
+    const raw=hexInput.value.trim();
+    const parsed=hexToColor(raw);
+    if(parsed){
+      state.customColor=parsed;
+      document.getElementById('hexHint').textContent='已应用: '+parsed.toUpperCase();
+      document.getElementById('hexHint').style.color='var(--accent)';
+      updateHexPreview(parsed);
+      // 取消预设激活态
+      document.querySelectorAll('.swatch').forEach(s=>s.classList.remove('active'));
+    } else if(raw.length===0){
+      state.customColor='';
+      document.getElementById('hexHint').textContent='留空使用上方预设颜色。输入后优先生效。';
+      document.getElementById('hexHint').style.color='';
+      updateHexPreview(state.color);
+      // 恢复预设激活态
+      document.querySelectorAll('.swatch').forEach(s=>{if(s.title&&colors.find(c=>c.v===state.color&&c.n===s.title))s.classList.add('active');});
+    } else {
+      document.getElementById('hexHint').textContent='格式无效, 请输入 #RRGGBB';
+      document.getElementById('hexHint').style.color='#ff3b30';
+    }
+    renderAll();
+  };
+
+  // 形状
+  const sw=document.getElementById('shapes');
+  Object.keys(shapePaths).forEach(sh=>{
+    const b=document.createElement('div');
+    b.className='shape-btn'+(sh===state.shape?' active':'');
+    b.innerHTML=`<svg viewBox="0 0 18 18" style="color:#34c759">${shapePaths[sh]}</svg>`;
+    b.onclick=()=>{state.shape=sh;document.querySelectorAll('.shape-btn').forEach(s=>s.classList.remove('active'));b.classList.add('active');renderAll();};
+    sw.appendChild(b);
+  });
+  // 大小
+  const sz=document.getElementById('size');
+  sz.oninput=()=>{state.size=+sz.value;document.getElementById('sizeVal').textContent=sz.value;renderAll();};
+  // 位置
+  document.querySelectorAll('#pos button').forEach(btn=>{
+    btn.onclick=()=>{state.pos=btn.dataset.pos;document.querySelectorAll('#pos button').forEach(b=>b.classList.remove('active'));btn.classList.add('active');renderAll();};
+  });
+  // 不透明度
+  const op=document.getElementById('op');
+  op.oninput=()=>{state.opacity=+op.value;document.getElementById('opVal').textContent=(+op.value).toFixed(1);renderAll();};
+
+  updateHexPreview(state.color);
+}
+
+// 更新颜色预览圆点
+function updateHexPreview(col){
+  const el=document.getElementById('hexPreview');
+  if(el){
+    el.style.background=col;
+    // 浅色文字用深色, 深色背景用白字
+    const isLight=['#ffffff','#ffcc00'].includes(col.toLowerCase());
+    el.style.color=isLight?'#000':'#fff';
+  }
+}
+
+buildControls();
+renderAll();
+</script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+#!/bin/sh
+# RunningDotIndicator postinst — logs installation to syslog
+syslog -s -l 5 "RunningDotIndicator postinst: dylib installed"
+exit 0

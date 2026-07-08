@@ -1,0 +1,277 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>items</key>
+	<array>
+
+		<!-- ===== 顶部说明 ===== -->
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>RunningDotIndicator 1.2.0</string>
+			<key>footerText</key>
+			<string>在桌面上为「运行中」的 App(仍在多任务里)添加指示点, 一眼看出哪些 App 在后台运行。修改后即时生效, 无需注销。</string>
+		</dict>
+
+		<!-- ===== 总开关 ===== -->
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>enabled</string>
+			<key>label</key>
+			<string>已启用</string>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+		</dict>
+
+		<!-- ===== 颜色(预设) ===== -->
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>颜色</string>
+			<key>footerText</key>
+			<string>从预设中选择, 或在下方输入自定义十六进制颜色。自定义颜色优先于预设。</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSLinkListCell</string>
+			<key>detail</key>
+			<string>PSListItemsController</string>
+			<key>label</key>
+			<string>预设颜色</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>color</string>
+			<key>default</key>
+			<string>#34C759</string>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+			<key>validTitles</key>
+			<array>
+				<string>绿色</string>
+				<string>红色</string>
+				<string>橙色</string>
+				<string>黄色</string>
+				<string>蓝色</string>
+				<string>靛蓝</string>
+				<string>紫色</string>
+				<string>粉色</string>
+				<string>青色</string>
+				<string>薄荷</string>
+				<string>白色</string>
+				<string>浅灰</string>
+				<string>黑色</string>
+			</array>
+			<key>validValues</key>
+			<array>
+				<string>#34C759</string>
+				<string>#FF3B30</string>
+				<string>#FF9500</string>
+				<string>#FFCC00</string>
+				<string>#007AFF</string>
+				<string>#5856D6</string>
+				<string>#AF52DE</string>
+				<string>#FF2D55</string>
+				<string>#5AC8FA</string>
+				<string>#00C7BE</string>
+				<string>#FFFFFF</string>
+				<string>#AEAEB2</string>
+				<string>#000000</string>
+			</array>
+		</dict>
+
+		<!-- ===== 自定义十六进制颜色 ===== -->
+		<dict>
+			<key>cell</key>
+			<string>PSEditTextCell</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>customColor</string>
+			<key>default</key>
+			<string></string>
+			<key>placeholder</key>
+			<string>如 #FF6B00 或 FF6B00</string>
+			<key>label</key>
+			<string>自定义颜色</string>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+			<key>keyboardType</key>
+			<string>Alphabet</string>
+			<key>autoCapitalization</key>
+			<string>None</string>
+			<key>autoCorrection</key>
+			<string>No</string>
+		</dict>
+
+		<!-- ===== 形状 ===== -->
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>外观</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSLinkListCell</string>
+			<key>detail</key>
+			<string>PSListItemsController</string>
+			<key>label</key>
+			<string>指示点形状</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>shape</string>
+			<key>default</key>
+			<integer>0</integer>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+			<key>validTitles</key>
+			<array>
+				<string>圆形</string>
+				<string>方形</string>
+				<string>三角形</string>
+				<string>菱形</string>
+				<string>五角星</string>
+				<string>心形</string>
+			</array>
+			<key>validValues</key>
+			<array>
+				<integer>0</integer>
+				<integer>1</integer>
+				<integer>2</integer>
+				<integer>3</integer>
+				<integer>4</integer>
+				<integer>5</integer>
+			</array>
+		</dict>
+
+		<!-- ===== 大小 ===== -->
+		<dict>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>label</key>
+			<string>指示点大小</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>size</string>
+			<key>default</key>
+			<real>6</real>
+			<key>min</key>
+			<real>3</real>
+			<key>max</key>
+			<real>14</real>
+			<key>isSegmented</key>
+			<true/>
+			<key>segmentCount</key>
+			<integer>11</integer>
+			<key>showValue</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+		</dict>
+
+		<!-- ===== 位置 ===== -->
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>位置</string>
+			<key>footerText</key>
+			<string>替换名称: App 运行中时隐藏图标下方的文字, 直接用指示点替代。停止运行后自动恢复名称。</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSLinkListCell</string>
+			<key>detail</key>
+			<string>PSListItemsController</string>
+			<key>label</key>
+			<string>指示点位置</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>position</string>
+			<key>default</key>
+			<integer>0</integer>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+			<key>validTitles</key>
+			<array>
+				<string>名称左侧</string>
+				<string>名称右侧</string>
+				<string>替换名称</string>
+			</array>
+			<key>validValues</key>
+			<array>
+				<integer>0</integer>
+				<integer>1</integer>
+				<integer>2</integer>
+			</array>
+		</dict>
+
+		<!-- ===== 不透明度 ===== -->
+		<dict>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>label</key>
+			<string>不透明度</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>opacity</string>
+			<key>default</key>
+			<real>1.0</real>
+			<key>min</key>
+			<real>0.1</real>
+			<key>max</key>
+			<real>1.0</real>
+			<key>isSegmented</key>
+			<true/>
+			<key>segmentCount</key>
+			<integer>10</integer>
+			<key>showValue</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+		</dict>
+
+		<!-- ===== 操作 ===== -->
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>操作</string>
+			<key>footerText</key>
+			<string>修改后无需手动刷新, 指示点会自动更新。如遇异常可注销重启 SpringBoard。</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSButtonCell</string>
+			<key>label</key>
+			<string>注销(重启 SpringBoard)</string>
+			<key>action</key>
+			<string>respring</string>
+			<key>isDestructive</key>
+			<false/>
+		</dict>
+
+	</array>
+
+	<key>title</key>
+	<string>运行指示点</string>
+</dict>
+</plist>

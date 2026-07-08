@@ -1,0 +1,192 @@
+name: Build .deb
+
+on:
+  push:
+    branches: ["**"]
+    paths-ignore:
+      - "**.md"
+      - "preview.html"
+  workflow_dispatch:
+  release:
+    types: [created]
+
+env:
+  THEOS: ${{ github.workspace }}/theos
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        env:
+          HOMEBREW_NO_REQUIRE_TAP_TRUST: 1
+        run: |
+          brew install dpkg ldid
+
+      - name: Install Theos
+        run: |
+          git clone https://github.com/theos/theos.git "$THEOS"
+          cd "$THEOS"
+          git submodule update --init --recursive 2>&1 || true
+          for f in logos.pl dm.pl; do
+            if [ -e "$THEOS/bin/$f" ]; then
+              echo "OK: bin/$f exists"
+            else
+              echo "Fixing bin/$f"
+              rm -f "$THEOS/bin/$f"
+              case "$f" in
+                logos.pl) curl -fsSL https://raw.githubusercontent.com/theos/logos/master/logos.pl -o "$THEOS/bin/logos.pl" ;;
+                dm.pl)    curl -fsSL https://raw.githubusercontent.com/theos/dm.pl/master/dm.pl -o "$THEOS/bin/dm.pl" ;;
+              esac
+              chmod +x "$THEOS/bin/$f"
+            fi
+          done
+          brew install xz
+          cpanm -n IO::Compress::Lzma 2>/dev/null || true
+
+      - name: Install SDKs
+        run: |
+          rm -rf "$THEOS/sdks"
+          git clone --depth=1 https://github.com/theos/sdks.git "$THEOS/sdks"
+          echo "Installed SDKs:"
+          ls -1 "$THEOS/sdks/" | grep -i iphone
+
+      - name: Detect SDK version
+        id: sdk
+        run: |
+          SDK=$(ls "$THEOS/sdks/" | grep -o 'iPhoneOS[0-9.]*\.sdk' | sort -V | tail -1 | sed 's/iPhoneOS//;s/\.sdk//')
+          echo "sdk_version=$SDK" >> "$GITHUB_OUTPUT"
+          sed -i '' "s/TARGET := iphone:clang:.*:15.0/TARGET := iphone:clang:$SDK:15.0/" Makefile
+
+      # =========================================================================
+      # Step 1: Build rootless (baseline, installs to /var/jb/)
+      # =========================================================================
+      - name: Build rootless package
+        run: |
+          echo "=== Step 1: Building rootless (iphoneos-arm64) ==="
+          make clean
+          make package FINALPACKAGE=1 THEOS_ENV=silent 2>&1 || make package FINALPACKAGE=1
+          mkdir -p artifacts
+          cp packages/*.deb artifacts/
+          echo "Rootless build done:"
+          ls -lh artifacts/
+
+      # =========================================================================
+      # Step 2: Build rootful (installs to /, Architecture=iphoneos-arm)
+      # =========================================================================
+      - name: Build rootful package
+        run: |
+          echo "=== Step 2: Building rootful (iphoneos-arm) ==="
+          make clean
+          # Temporarily change Architecture for rootful
+          cp control control.bak
+          sed -i '' 's/^Architecture:.*/Architecture: iphoneos-arm/' control
+          echo "control after sed:"
+          grep Architecture control
+          # PACK_TYPE=rootful -> THEOS_PACKAGE_SCHEME empty -> install to /
+          make package FINALPACKAGE=1 PACK_TYPE=rootful THEOS_ENV=silent 2>&1 || make package FINALPACKAGE=1 PACK_TYPE=rootful
+          mv control.bak control
+          cp packages/*.deb artifacts/
+          echo "Rootful build done:"
+          ls -lh artifacts/
+
+      # =========================================================================
+      # Step 3: Repack rootless .deb as roothide (same /var/jb/ layout, arch=iphoneos-arm64e)
+      # =========================================================================
+      - name: Repack rootless as roothide
+        run: |
+          echo "=== Step 3: Repacking rootless as roothide (iphoneos-arm64e) ==="
+          WS="${{ github.workspace }}"
+          ROOTLESS_DEB=$(ls "$WS"/artifacts/*_iphoneos-arm64.deb | head -1)
+          ROOTHIDE_NAME=$(basename "$ROOTLESS_DEB" | sed 's/_iphoneos-arm64/_iphoneos-arm64e/')
+          TMPDIR=$(mktemp -d)
+          cd "$TMPDIR"
+
+          # Extract the rootless .deb
+          cp "$ROOTLESS_DEB" .
+          ar x "$(basename "$ROOTLESS_DEB")"
+
+          # Extract control archive
+          mkdir control_dir
+          cd control_dir
+          CONTROL_TAR_NAME=$(ls ../control.tar.* 2>/dev/null | head -1 | xargs basename)
+          tar xf "../$CONTROL_TAR_NAME"
+
+          # Change Architecture
+          sed -i '' 's/Architecture: iphoneos-arm64/Architecture: iphoneos-arm64e/' control
+          echo "=== Modified control file ==="
+          cat control
+
+          # Repack control archive (writes to $TMPDIR)
+          rm -f "../$CONTROL_TAR_NAME"
+          tar cf "../$CONTROL_TAR_NAME" control postinst extrainst_ 2>/dev/null || tar cf "../$CONTROL_TAR_NAME" control
+          cd ..
+
+          # Repack .deb
+          DATA_TAR=$(ls data.tar.* 2>/dev/null | head -1 | xargs basename)
+          ar r "$ROOTHIDE_NAME" debian-binary "$CONTROL_TAR_NAME" "$DATA_TAR"
+
+          cp "$ROOTHIDE_NAME" "$WS/artifacts/"
+          rm -rf "$TMPDIR"
+          echo "Roothide repack done:"
+          ls -lh "$WS"/artifacts/*_iphoneos-arm64e.deb
+
+      # =========================================================================
+      # Verify everything
+      # =========================================================================
+      - name: Verify all .deb packages
+        run: |
+          echo "=== All built packages ==="
+          ls -lh artifacts/
+          echo ""
+          for deb in artifacts/*.deb; do
+            echo "--- $(basename "$deb") ---"
+            dpkg-deb -I "$deb" | grep -E "Package:|Version:|Architecture:"
+            echo ""
+          done
+
+      - name: Verify .deb contents (full file listing)
+        run: |
+          for deb in artifacts/*.deb; do
+            echo ""
+            echo "======================================================================"
+            echo "=== CONTENTS OF: $(basename "$deb") ==="
+            echo "======================================================================"
+            TMPDIR=$(mktemp -d)
+            dpkg-deb -x "$deb" "$TMPDIR"
+            echo ""
+            echo "--- Full file tree ---"
+            find "$TMPDIR" -type f | sort
+            echo ""
+            echo "--- Filter plist check ---"
+            find "$TMPDIR" -name "RunningDotIndicator.plist" -exec sh -c 'echo "  FOUND:"; cat "$1"' _ {} \; || echo "  *** WARNING: filter plist NOT FOUND! ***"
+            echo ""
+            echo "--- Dylib check ---"
+            find "$TMPDIR" -name "RunningDotIndicator.dylib" -exec sh -c 'echo "  FOUND:"; ls -lh "$1"; file "$1"' _ {} \; || echo "  *** WARNING: dylib NOT FOUND! ***"
+            echo ""
+            echo "--- Preference files ---"
+            find "$TMPDIR" -path "*/RunningDotIndicator*" -ls 2>/dev/null || echo "  (none)"
+            rm -rf "$TMPDIR"
+          done
+
+      - name: Upload .deb artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: RunningDotIndicator-deb
+          path: artifacts/*.deb
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attach .deb to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: artifacts/*.deb
+
+      - name: Done
+        run: |
+          echo "::notice::Build done! 3 DEBs: rootful / rootless / roothide. Download from Artifacts section below."
