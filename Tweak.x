@@ -1,11 +1,13 @@
 //
-//  Tweak.x — RunningDotIndicator v1.4.4
-//  v1.4.4 紧急修复：
-//    ✅ 移除 SBMainWorkspace hook（arg2/arg3 是 NSInteger 枚举不是 id 对象 → EXC_BAD_ACCESS）
-//    ✅ 保留延迟初始化（15秒后执行重量级工作）
-//    ✅ 保留 NSFileManager path cache（1033 apps 缓存成功）
-//    ✅ 保留 proc_listallpids 进程枚举
-//    ✅ 保留生命周期通知（SBApplicationDidExitNotification 等）
+//  Tweak.x — RunningDotIndicator v1.4.5
+//  v1.4.5 核心策略转变：
+//    ✅ Hook SBApplication._setActivationState:(NSInteger) — 实时检测 App 启动/状态变化
+//    ✅ Hook SBApplication._noteProcess:(id)didChangeToState:(NSInteger) — 补充检测
+//    ✅ SBApplicationController.runningApplications (performSelector) — 初始同步
+//    ✅ 系统进程黑名单 — 过滤掉不该显示指示点的 App
+//    ✅ 日志限流 — 同一 bundleID 最多记录 3 次 RUNNING
+//    ✅ 保留延迟初始化（15 秒）防止 watchdog 杀 SpringBoard
+//    ✅ 保留 SBApplicationDidExitNotification 退出检测
 //  紧急开关：/var/mobile/Documents/rd_disabled 存在则整机不生效。
 //
 
@@ -29,12 +31,64 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 - (NSString *)applicationBundleID;
 @end
 
+@interface SBApplication : NSObject
+@property (nonatomic, readonly) NSString *bundleIdentifier;
+@end
+
+@interface SBApplicationController : NSObject
++ (instancetype)sharedInstance;
+@end
+
+// ─── iOS 16 App Activation State 枚举 ────────────────────
+//  SBApplicationActivationState:
+//    0 = Inactive/Dead
+//    1 = Background (in memory, suspended or running)
+//    2 = Foreground (active, user-visible)
+
 // ─── 常量 ──────────────────────────────────────────────────
 static NSInteger const kDotTag  = 9999;
 
+// ─── 系统进程黑名单（这些 App 不显示指示点）─────────────
+static NSArray *sBlacklist = nil;
+static void MKInitBlacklist() {
+    sBlacklist = @[
+        @"com.apple.springboard",
+        @"com.apple.AccessibilityUIServer",
+        @"com.apple.PosterBoard",
+        @"com.apple.NanoUniverse.AegirProxyApp",
+        @"com.apple.SleepLockScreen",
+        @"com.apple.GameCenterRemoteAlert",
+        @"com.apple.InCallService",
+        @"com.apple.Spotlight",
+        @"com.apple.CoreAuthUI",
+        @"com.apple.camera",
+        @"com.apple.weather",      // WeatherPoster 误检测，不是用户打开的天气
+        @"wiki.qaq.trapp",         // 越狱工具 App，不是用户关注的
+        @"wiki.qaq.TrollFools",
+        @"com.opa334.Dopamine-roothide",
+        @"com.roothide.manager",
+        @"com.tigisoftware.Filza",
+        @"org.coolstar.SileoStore",
+        @"com.muirey03.cr4shedgui",
+        @"netdisk_iPhone.files_extension",
+    ];
+}
+
+static BOOL MKIsBlacklisted(NSString *bid) {
+    if (!sBlacklist) MKInitBlacklist();
+    for (NSString *b in sBlacklist) {
+        if ([bid isEqualToString:b] || [bid hasPrefix:b]) return YES;
+    }
+    // 通配：所有 .jbroot 路径的越狱 App
+    if ([bid containsString:@"qaq."] || [bid containsString:@"roothide"]) return YES;
+    // 系统扩展 (.appex)
+    if ([bid containsString:@"Extension"] || [bid containsString:@".appex"]) return YES;
+    return NO;
+}
+
 // ─── 全局状态 ─────────────────────────────────────────────
 static int   sCallCount    = 0;
-static BOOL  sInitDone     = NO;    // 延迟初始化完成后设为 YES
+static BOOL  sInitDone     = NO;
 static NSMutableSet<NSString*> *sRunningSet = nil;
 static NSMutableDictionary<NSString*, NSString*> *sPathToBundleID = nil;
 static NSMutableDictionary<NSString*, NSString*> *sBidToExePath = nil;
@@ -43,6 +97,7 @@ static NSTimeInterval sDisableTS = 0;
 static BOOL  sDisableChecked = NO;
 static BOOL  sDisabled = NO;
 static BOOL  sPathCacheReady = NO;
+static NSMutableDictionary<NSString*, NSInteger> *sRunLogCounts = nil; // 日志限流
 
 // ─── 文件日志 ────────────────────────────────────────────────
 static void RDLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
@@ -65,6 +120,16 @@ static void RDLog(NSString *fmt, ...) {
             [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
         }
     } @catch (NSException *e) {}
+}
+
+// ─── 限流日志（同一 bundleID 最多记录 N 次）──────────────
+static void RDLogRunning(NSString *bid) {
+    if (!sRunLogCounts) sRunLogCounts = [NSMutableDictionary dictionary];
+    NSInteger count = sRunLogCounts[bid];
+    if (count < 3) {
+        sRunLogCounts[bid] = count + 1;
+        RDLog(@"RUNNING: %@ (call=%d, log=%ld)", bid, sCallCount, (long)(count+1));
+    }
 }
 
 // ─── 紧急开关 ────────────────────────────────────────────────
@@ -94,13 +159,25 @@ static void MKSafe(void (^block)(void)) {
 
 static void MKAddToRunningSet(NSString *bid) {
     if (!bid.length) return;
+    if (MKIsBlacklisted(bid)) {
+        static int sBlacklistLogs = 0;
+        if (sBlacklistLogs < 10) {
+            sBlacklistLogs++;
+            RDLog(@"BLACKLIST: skipped %@", bid);
+        }
+        return;
+    }
     if (!sRunningSet) sRunningSet = [NSMutableSet set];
+    BOOL wasNew = ![sRunningSet containsObject:bid];
     [sRunningSet addObject:bid];
+    if (wasNew) RDLog(@"+ RUNNING SET: %@", bid);
 }
 
 static void MKRemoveFromRunningSet(NSString *bid) {
     if (!bid.length) return;
+    BOOL wasIn = sRunningSet && [sRunningSet containsObject:bid];
     [sRunningSet removeObject:bid];
+    if (wasIn) RDLog(@"- RUNNING SET: %@", bid);
 }
 
 static BOOL MKIsAppRunning(NSString *bundleID) {
@@ -126,8 +203,7 @@ static void MKBuildPathCache() {
         if (!uuids) continue;
 
         for (NSString *uuid in uuids) {
-            // 跳过 roothide 前缀目录
-            if ([uuid hasPrefix:@"."]) continue;
+            if ([uuid hasPrefix:@"."]) continue;  // roothide 前缀跳过
 
             NSString *uuidDir = [baseDir stringByAppendingPathComponent:uuid];
             NSArray *contents = [fm contentsOfDirectoryAtPath:uuidDir error:nil];
@@ -153,7 +229,7 @@ static void MKBuildPathCache() {
         }
     }
 
-    // ─── 扫描系统内置应用 ──────────
+    // ─── 系统内置应用 ──────
     NSArray *sysApps = [fm contentsOfDirectoryAtPath:@"/Applications" error:nil];
     if (sysApps) {
         for (NSString *item in sysApps) {
@@ -177,21 +253,54 @@ static void MKBuildPathCache() {
 
     sPathCacheReady = YES;
     RDLog(@"PathCache: cached %d apps", added);
+}
 
-    // 诊断：打印几个示例
-    NSArray *sample = [sBidToExePath allKeys];
-    for (int i = 0; i < MIN(5, (int)sample.count); i++) {
-        RDLog(@"PathCache sample: %@ → %@", sample[i], sBidToExePath[sample[i]]);
+// ─── SBApplicationController.runningApplications 初始同步 ────
+static void MKSyncFromSBAppCtrl() {
+    @try {
+        id appCtrl = [SBApplicationController sharedInstance];
+        if (!appCtrl) {
+            RDLog(@"SBAppCtrl: sharedInstance is nil");
+            return;
+        }
+
+        SEL runningSel = NSSelectorFromString(@"runningApplications");
+        if (![appCtrl respondsToSelector:runningSel]) {
+            RDLog(@"SBAppCtrl: does not respond to runningApplications");
+            return;
+        }
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        NSArray *runningApps = [appCtrl performSelector:runningSel];
+#pragma clang diagnostic pop
+
+        if (!runningApps) {
+            RDLog(@"SBAppCtrl: runningApplications returned nil");
+            return;
+        }
+
+        int count = 0;
+        for (id app in runningApps) {
+            if (![app isKindOfClass:NSClassFromString(@"SBApplication")]) continue;
+            NSString *bid = [app performSelector:NSSelectorFromString(@"bundleIdentifier")];
+            if (bid.length && !MKIsBlacklisted(bid)) {
+                MKAddToRunningSet(bid);
+                count++;
+            }
+        }
+        RDLog(@"SBAppCtrl: synced %d running apps (total=%lu)", count, (unsigned long)runningApps.count);
+
+    } @catch (NSException *e) {
+        RDLog(@"SBAppCtrl EXCEPTION: %@", e.reason);
     }
 }
 
 // ─── 进程路径→bundleID 反查 ──────────
 static NSString *MKBidFromPath(NSString *fullPath) {
-    // PathCache 直查
     NSString *bid = sPathToBundleID[fullPath];
     if (bid) return bid;
 
-    // Info.plist 回退
     NSString *appBundlePath = [fullPath stringByDeletingLastPathComponent];
     if ([appBundlePath hasSuffix:@".appex"]) {
         appBundlePath = [[appBundlePath stringByDeletingLastPathComponent]
@@ -207,7 +316,6 @@ static NSString *MKBidFromPath(NSString *fullPath) {
         }
     }
 
-    // .app 目录名模糊匹配
     NSString *appName = [appBundlePath lastPathComponent];
     if ([appName hasSuffix:@".app"] && sBidToExePath) {
         for (NSString *cachedBid in sBidToExePath) {
@@ -222,44 +330,13 @@ static NSString *MKBidFromPath(NSString *fullPath) {
     return nil;
 }
 
-// ─── 进程枚举 ──────────
-static void MKComputeRunningSet() {
+// ─── 进程枚举（辅助，仅补充用户 App）─────────
+static void MKComputeRunningSetFromProc() {
     @try {
         int pidBuf[512];
-        int bufBytes = sizeof(pidBuf);
-        int retBytes = proc_listallpids(pidBuf, bufBytes);
-
+        int retBytes = proc_listallpids(pidBuf, sizeof(pidBuf));
         if (retBytes <= 0) return;
-
         int numPids = retBytes / sizeof(int);
-
-        static int sProcEntryLogs = 0;
-        if (sProcEntryLogs < 3) {
-            sProcEntryLogs++;
-            RDLog(@"PROC: %d PIDs (ret=%d)", numPids, retBytes);
-        }
-
-        // ─── 首次扫描时 dump 所有路径（诊断）──────────
-        static int sFullDumpDone = 0;
-        if (sFullDumpDone == 0) {
-            sFullDumpDone = 1;
-            RDLog(@"PROC: === FULL PATH DUMP (first scan) ===");
-            int dumpCount = 0;
-            for (int i = 0; i < numPids && dumpCount < 80; i++) {
-                char pathBuf[PROC_PIDPATHINFO_MAXSIZE];
-                if (proc_pidpath(pidBuf[i], pathBuf, sizeof(pathBuf)) <= 0) continue;
-                NSString *p = [NSString stringWithUTF8String:pathBuf];
-                if (p.length > 0) {
-                    RDLog(@"PROC dump [%d]: pid=%d → %@", dumpCount, pidBuf[i], p);
-                    dumpCount++;
-                }
-            }
-            RDLog(@"PROC: === END DUMP (%d paths) ===", dumpCount);
-        }
-
-        // ─── 遍历匹配 ──────
-        NSMutableSet *procSet = [NSMutableSet set];
-        int appProcessCount = 0;
 
         for (int i = 0; i < numPids; i++) {
             char pathBuf[PROC_PIDPATHINFO_MAXSIZE];
@@ -267,56 +344,20 @@ static void MKComputeRunningSet() {
 
             NSString *fullPath = [NSString stringWithUTF8String:pathBuf];
 
-            BOOL isAppPath = NO;
-            if ([fullPath containsString:@"/Bundle/Application/"]) {
-                isAppPath = YES;
-            } else if ([fullPath containsString:@".app/"]) {
-                if (![fullPath containsString:@"/var/jb/"] && ![fullPath hasPrefix:@"/usr/"]) {
-                    isAppPath = YES;
-                }
+            // 只关注用户 App 路径
+            BOOL isUserApp = NO;
+            if ([fullPath containsString:@"/Bundle/Application/"] &&
+                ![fullPath containsString:@".jbroot-"] &&
+                ![fullPath containsString:@".appex"]) {
+                isUserApp = YES;
             }
-            if (!isAppPath) continue;
-            appProcessCount++;
+            if (!isUserApp) continue;
 
             NSString *bid = MKBidFromPath(fullPath);
-            if (bid) {
-                [procSet addObject:bid];
-            } else {
-                static int sUnmatchLogs = 0;
-                if (sUnmatchLogs < 10) {
-                    sUnmatchLogs++;
-                    RDLog(@"PROC: UNMATCHED %@", fullPath);
-                }
-            }
-        }
-
-        // 进程枚举只补充，不覆盖
-        int supplemented = 0;
-        for (NSString *bid in procSet) {
-            if (![sRunningSet containsObject:bid]) {
+            if (bid && !MKIsBlacklisted(bid)) {
                 MKAddToRunningSet(bid);
-                supplemented++;
             }
         }
-
-        // 也清理不在进程列表中的 App（除非刚通过通知添加）
-        // 只在 sInitDone 之后才清理，避免误删通知添加的
-        if (sInitDone && sRunningSet.count > 0) {
-            for (NSString *bid in [sRunningSet copy]) {
-                if (![procSet containsObject:bid]) {
-                    MKRemoveFromRunningSet(bid);
-                    RDLog(@"PROC cleanup: removed %@ (not in process list)", bid);
-                }
-            }
-        }
-
-        static int sProcResultLogs = 0;
-        if (sProcResultLogs < 5) {
-            sProcResultLogs++;
-            RDLog(@"PROC result: appProc=%d supplemented=%d runningSet=%lu",
-                  appProcessCount, supplemented, (unsigned long)sRunningSet.count);
-        }
-
     } @catch (NSException *e) {
         RDLog(@"PROC exception: %@", e.reason);
     }
@@ -354,15 +395,6 @@ static NSString *MKBidFromNote(NSNotification *note) {
                 if ([v isKindOfClass:[NSString class]] && [(NSString *)v containsString:@"."] && ![(NSString *)v containsString:@"/"]) return v;
             }
         }
-
-        NSString *name = note.name;
-        if (name.length > 0) {
-            NSArray *parts = [name componentsSeparatedByString:@"_"];
-            if (parts.count > 1) {
-                NSString *last = [parts lastObject];
-                if ([last containsString:@"."] && ![last containsString:@"/"]) return last;
-            }
-        }
     } @catch (NSException *e) {}
     return nil;
 }
@@ -388,7 +420,7 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
 
 static void MKUpdate(SBIconView *self) {
     MKSafe(^{
-        if (!sInitDone) return;  // ⚠️ 延迟初始化未完成时不渲染
+        if (!sInitDone) return;
 
         sCallCount++;
         if (MKIsDisabled()) {
@@ -423,8 +455,7 @@ static void MKUpdate(SBIconView *self) {
             return;
         }
 
-        static int sRunLogs = 0;
-        if (sRunLogs < 30) { sRunLogs++; RDLog(@"RUNNING: %@ (call=%d)", bundleID, sCallCount); }
+        RDLogRunning(bundleID);
 
         CGFloat sz = cfg.size;
         UIView *existing = [self viewWithTag:kDotTag];
@@ -499,20 +530,25 @@ static void MKRefreshAllIcons() {
 static void MKDelayedInit() {
     RDLog(@"DELAYED INIT: starting heavy work...");
 
-    // ─── 步骤 1：路径缓存 ──────
+    // ─── 步骤 1：系统黑名单 ──────
+    MKInitBlacklist();
+
+    // ─── 步骤 2：路径缓存 ──────
     MKBuildPathCache();
 
-    // ─── 步骤 2：进程枚举初始同步 ──────
+    // ─── 步骤 3：SBApplicationController 初始同步 ──────
     if (!sRunningSet) sRunningSet = [NSMutableSet set];
-    MKComputeRunningSet();
+    MKSyncFromSBAppCtrl();
+
+    // ─── 步骤 4：进程枚举辅助 ──────
+    MKComputeRunningSetFromProc();
 
     RDLog(@"DELAYED INIT: runningSet has %lu items", (unsigned long)sRunningSet.count);
+    RDLog(@"runningSet: %@", [[sRunningSet allObjects] componentsJoinedByString:@", "]);
 
     // ─── 标记初始化完成 ──────
     sInitDone = YES;
-
     RDLog(@"DELAYED INIT: done. sInitDone=YES");
-    RDLog(@"runningSet: %@", [[sRunningSet allObjects] componentsJoinedByString:@", "]);
 
     // ─── 首次刷新所有图标 ──────
     MKRefreshAllIcons();
@@ -567,11 +603,95 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %end
 
 // ====================================================================
-// ⚠️ v1.4.4 已移除 SBMainWorkspace hook
-// 崩溃原因：process:stateDidChangeFromState:toState: 的 arg2/arg3
-// 是 FBProcessState 枚举值（NSInteger），不是 id 对象。
-// 对整数 2 调用 respondsToSelector: → objc_msgSend(0x2, ...) → EXC_BAD_ACCESS
+// Hook — SBApplication._setActivationState:(NSInteger)
+// 这是 iOS 16 上检测 App 启动的关键方法！
+// 当 App 从 Inactive→Background/Foreground 时，SpringBoard 内部调用此方法
+// state 值：0=Inactive/Dead, 1=Background, 2=Foreground
 // ====================================================================
+
+%hook SBApplication
+
+- (void)_setActivationState:(NSInteger)state {
+    %orig;
+
+    @try {
+        NSString *bid = [self bundleIdentifier];
+        if (!bid.length) return;
+
+        RDLog(@"SBApp._setActivationState: %@ → state=%ld", bid, (long)state);
+
+        if (state >= 1) {
+            // Background 或 Foreground → App 正在运行
+            MKAddToRunningSet(bid);
+        } else {
+            // Inactive/Dead → App 已退出
+            MKRemoveFromRunningSet(bid);
+        }
+
+        if (sInitDone) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                MKRefreshAllIcons();
+            });
+        }
+    } @catch (NSException *e) {
+        RDLog(@"_setActivationState EXCEPTION: %@", e.reason);
+    }
+}
+
+%end
+
+// ====================================================================
+// Hook — SBApplication._noteProcess:(id)didChangeToState:(NSInteger)
+// 补充检测：进程状态变化时也更新 runningSet
+// process 是 FBApplicationProcess 实例（有 bundleIdentifier）
+// state 是 FBProcessState 枚举：1=Dead, 2=Running, 3=Suspended
+// ====================================================================
+
+%hook SBApplication
+
+- (void)_noteProcess:(id)process didChangeToState:(NSInteger)state {
+    %orig;
+
+    @try {
+        NSString *bid = nil;
+
+        // 先从 SBApplication 自身获取 bundleID
+        bid = [self bundleIdentifier];
+
+        // 如果自身没有，从 process 对象尝试获取
+        if (!bid.length && process) {
+            SEL bidSel = NSSelectorFromString(@"bundleIdentifier");
+            if ([process respondsToSelector:bidSel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                bid = [process performSelector:bidSel];
+#pragma clang diagnostic pop
+            }
+        }
+
+        if (!bid.length) return;
+
+        RDLog(@"SBApp._noteProcess: %@ → state=%ld", bid, (long)state);
+
+        // FBProcessState: 2=Running, 3=Suspended → both mean app is alive
+        // FBProcessState: 1=Dead → app exited
+        if (state >= 2) {
+            MKAddToRunningSet(bid);
+        } else if (state == 1) {
+            MKRemoveFromRunningSet(bid);
+        }
+
+        if (sInitDone) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                MKRefreshAllIcons();
+            });
+        }
+    } @catch (NSException *e) {
+        RDLog(@"_noteProcess EXCEPTION: %@", e.reason);
+    }
+}
+
+%end
 
 // ====================================================================
 // 构造函数（只做最轻量工作）
@@ -580,16 +700,15 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.4.4 ctor: minimal init (SBMainWorkspace hook REMOVED)");
-    RDLog(@"======== v1.4.4 loading (SBWS hook removed, safe) ========");
+    NSLog(@"[RunningDotIndicator] v1.4.5 ctor: SBApplication._setActivationState hook");
+    RDLog(@"======== v1.4.5 loading (SBApp._setActivationState + blacklist) ========");
 
-    // ⚠️ 紧急开关检查
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
         return;
     }
 
-    // ─── 只注册最轻量的通知 ──────────
+    // ─── Darwin 通知 ──────────
     CFNotificationCenterAddObserver(
         CFNotificationCenterGetDarwinNotifyCenter(),
         NULL, MKPrefsChangedCallback,
@@ -602,46 +721,28 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
         CFSTR("com.mk.runningdotindicator.respring"),
         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
-    // ─── 生命周期通知 ──────────
+    // ─── 生命周期通知（只保留 exit，iOS 16 上只有 exit 有效）──────────
     if (!sLifecycleObservers) sLifecycleObservers = [NSMutableArray array];
-    NSDictionary *lifecycleActions = @{
-        @"SBApplicationDidFinishLaunchingNotification":      @"add",
-        @"SBApplicationDidBecomeActiveNotification":         @"add",
-        @"SBApplicationWillResumeNotification":              @"add",
-        @"SBApplicationDidResumeNotification":               @"add",
-        @"SBApplicationWillForegroundNotification":          @"add",
-        @"SBApplicationDidForegroundNotification":           @"add",
-        @"SBApplicationProcessDidLaunchNotification":        @"add",
-        @"SBApplicationProcessDidExitNotification":          @"remove",
-        @"SBApplicationDidExitNotification":                 @"remove",
-        @"SBApplicationWillTerminateNotification":           @"remove",
-    };
-    [lifecycleActions enumerateKeysAndObjectsUsingBlock:^(NSString *nm, NSString *act, BOOL *_) {
+    NSArray *exitNoteNames = @[
+        @"SBApplicationDidExitNotification",
+        @"SBApplicationProcessDidExitNotification",
+    ];
+    for (NSString *nm in exitNoteNames) {
         id obs = [[NSNotificationCenter defaultCenter]
             addObserverForName:nm object:nil queue:[NSOperationQueue mainQueue]
             usingBlock:^(NSNotification *note){
             @try {
                 NSString *bid = MKBidFromNote(note);
-                static int sNoteDetailLogs = 0;
-                if (sNoteDetailLogs < 30) {
-                    sNoteDetailLogs++;
-                    RDLog(@"NOTE: %@ bid=%@", note.name, bid ?: @"(nil)");
-                }
+                RDLog(@"EXIT NOTE: %@ bid=%@", nm, bid ?: @"(nil)");
                 if (!bid) return;
-                if ([act isEqualToString:@"add"]) {
-                    MKAddToRunningSet(bid);
-                    RDLog(@"LIFECYCLE + %@", bid);
-                } else {
-                    MKRemoveFromRunningSet(bid);
-                    RDLog(@"LIFECYCLE - %@", bid);
-                }
+                MKRemoveFromRunningSet(bid);
                 if (sInitDone) MKRefreshAllIcons();
             } @catch (NSException *e) {
-                RDLog(@"NOTE exception: %@", e.reason);
+                RDLog(@"EXIT NOTE exception: %@", e.reason);
             }
         }];
         if (obs) [sLifecycleObservers addObject:obs];
-    }];
+    }
 
     RDLog(@"======== ctor done (heavy work pending) ========");
 
@@ -658,7 +759,12 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
                               dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC),
                               8 * NSEC_PER_SEC, 1.0 * NSEC_PER_SEC);
     dispatch_source_set_event_handler(timer, ^{
-        MKSafe(^{ if (sInitDone) { MKComputeRunningSet(); MKRefreshAllIcons(); } });
+        MKSafe(^{
+            if (!sInitDone) return;
+            // 定时器只做补充扫描，不做清理（SBApp._setActivationState 已实时管理）
+            MKComputeRunningSetFromProc();
+            MKRefreshAllIcons();
+        });
     });
     dispatch_resume(timer);
 }

@@ -1,8 +1,8 @@
 Package: com.mk.runningdotindicator
 Name: RunningDotIndicator
-Version: 1.4.4
+Version: 1.4.5
 Architecture: iphoneos-arm64
-Description: Adds a customizable indicator dot beside app icons on the home screen to show which apps are currently running (v1.4.4: removed SBMainWorkspace hook that caused EXC_BAD_ACCESS).
+Description: Adds a customizable indicator dot beside app icons on the home screen to show which apps are currently running (v1.4.5: SBApplication._setActivationState hook + blacklist filter).
 Maintainer: 口非口
 Author: 口非口
 Section: Tweaks
