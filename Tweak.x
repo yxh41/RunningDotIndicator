@@ -142,8 +142,6 @@ static void MKBuildLSProxyCache() {
 
         int added = 0;
         int failed = 0;
-        Class recordClass = NSClassFromString(@"LSApplicationRecord");
-        Class proxyClass  = NSClassFromString(@"LSApplicationProxy");
 
         for (id record in records) {
             @try {
