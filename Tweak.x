@@ -100,7 +100,8 @@ static void MKSafe(void (^block)(void)) {
 // 运行状态检测（全部做 respondsToSelector 校验）
 // ====================================================================
 
-// 一次性探测本机真实存在的私有类/方法名（仅首次，输出到日志精确定位 API）
+// 一次性探测本机真实存在的私有类/方法名（调试用，保留但当前不调用）
+__attribute__((unused))
 static void MKProbe() {
     static BOOL done = NO;
     if (done) return; done = YES;
