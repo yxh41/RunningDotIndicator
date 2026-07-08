@@ -116,7 +116,7 @@ static NSTimeInterval sDisableTS = 0;
 static BOOL  sDisableChecked = NO;
 static BOOL  sDisabled = NO;
 static BOOL  sPathCacheReady = NO;
-static NSMutableDictionary<NSString*, NSInteger> *sRunLogCounts = nil; // 日志限流
+static NSMutableDictionary<NSString*, NSNumber*> *sRunLogCounts = nil; // 日志限流
 
 // ─── 文件日志 ────────────────────────────────────────────────
 static void RDLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
@@ -144,9 +144,10 @@ static void RDLog(NSString *fmt, ...) {
 // ─── 限流日志（同一 bundleID 最多记录 N 次）──────────────
 static void RDLogRunning(NSString *bid) {
     if (!sRunLogCounts) sRunLogCounts = [NSMutableDictionary dictionary];
-    NSInteger count = sRunLogCounts[bid];
+    NSNumber *countObj = sRunLogCounts[bid];
+    NSInteger count = countObj ? [countObj integerValue] : 0;
     if (count < 3) {
-        sRunLogCounts[bid] = count + 1;
+        sRunLogCounts[bid] = @(count + 1);
         RDLog(@"RUNNING: %@ (call=%d, log=%ld)", bid, sCallCount, (long)(count+1));
     }
 }
@@ -302,7 +303,10 @@ static void MKSyncFromSBAppCtrl() {
         int count = 0;
         for (id app in runningApps) {
             if (![app isKindOfClass:NSClassFromString(@"SBApplication")]) continue;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
             NSString *bid = [app performSelector:NSSelectorFromString(@"bundleIdentifier")];
+#pragma clang diagnostic pop
             if (bid.length && !MKIsBlacklisted(bid)) {
                 MKAddToRunningSet(bid);
                 count++;
