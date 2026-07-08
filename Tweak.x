@@ -1,16 +1,10 @@
 //
-//  Tweak.x — RunningDotIndicator v1.4.6
-//  v1.4.6 核心修复（参考 iOS 16 运行时头文件 + Lynx2 Dock 指示器）：
-//    🔴 FIX: _noteProcess:(id) didChangeToState:(id) — arg3 是 FBProcessState* 对象，不是 NSInteger！
-//       之前把指针地址当整数比较 → state >= 2 永远 true → 所有 App 都在 runningSet
-//    ✅ Hook SBApplication._noteProcess:(FBApplicationProcess*) didChangeToState:(FBProcessState*)
-//       → [arg3 isRunning] / [arg3 taskState] 获取真实运行状态
-//    ✅ Hook SBApplication._setInternalProcessState:(SBApplicationProcessState*)
-//       → [arg2 isRunning] 获取运行状态（iOS 16.3+ 新增包装类）
-//    ✅ Hook SBApplication._setActivationState:(int) — 备用入口（int 不是 NSInteger）
-//    ✅ 系统进程黑名单 + 日志限流
-//    ✅ 保留延迟初始化（15 秒）防止 watchdog 杀 SpringBoard
-//    ✅ 保留 SBApplicationDidExitNotification 退出检测
+//  Tweak.x — RunningDotIndicator v1.4.7
+//  v1.4.7: ✅ 核心检测已验证成功！优化版：
+//    - 黑名单精简：只过滤无桌面图标的纯后台服务（用户手动打开的系统App也显示绿点）
+//    - 移除 com.apple.weather/camera 黑名单（_setInternalProcState 更准确）
+//    - 移除 8秒定时器（hook 已实时检测，不需要补充扫描）
+//    - 日志级别降低（检测稳定后减少刷屏）
 //  紧急开关：/var/mobile/Documents/rd_disabled 存在则整机不生效。
 //
 
@@ -67,29 +61,29 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 // ─── 常量 ──────────────────────────────────────────────────
 static NSInteger const kDotTag  = 9999;
 
-// ─── 系统进程黑名单（这些 App 不显示指示点）─────────────
+// ─── 系统进程黑名单（只过滤无桌面图标的纯后台服务 + 越狱工具）─────────
+// 用户手动打开的系统App（设置、短信、天气、相机等）应该显示绿点
 static NSArray *sBlacklist = nil;
 static void MKInitBlacklist() {
     sBlacklist = @[
-        @"com.apple.springboard",
-        @"com.apple.AccessibilityUIServer",
-        @"com.apple.PosterBoard",
-        @"com.apple.NanoUniverse.AegirProxyApp",
-        @"com.apple.SleepLockScreen",
-        @"com.apple.GameCenterRemoteAlert",
-        @"com.apple.InCallService",
-        @"com.apple.Spotlight",
-        @"com.apple.CoreAuthUI",
-        @"com.apple.camera",
-        @"com.apple.weather",      // WeatherPoster 误检测，不是用户打开的天气
-        @"wiki.qaq.trapp",         // 越狱工具 App，不是用户关注的
+        // ── 无桌面图标的纯后台服务 ──
+        @"com.apple.springboard",           // SpringBoard 自身
+        @"com.apple.PosterBoard",           // 墙纸/锁屏管理（无桌面图标）
+        @"com.apple.AccessibilityUIServer",  // 无障碍服务（无桌面图标）
+        @"com.apple.Spotlight",             // Spotlight搜索（无桌面图标）
+        @"com.apple.NanoUniverse.AegirProxyApp", // 后台代理
+        @"com.apple.SleepLockScreen",       // 锁屏后台
+        @"com.apple.GameCenterRemoteAlert", // GameCenter弹窗后台
+        @"com.apple.CoreAuthUI",            // 认证UI后台
+        // ── 越狱工具 ──
+        @"wiki.qaq.trapp",                  // 越狱工具App
         @"wiki.qaq.TrollFools",
         @"com.opa334.Dopamine-roothide",
         @"com.roothide.manager",
         @"com.tigisoftware.Filza",
         @"org.coolstar.SileoStore",
         @"com.muirey03.cr4shedgui",
-        @"netdisk_iPhone.files_extension",
+        @"netdisk_iPhone.files_extension",   // 网盘扩展
     ];
 }
 
@@ -141,12 +135,12 @@ static void RDLog(NSString *fmt, ...) {
     } @catch (NSException *e) {}
 }
 
-// ─── 限流日志（同一 bundleID 最多记录 N 次）──────────────
+// ─── 限流日志（同一 bundleID 最多记录 5 次 RUNNING）──────────────
 static void RDLogRunning(NSString *bid) {
     if (!sRunLogCounts) sRunLogCounts = [NSMutableDictionary dictionary];
     NSNumber *countObj = sRunLogCounts[bid];
     NSInteger count = countObj ? [countObj integerValue] : 0;
-    if (count < 3) {
+    if (count < 5) {
         sRunLogCounts[bid] = @(count + 1);
         RDLog(@"RUNNING: %@ (call=%d, log=%ld)", bid, sCallCount, (long)(count+1));
     }
@@ -802,8 +796,8 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.4.6 ctor: 3 SBApplication hooks (corrected arg types)");
-    RDLog(@"======== v1.4.6 loading (FIX: _noteProcess arg3=id, _setInternalProcState, _setActivationState=int) ========");
+    NSLog(@"[RunningDotIndicator] v1.4.7 ctor: 3 SBApplication hooks (optimized blacklist + no timer)");
+    RDLog(@"======== v1.4.7 loading (optimized: refined blacklist, removed timer, hooks handle all detection) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
@@ -854,19 +848,6 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
         MKSafe(^{ MKDelayedInit(); });
     });
 
-    // ─── 定时刷新：每 8 秒 ──────────
-    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                                                      dispatch_get_main_queue());
-    dispatch_source_set_timer(timer,
-                              dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC),
-                              8 * NSEC_PER_SEC, 1.0 * NSEC_PER_SEC);
-    dispatch_source_set_event_handler(timer, ^{
-        MKSafe(^{
-            if (!sInitDone) return;
-            // 定时器只做补充扫描，不做清理（SBApp hooks 已实时管理）
-            MKComputeRunningSetFromProc();
-            MKRefreshAllIcons();
-        });
-    });
-    dispatch_resume(timer);
+    // ─── 无定时器：_setInternalProcessState hook 已实时检测所有状态变化 ──
+    // v1.4.4~v1.4.6 曾用8秒定时器做补充扫描，但 hook 已完全覆盖所有 App 启动/退出
 }
