@@ -1,8 +1,8 @@
 Package: com.mk.runningdotindicator
 Name: RunningDotIndicator
-Version: 1.3.6
+Version: 1.4.0
 Architecture: iphoneos-arm64
-Description: Adds a customizable indicator dot beside app icons on the home screen to show which apps are currently running (process-based detection). Color, shape, size, position and opacity are all configurable.
+Description: Adds a customizable indicator dot beside app icons on the home screen to show which apps are currently running (multi-strategy detection: proc_enum + LSProxy + lifecycle). Color, shape, size, position and opacity are all configurable.
 Maintainer: 口非口
 Author: 口非口
 Section: Tweaks
