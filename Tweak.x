@@ -1,11 +1,14 @@
 //
-//  Tweak.x — RunningDotIndicator v1.4.5
-//  v1.4.5 核心策略转变：
-//    ✅ Hook SBApplication._setActivationState:(NSInteger) — 实时检测 App 启动/状态变化
-//    ✅ Hook SBApplication._noteProcess:(id)didChangeToState:(NSInteger) — 补充检测
-//    ✅ SBApplicationController.runningApplications (performSelector) — 初始同步
-//    ✅ 系统进程黑名单 — 过滤掉不该显示指示点的 App
-//    ✅ 日志限流 — 同一 bundleID 最多记录 3 次 RUNNING
+//  Tweak.x — RunningDotIndicator v1.4.6
+//  v1.4.6 核心修复（参考 iOS 16 运行时头文件 + Lynx2 Dock 指示器）：
+//    🔴 FIX: _noteProcess:(id) didChangeToState:(id) — arg3 是 FBProcessState* 对象，不是 NSInteger！
+//       之前把指针地址当整数比较 → state >= 2 永远 true → 所有 App 都在 runningSet
+//    ✅ Hook SBApplication._noteProcess:(FBApplicationProcess*) didChangeToState:(FBProcessState*)
+//       → [arg3 isRunning] / [arg3 taskState] 获取真实运行状态
+//    ✅ Hook SBApplication._setInternalProcessState:(SBApplicationProcessState*)
+//       → [arg2 isRunning] 获取运行状态（iOS 16.3+ 新增包装类）
+//    ✅ Hook SBApplication._setActivationState:(int) — 备用入口（int 不是 NSInteger）
+//    ✅ 系统进程黑名单 + 日志限流
 //    ✅ 保留延迟初始化（15 秒）防止 watchdog 杀 SpringBoard
 //    ✅ 保留 SBApplicationDidExitNotification 退出检测
 //  紧急开关：/var/mobile/Documents/rd_disabled 存在则整机不生效。
@@ -39,11 +42,27 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 + (instancetype)sharedInstance;
 @end
 
-// ─── iOS 16 App Activation State 枚举 ────────────────────
-//  SBApplicationActivationState:
-//    0 = Inactive/Dead
-//    1 = Background (in memory, suspended or running)
-//    2 = Foreground (active, user-visible)
+// ─── iOS 16 私有类声明（运行时头文件确认）──────────────
+// FBProcessState — 进程状态对象（有 isRunning/taskState/foreground 属性）
+@interface FBProcessState : NSObject
+@property (getter=isRunning, nonatomic) BOOL running;
+@property (nonatomic) int taskState;         // 2=Running, 3=Suspended, 1=NotRunning
+@property (getter=isForeground, nonatomic) BOOL foreground;
+@end
+
+// FBApplicationProcess — 应用进程对象（有 bundleIdentifier）
+@interface FBApplicationProcess : NSObject
+@property (nonatomic, readonly) NSString *bundleIdentifier;
+@property (getter=isRunning, nonatomic, readonly) BOOL running;
+@property (nonatomic, readonly) int pid;
+@end
+
+// SBApplicationProcessState — iOS 16.3+ 包装类（有 isRunning/taskState/foreground）
+@interface SBApplicationProcessState : NSObject
+@property (readonly, nonatomic, getter=isRunning) BOOL running;
+@property (readonly, nonatomic) int taskState;
+@property (readonly, nonatomic, getter=isForeground) BOOL foreground;
+@end
 
 // ─── 常量 ──────────────────────────────────────────────────
 static NSInteger const kDotTag  = 9999;
@@ -399,6 +418,47 @@ static NSString *MKBidFromNote(NSNotification *note) {
     return nil;
 }
 
+// ─── 安全获取 FBProcessState / SBApplicationProcessState 属性 ──
+static BOOL MKGetBoolFromState(id stateObj, NSString *propName) {
+    @try {
+        if (!stateObj) return NO;
+        // 尝试 valueForKey（KVC）
+        id val = [stateObj valueForKey:propName];
+        if ([val isKindOfClass:[NSNumber class]]) return [val boolValue];
+        // 尝试 performSelector
+        SEL sel = NSSelectorFromString(propName);
+        if ([stateObj respondsToSelector:sel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            id result = [stateObj performSelector:sel];
+#pragma clang diagnostic pop
+            if ([result isKindOfClass:[NSNumber class]]) return [result boolValue];
+        }
+    } @catch (NSException *e) {
+        RDLog(@"KVC %@ failed: %@", propName, e.reason);
+    }
+    return NO;
+}
+
+static int MKGetIntFromState(id stateObj, NSString *propName) {
+    @try {
+        if (!stateObj) return 0;
+        id val = [stateObj valueForKey:propName];
+        if ([val isKindOfClass:[NSNumber class]]) return [val intValue];
+        SEL sel = NSSelectorFromString(propName);
+        if ([stateObj respondsToSelector:sel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            id result = [stateObj performSelector:sel];
+#pragma clang diagnostic pop
+            if ([result isKindOfClass:[NSNumber class]]) return [result intValue];
+        }
+    } @catch (NSException *e) {
+        RDLog(@"KVC %@ failed: %@", propName, e.reason);
+    }
+    return 0;
+}
+
 // ====================================================================
 // 渲染辅助
 // ====================================================================
@@ -603,25 +663,116 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %end
 
 // ====================================================================
-// Hook — SBApplication._setActivationState:(NSInteger)
-// 这是 iOS 16 上检测 App 启动的关键方法！
-// 当 App 从 Inactive→Background/Foreground 时，SpringBoard 内部调用此方法
-// state 值：0=Inactive/Dead, 1=Background, 2=Foreground
+// Hook 1 — SBApplication._noteProcess:(id) didChangeToState:(id)
+// 🔴 v1.4.5 BUG FIX: arg3 是 FBProcessState* 对象 (id)，不是 NSInteger！
+// 之前把指针地址当整数 → state >= 2 永远 true → 所有 App 都加入 runningSet
+// 正确方式：用 [arg3 isRunning] / [arg3 taskState] 获取真实状态
+// 参考 iOS 16 运行时头文件：FBProcessState 有 running/taskState/foreground 属性
 // ====================================================================
 
 %hook SBApplication
 
-- (void)_setActivationState:(NSInteger)state {
+- (void)_noteProcess:(id)process didChangeToState:(id)state {
+    %orig;
+
+    @try {
+        NSString *bid = [self bundleIdentifier];
+        if (!bid.length && process) {
+            // 从 FBApplicationProcess 获取 bundleIdentifier
+            bid = [process valueForKey:@"bundleIdentifier"];
+            if (![bid isKindOfClass:[NSString class]]) bid = nil;
+        }
+        if (!bid.length) return;
+
+        // 从 FBProcessState 对象获取运行状态（KVC 安全方式）
+        BOOL isRunning = MKGetBoolFromState(state, @"isRunning");
+        int taskState = MKGetIntFromState(state, @"taskState");
+        BOOL isForeground = MKGetBoolFromState(state, @"isForeground");
+
+        RDLog(@"SBApp._noteProcess: %@ → isRunning=%d taskState=%d foreground=%d",
+              bid, isRunning, taskState, isForeground);
+
+        // FBProcessState.taskState: 2=Running, 3=Suspended → app alive
+        // FBProcessState.taskState: 1=NotRunning/Dead → app exited
+        // FBProcessState.isRunning: YES → app process exists
+        if (isRunning || taskState == 2 || taskState == 3) {
+            MKAddToRunningSet(bid);
+        } else if (taskState == 1 || !isRunning) {
+            MKRemoveFromRunningSet(bid);
+        }
+
+        if (sInitDone) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                MKRefreshAllIcons();
+            });
+        }
+    } @catch (NSException *e) {
+        RDLog(@"_noteProcess EXCEPTION: %@", e.reason);
+    }
+}
+
+%end
+
+// ====================================================================
+// Hook 2 — SBApplication._setInternalProcessState:(id)
+// iOS 16.3+ 新增：SBApplicationProcessState 包装类
+// 内含 isRunning / taskState / foreground 属性（直接 ObjC 属性）
+// 这是更干净的状态更新入口
+// ====================================================================
+
+%hook SBApplication
+
+- (void)_setInternalProcessState:(id)internalState {
     %orig;
 
     @try {
         NSString *bid = [self bundleIdentifier];
         if (!bid.length) return;
 
-        RDLog(@"SBApp._setActivationState: %@ → state=%ld", bid, (long)state);
+        BOOL isRunning = MKGetBoolFromState(internalState, @"isRunning");
+        int taskState = MKGetIntFromState(internalState, @"taskState");
+
+        RDLog(@"SBApp._setInternalProcState: %@ → isRunning=%d taskState=%d",
+              bid, isRunning, taskState);
+
+        if (isRunning || taskState == 2 || taskState == 3) {
+            MKAddToRunningSet(bid);
+        } else if (taskState == 1 || !isRunning) {
+            MKRemoveFromRunningSet(bid);
+        }
+
+        if (sInitDone) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                MKRefreshAllIcons();
+            });
+        }
+    } @catch (NSException *e) {
+        RDLog(@"_setInternalProcState EXCEPTION: %@", e.reason);
+    }
+}
+
+%end
+
+// ====================================================================
+// Hook 3 — SBApplication._setActivationState:(int)
+// 备用入口：App UI 激活状态变化
+// 实际签名是 (int)，不是 (NSInteger)
+// state 值：0=Inactive/Dead, 1=Background, 2=Foreground
+// ====================================================================
+
+%hook SBApplication
+
+- (void)_setActivationState:(int)state {
+    %orig;
+
+    @try {
+        NSString *bid = [self bundleIdentifier];
+        if (!bid.length) return;
+
+        RDLog(@"SBApp._setActivationState: %@ → state=%d", bid, state);
 
         if (state >= 1) {
-            // Background 或 Foreground → App 正在运行
+            // Background 或 Foreground → App 在内存中运行
             MKAddToRunningSet(bid);
         } else {
             // Inactive/Dead → App 已退出
@@ -641,67 +792,14 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %end
 
 // ====================================================================
-// Hook — SBApplication._noteProcess:(id)didChangeToState:(NSInteger)
-// 补充检测：进程状态变化时也更新 runningSet
-// process 是 FBApplicationProcess 实例（有 bundleIdentifier）
-// state 是 FBProcessState 枚举：1=Dead, 2=Running, 3=Suspended
-// ====================================================================
-
-%hook SBApplication
-
-- (void)_noteProcess:(id)process didChangeToState:(NSInteger)state {
-    %orig;
-
-    @try {
-        NSString *bid = nil;
-
-        // 先从 SBApplication 自身获取 bundleID
-        bid = [self bundleIdentifier];
-
-        // 如果自身没有，从 process 对象尝试获取
-        if (!bid.length && process) {
-            SEL bidSel = NSSelectorFromString(@"bundleIdentifier");
-            if ([process respondsToSelector:bidSel]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                bid = [process performSelector:bidSel];
-#pragma clang diagnostic pop
-            }
-        }
-
-        if (!bid.length) return;
-
-        RDLog(@"SBApp._noteProcess: %@ → state=%ld", bid, (long)state);
-
-        // FBProcessState: 2=Running, 3=Suspended → both mean app is alive
-        // FBProcessState: 1=Dead → app exited
-        if (state >= 2) {
-            MKAddToRunningSet(bid);
-        } else if (state == 1) {
-            MKRemoveFromRunningSet(bid);
-        }
-
-        if (sInitDone) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                MKRefreshAllIcons();
-            });
-        }
-    } @catch (NSException *e) {
-        RDLog(@"_noteProcess EXCEPTION: %@", e.reason);
-    }
-}
-
-%end
-
-// ====================================================================
 // 构造函数（只做最轻量工作）
 // ====================================================================
 
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.4.5 ctor: SBApplication._setActivationState hook");
-    RDLog(@"======== v1.4.5 loading (SBApp._setActivationState + blacklist) ========");
+    NSLog(@"[RunningDotIndicator] v1.4.6 ctor: 3 SBApplication hooks (corrected arg types)");
+    RDLog(@"======== v1.4.6 loading (FIX: _noteProcess arg3=id, _setInternalProcState, _setActivationState=int) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
@@ -761,7 +859,7 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
     dispatch_source_set_event_handler(timer, ^{
         MKSafe(^{
             if (!sInitDone) return;
-            // 定时器只做补充扫描，不做清理（SBApp._setActivationState 已实时管理）
+            // 定时器只做补充扫描，不做清理（SBApp hooks 已实时管理）
             MKComputeRunningSetFromProc();
             MKRefreshAllIcons();
         });
