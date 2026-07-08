@@ -1,9 +1,10 @@
 //
-//  Tweak.x — RunningDotIndicator v1.4.9
-//  v1.4.9: 修复 App 名字未被隐藏的 bug
-//    ✅ MKFindLabelView 三重策略：accessor → 直接子视图 → 递归搜索
-//    ✅ 双重隐藏策略：hidden=YES + alpha=0（防止系统 layout 恢复可见性）
-//    ✅ 诊断日志：标签未找到时 dump 子视图类名
+//  Tweak.x — RunningDotIndicator v1.5.0
+//  v1.5.0: 修复指示器定位 — 标签搜索加 superview 兄弟节点策略
+//    ✅ MKFindLabelView 四重策略：accessor → superview兄弟 → 直接子视图 → 递归
+//    ✅ 指示器定位：标签找到→在标签位置(替换名字)，标签未找到→图标底部(Dock)
+//    ✅ objc associated objects 跨层级追踪指示器（不再依赖 viewWithTag）
+//    ✅ didMoveToWindow 清理：视图移除时同步清理指示器+恢复标签
 //  v1.4.8: Lynx2 风格重构 — 两种形状（圆点/横条），固定替换 App 名字位置
 //    ✅ 核心检测已验证成功（_setInternalProcessState hook）
 //    ✅ 简化 UI：只有圆点(Dot)和横条(Bar/Pill)两种形状
@@ -64,6 +65,15 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 
 // ─── 常量 ──────────────────────────────────────────────────
 static NSInteger const kDotTag  = 9999;
+
+// ─── 关联对象：SBIconView ↔ 指示器视图（跨层级追踪）──
+static char kMKIndicatorKey;
+static UIView *MKGetIndicator(SBIconView *iv) {
+    return objc_getAssociatedObject(iv, &kMKIndicatorKey);
+}
+static void MKSetIndicator(SBIconView *iv, UIView *dot) {
+    objc_setAssociatedObject(iv, &kMKIndicatorKey, dot, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
 
 // ─── 系统进程黑名单（只过滤无桌面图标的纯后台服务 + 越狱工具）─────────
 // 用户手动打开的系统App（设置、短信、天气、相机等）应该显示绿点
@@ -465,13 +475,19 @@ static int MKGetIntFromState(id stateObj, NSString *propName) {
 // 渲染辅助 — Lynx2 风格：替换 App 名字标签区域
 // ====================================================================
 
-// 找到 SBIconView 中的名字标签视图 — 三重策略（v1.4.9 修复）
-// 问题：v1.4.8 只搜索直接子视图，iOS 16 SBIconListLabel 可能通过属性访问而非子视图
+// 找到 SBIconView 对应的名字标签视图 — v1.5.0 四重策略
+// v1.4.9 问题：iOS 16 SBIconListLabel 不在 SBIconView 内部，是其兄弟节点
+// 日志证实：NO LABEL — SBIconView subviews: [SBFTouchPassThroughView]
 static UIView *MKFindLabelView(SBIconView *iconView) {
     @try {
-        // ── Strategy 1: SBIconView accessor 方法（iOS 16 最可靠）──
-        // 运行时头文件: SBIconView.labelView → SBIconListLabel
-        NSArray *accessorNames = @[@"labelView", @"_titleLabelView", @"titleLabel", @"_labelView"];
+        // ── Strategy 1: SBIconView accessor 方法（iOS 16 运行时头文件）──
+        // SBIconView 有 labelView / listLabelView → SBIconListLabel
+        NSArray *accessorNames = @[
+            @"labelView", @"listLabelView", @"_listLabelView",
+            @"_titleLabelView", @"titleLabel", @"_labelView",
+            @"iconLabelView", @"_iconLabelView",
+            @"nameLabelView", @"_nameLabelView"
+        ];
         for (NSString *name in accessorNames) {
             SEL sel = NSSelectorFromString(name);
             if ([iconView respondsToSelector:sel]) {
@@ -485,18 +501,35 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
             }
         }
 
-        // ── Strategy 2: 直接子视图搜索 ──
+        // ── Strategy 2: 父视图兄弟节点（iOS 16 核心！标签是 SBIconView 的兄弟）──
+        // SBIconView 和 SBIconListLabel 是同一个父容器的子视图
+        UIView *parent = iconView.superview;
+        if (parent && parent.subviews.count <= 8) {
+            // 父视图子节点 ≤8 → 很可能是 per-icon 容器（icon + label + badge 等）
+            for (UIView *sv in parent.subviews) {
+                if (sv == iconView) continue;  // 跳过自己
+                NSString *cls = NSStringFromClass([sv class]);
+                if ([sv isKindOfClass:[UILabel class]] ||
+                    [cls containsString:@"IconLabel"] ||
+                    [cls containsString:@"ListLabel"] ||
+                    [cls containsString:@"Label"] ||
+                    [cls containsString:@"label"]) {
+                    return sv;
+                }
+            }
+        }
+
+        // ── Strategy 3: 直接子视图搜索 ──
         for (UIView *sv in iconView.subviews) {
             NSString *cls = NSStringFromClass([sv class]);
             if ([sv isKindOfClass:[UILabel class]] ||
                 [cls containsString:@"IconLabel"] ||
-                [cls containsString:@"Label"] ||
-                [cls containsString:@"label"]) {
+                [cls containsString:@"Label"]) {
                 return sv;
             }
         }
 
-        // ── Strategy 3: 递归子视图搜索 ──
+        // ── Strategy 4: 递归子视图搜索 ──
         NSMutableArray *stack = [NSMutableArray arrayWithArray:iconView.subviews];
         while (stack.count > 0) {
             UIView *v = [stack lastObject];
@@ -513,13 +546,22 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
             [stack addObjectsFromArray:v.subviews];
         }
 
-        // ── 诊断：标签未找到时 dump 子视图类名 ──
+        // ── 诊断：标签未找到 → dump iconView + 父视图层级 ──
         static int sNoLabelLogs = 0;
-        if (sNoLabelLogs < 5) {
+        if (sNoLabelLogs < 10) {
             sNoLabelLogs++;
-            NSMutableString *dump = [NSMutableString stringWithFormat:@"NO LABEL — %@ subviews:", NSStringFromClass([iconView class])];
+            NSMutableString *dump = [NSMutableString stringWithFormat:@"NO LABEL — %@ direct:[", NSStringFromClass([iconView class])];
             for (UIView *sv in iconView.subviews) {
-                [dump appendFormat:@" [%@]", NSStringFromClass([sv class])];
+                [dump appendFormat:@" %@", NSStringFromClass([sv class])];
+            }
+            [dump appendString:@"]"];
+            UIView *parent = iconView.superview;
+            if (parent) {
+                [dump appendFormat:@" parent(%@, %lu kids):[", NSStringFromClass([parent class]), (unsigned long)parent.subviews.count];
+                for (UIView *sv in parent.subviews) {
+                    [dump appendFormat:@" %@(y=%.0f,h=%.0f)", NSStringFromClass([sv class]), sv.frame.origin.y, sv.frame.size.height];
+                }
+                [dump appendString:@"]"];
             }
             RDLog(@"%@", dump);
         }
@@ -531,7 +573,7 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
 }
 
 // ====================================================================
-// 主更新函数 — Lynx2 风格：运行中→指示器替换名字，退出→恢复名字
+// 主更新函数 — v1.5.0：标签找到→指示器在标签位置，标签未找到→图标底部居中(Dock)
 // ====================================================================
 
 static void MKUpdate(SBIconView *self) {
@@ -541,7 +583,8 @@ static void MKUpdate(SBIconView *self) {
         sCallCount++;
         if (MKIsDisabled()) {
             // 禁用时：移除指示器，恢复名字标签
-            [[self viewWithTag:kDotTag] removeFromSuperview];
+            UIView *indicator = MKGetIndicator(self);
+            if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
             UIView *label = MKFindLabelView(self);
             if (label) { label.hidden = NO; label.alpha = 1.0f; }
             return;
@@ -550,7 +593,8 @@ static void MKUpdate(SBIconView *self) {
         MKConfig *cfg = [MKConfig sharedConfig];
         if (!cfg || !cfg.enabled) {
             // 未启用：移除指示器，恢复名字标签
-            [[self viewWithTag:kDotTag] removeFromSuperview];
+            UIView *indicator = MKGetIndicator(self);
+            if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
             UIView *label = MKFindLabelView(self);
             if (label) { label.hidden = NO; label.alpha = 1.0f; }
             return;
@@ -566,10 +610,11 @@ static void MKUpdate(SBIconView *self) {
         BOOL running = MKIsAppRunning(bundleID);
 
         UIView *label = MKFindLabelView(self);
+        UIView *indicator = MKGetIndicator(self);
 
         if (!running) {
             // ── App 不在运行 → 移除指示器，恢复名字 ──
-            [[self viewWithTag:kDotTag] removeFromSuperview];
+            if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
             if (label) { label.hidden = NO; label.alpha = 1.0f; }
             return;
         }
@@ -579,10 +624,7 @@ static void MKUpdate(SBIconView *self) {
         // ── App 正在运行 → 隐藏名字，显示指示器 ──
         if (label) { label.hidden = YES; label.alpha = 0.0f; }
 
-        CGSize mySize = self.bounds.size;
-        if (mySize.width < 10 || mySize.height < 10) return;
-
-        // 计算指示器尺寸和位置
+        // 指示器尺寸
         CGFloat indicatorW, indicatorH;
         if (cfg.shape == MKShapeDot) {
             indicatorW = cfg.dotSize;
@@ -593,32 +635,51 @@ static void MKUpdate(SBIconView *self) {
             indicatorH = cfg.barHeight;
         }
 
-        // 指示器放在名字标签区域：图标底部，居中
-        // 标签通常在图标底部 ~30pt 区域
-        CGFloat labelAreaY = mySize.height - indicatorH - 2.0f;
-        CGFloat indicatorX = (mySize.width - indicatorW) / 2.0f;
+        // ── 决定宿主视图和位置 ──
+        UIView *hostView;
+        CGRect indicatorFrame;
 
-        UIView *existing = [self viewWithTag:kDotTag];
-        if (existing && ![existing isKindOfClass:[MKIndicatorDotView class]]) {
-            [existing removeFromSuperview];
-            existing = nil;
+        if (label && label.superview) {
+            // 标签找到 → 指示器放在标签位置（替换名字）
+            hostView = label.superview;
+            CGRect labelFrame = label.frame;
+            indicatorFrame = CGRectMake(
+                labelFrame.origin.x + (labelFrame.size.width - indicatorW) / 2.0f,
+                labelFrame.origin.y + (labelFrame.size.height - indicatorH) / 2.0f,
+                indicatorW,
+                indicatorH
+            );
+        } else {
+            // 无标签（Dock 图标）→ 指示器在图标底部居中
+            hostView = self;
+            CGSize mySize = self.bounds.size;
+            if (mySize.width < 10 || mySize.height < 10) return;
+            indicatorFrame = CGRectMake(
+                (mySize.width - indicatorW) / 2.0f,
+                mySize.height - indicatorH - 4.0f,
+                indicatorW,
+                indicatorH
+            );
         }
 
-        if (!existing) {
-            MKIndicatorDotView *indicator = [[MKIndicatorDotView alloc]
-                initWithFrame:CGRectMake(indicatorX, labelAreaY, indicatorW, indicatorH)];
+        // 宿主视图变了 → 需要重新添加指示器
+        if (indicator && indicator.superview != hostView) {
+            [indicator removeFromSuperview];
+            indicator = nil;
+            MKSetIndicator(self, nil);
+        }
+
+        if (!indicator) {
+            indicator = [[MKIndicatorDotView alloc] initWithFrame:indicatorFrame];
             indicator.tag = kDotTag;
-            [indicator applyConfig];
-            [self addSubview:indicator];
+            [(MKIndicatorDotView *)indicator applyConfig];
+            [hostView addSubview:indicator];
+            MKSetIndicator(self, indicator);
+        } else {
+            indicator.frame = indicatorFrame;
+            [(MKIndicatorDotView *)indicator applyConfig];
+            indicator.hidden = NO;
         }
-
-        UIView *indicator = [self viewWithTag:kDotTag];
-        if (!indicator) return;
-
-        // 更新位置和外观
-        indicator.frame = CGRectMake(indicatorX, labelAreaY, indicatorW, indicatorH);
-        [(MKIndicatorDotView *)indicator applyConfig];
-        indicator.hidden = NO;
     });
 }
 
@@ -711,7 +772,15 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 
 - (void)didMoveToWindow {
     %orig;
-    if (self.window && sInitDone) {
+    if (!self.window) {
+        // View 从窗口移除 → 清理指示器 + 恢复标签
+        UIView *indicator = MKGetIndicator(self);
+        if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
+        UIView *label = MKFindLabelView(self);
+        if (label) { label.hidden = NO; label.alpha = 1.0f; }
+        return;
+    }
+    if (sInitDone) {
         dispatch_async(dispatch_get_main_queue(), ^{
             MKUpdate(self);
         });
@@ -861,8 +930,8 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.4.9 ctor: fixed label hiding (3-strategy search + alpha=0)");
-    RDLog(@"======== v1.4.9 loading (fixed: label not hidden → 3-strategy findLabel + alpha=0) ========");
+    NSLog(@"[RunningDotIndicator] v1.5.0 ctor: superview sibling label search + label-frame positioning");
+    RDLog(@"======== v1.5.0 loading (superview sibling label search + label-frame positioning + associated objects) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
