@@ -1,11 +1,15 @@
 //
-//  Tweak.x — RunningDotIndicator v1.4.1
-//  v1.4.0 日志诊断结果：
-//    ✅ proc_listallpids 成功了！（ret=264, 66 PIDs）
-//    ❌ LSProxy 缓存崩了：allInstalledApplications 返回 LSApplicationRecord，
-//       它没有 executablePath 属性 → 改为用 applicationProxyForIdentifier: 获取 LSApplicationProxy
-//    ❌ 只检测到 4 个越狱工具进程（刚 respring 无普通 App 运行）
-//    🆕 roothide 路径格式：.jbroot-XXX 前缀 → 需处理
+//  Tweak.x — RunningDotIndicator v1.4.2
+//  v1.4.2 核心改动：
+//    ✅ Hook SBMainWorkspace.process:stateDidChangeFromState:toState: (实时检测)
+//    ✅ SBApplicationController.runningApplications (启动时初始同步)
+//    ✅ NSFileManager 扫描替代彻底失败的 LSProxy 缓存
+//    ✅ 保留 proc_listallpids 作为终极回退
+//    ✅ 生命周期通知作为补充
+//  已废弃方案（禁止回退）：
+//    ❌ LSApplicationProxy.applicationProxyForIdentifier: (iOS 16 unrecognized selector)
+//    ❌ SBApplication.isRunning (iOS 16 不存在)
+//    ❌ SBRunningProcessManager/SBAppSwitcher*/SBRecentAppListModel (全部 nil)
 //  紧急开关：/var/mobile/Documents/rd_disabled 存在则整机不生效。
 //
 
@@ -29,31 +33,49 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 - (NSString *)applicationBundleID;
 @end
 
+// SBApplicationController — 管理所有 SBApplication 实例
 @interface SBApplicationController : NSObject
 + (id)sharedInstance;
++ (id)sharedInstanceIfExists;
 - (id)applicationWithBundleIdentifier:(NSString *)bundleID;
+- (NSArray *)allApplications;
+- (NSArray *)runningApplications;
 @end
 
+// SBApplication — 代表单个应用（iOS 16 仍有 pid、bundleIdentifier）
 @interface SBApplication : NSObject
-@end
-
-// LSApplicationProxy — 有 executablePath 属性（通过 applicationProxyForIdentifier: 获取）
-@interface LSApplicationProxy : NSObject
-@property (nonatomic, readonly) NSString *applicationIdentifier;
 @property (nonatomic, readonly) NSString *bundleIdentifier;
-@property (nonatomic, readonly) NSString *executablePath;
+@property (nonatomic, readonly) pid_t pid;
 @end
 
-// LSApplicationWorkspace — 提供两个关键方法
-@interface LSApplicationWorkspace : NSObject
-+ (instancetype)defaultWorkspace;
-- (NSArray *)allInstalledApplications;             // 返回 LSApplicationRecord（无 executablePath）
-- (LSApplicationProxy *)applicationProxyForIdentifier:(NSString *)identifier;  // 返回 LSApplicationProxy（有 executablePath）
+// SBMainWorkspace — iOS 16 进程状态变更入口
+@interface SBMainWorkspace : NSObject
+@end
+
+// FBApplicationProcess — FrontBoard 进程表示
+@interface FBApplicationProcess : NSObject
+@property (nonatomic, readonly) NSString *bundleIdentifier;
+@end
+
+// FBProcessState — 进程状态
+@interface FBProcessState : NSObject
+@property (nonatomic, readonly) int taskState;  // 1=Dead, 2=Running, 3=Suspended
+@end
+
+// FBSSystemService — 通过 bundleID 获取 PID
+@interface FBSSystemService : NSObject
++ (instancetype)sharedService;
+- (pid_t)pidForApplication:(NSString *)bundleId;
 @end
 
 // ─── 常量 ──────────────────────────────────────────────────
 static NSInteger const kDotTag  = 9999;
 static NSInteger const kTestTag = 7777;
+
+// ─── taskState 枚举 ──────────────────────────────────────────
+static int const kTaskStateDead      = 1;  // 进程已终止
+static int const kTaskStateRunning   = 2;  // 进程正在运行（前台）
+static int const kTaskStateSuspended = 3;  // 进程已挂起（后台）
 
 // ─── 全局状态 ─────────────────────────────────────────────
 static int   sCallCount    = 0;
@@ -65,7 +87,7 @@ static NSMutableArray *sLifecycleObservers = nil;
 static NSTimeInterval sDisableTS = 0;
 static BOOL  sDisableChecked = NO;
 static BOOL  sDisabled = NO;
-static BOOL  sLSProxyReady = NO;
+static BOOL  sPathCacheReady = NO;
 
 // ─── 文件日志 ────────────────────────────────────────────────
 static void RDLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
@@ -112,94 +134,226 @@ static void MKSafe(void (^block)(void)) {
 }
 
 // ====================================================================
-// 运行状态检测（v1.4.1 — LSProxy 缓存修复 + 路径增强）
+// 运行状态检测（v1.4.2 — 三层策略：Hook + SBAppCtrl + 进程枚举）
 // ====================================================================
 
-// ─── 策略 0：LSApplicationProxy 缓存（v1.4.1 修复版）─────────
-// v1.4.0 Bug: allInstalledApplications 返回 LSApplicationRecord，
-// 它没有 executablePath → 崩溃。
-// v1.4.1 Fix: 先从 LSApplicationRecord 取 bundleIdentifier，
-// 再用 applicationProxyForIdentifier: 获取 LSApplicationProxy（有 executablePath）。
-// 同时逐条处理，单条异常不中断整体缓存构建。
-static void MKBuildLSProxyCache() {
+// ─── 策略 0：NSFileManager 扫描构建 bundleID↔executablePath 映射 ────
+// 替代彻底失败的 LSProxy 缓存（applicationProxyForIdentifier: 不存在）
+static void MKBuildPathCache() {
     if (!sBidToExePath) sBidToExePath = [NSMutableDictionary dictionary];
     if (!sPathToBundleID) sPathToBundleID = [NSMutableDictionary dictionary];
 
-    @try {
-        Class wsClass = NSClassFromString(@"LSApplicationWorkspace");
-        if (!wsClass) { RDLog(@"LSProxy: LSApplicationWorkspace NOT found"); return; }
+    NSFileManager *fm = [NSFileManager defaultManager];
+    int added = 0;
 
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        id ws = [wsClass performSelector:NSSelectorFromString(@"defaultWorkspace")];
-        if (!ws) { RDLog(@"LSProxy: defaultWorkspace nil"); return; }
+    // ─── 扫描 App Store 用户应用 ──────────
+    NSArray *scanDirs = @[
+        @"/var/containers/Bundle/Application",
+        @"/private/var/containers/Bundle/Application"
+    ];
 
-        NSArray *records = [ws performSelector:NSSelectorFromString(@"allInstalledApplications")];
-#pragma clang diagnostic pop
+    for (NSString *baseDir in scanDirs) {
+        NSArray *uuids = [fm contentsOfDirectoryAtPath:baseDir error:nil];
+        if (!uuids) continue;
 
-        if (!records || ![records count]) { RDLog(@"LSProxy: allInstalledApplications empty"); return; }
-        RDLog(@"LSProxy: got %lu records from allInstalledApplications", (unsigned long)records.count);
+        for (NSString *uuid in uuids) {
+            // 跳过 roothide 前缀目录（.jbroot-XXX），里面是越狱工具不是普通 App
+            if ([uuid hasPrefix:@"."]) continue;
 
-        int added = 0;
-        int failed = 0;
+            NSString *uuidDir = [baseDir stringByAppendingPathComponent:uuid];
+            NSArray *contents = [fm contentsOfDirectoryAtPath:uuidDir error:nil];
+            if (!contents) continue;
 
-        for (id record in records) {
-            @try {
-                // Step 1: 从 LSApplicationRecord 取 bundleIdentifier
-                NSString *bid = nil;
-                if ([record respondsToSelector:NSSelectorFromString(@"bundleIdentifier")]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                    bid = [record performSelector:NSSelectorFromString(@"bundleIdentifier")];
-#pragma clang diagnostic pop
-                }
-                if (!bid || !bid.length) continue;
+            for (NSString *item in contents) {
+                if (![item.pathExtension.lowercaseString isEqualToString:@"app"]) continue;
 
-                // Step 2: 用 applicationProxyForIdentifier: 获取 LSApplicationProxy（有 executablePath）
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                id proxy = [ws performSelector:NSSelectorFromString(@"applicationProxyForIdentifier:")
-                                       withObject:bid];
-#pragma clang diagnostic pop
+                NSString *appDir = [uuidDir stringByAppendingPathComponent:item];
+                NSString *plistPath = [appDir stringByAppendingPathComponent:@"Info.plist"];
+                NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+                if (!info) continue;
 
-                if (!proxy) { failed++; continue; }
+                NSString *bid = info[@"CFBundleIdentifier"];
+                NSString *exeName = info[@"CFBundleExecutable"];
+                if (!bid.length || !exeName.length) continue;
 
-                // Step 3: 从 LSApplicationProxy 取 executablePath
-                NSString *exePath = nil;
-                if ([proxy respondsToSelector:NSSelectorFromString(@"executablePath")]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                    exePath = [proxy performSelector:NSSelectorFromString(@"executablePath")];
-#pragma clang diagnostic pop
-                }
-
-                if (!exePath || !exePath.length) { failed++; continue; }
-
+                NSString *exePath = [appDir stringByAppendingPathComponent:exeName];
                 sBidToExePath[bid] = exePath;
                 sPathToBundleID[exePath] = bid;
                 added++;
-
-            } @catch (NSException *e) {
-                failed++;
-                if (failed <= 3) RDLog(@"LSProxy: record exception: %@", e.reason);
             }
         }
+    }
 
-        sLSProxyReady = YES;
-        RDLog(@"LSProxy: cached %d apps (failed=%d, total=%lu)", added, failed, (unsigned long)records.count);
+    // ─── 扫描系统内置应用 /Applications/ ──────────
+    NSArray *sysDirs = @[
+        @"/Applications",
+        @"/private/var/containers/Bundle/Application"  // 可能还有系统 App 在此
+    ];
+    for (NSString *sysDir in sysDirs) {
+        NSArray *sysApps = [fm contentsOfDirectoryAtPath:sysDir error:nil];
+        if (!sysApps) continue;
 
-        // 诊断：打印几个示例
-        NSArray *sample = [sBidToExePath allKeys];
-        for (int i = 0; i < MIN(5, (int)sample.count); i++) {
-            RDLog(@"LSProxy sample: %@ → %@", sample[i], sBidToExePath[sample[i]]);
+        for (NSString *item in sysApps) {
+            if (![item.pathExtension.lowercaseString isEqualToString:@"app"]) continue;
+
+            NSString *appDir = [sysDir stringByAppendingPathComponent:item];
+            NSString *plistPath = [appDir stringByAppendingPathComponent:@"Info.plist"];
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+            if (!info) continue;
+
+            NSString *bid = info[@"CFBundleIdentifier"];
+            NSString *exeName = info[@"CFBundleExecutable"];
+            if (!bid.length || !exeName.length) continue;
+
+            NSString *exePath = [appDir stringByAppendingPathComponent:exeName];
+            sBidToExePath[bid] = exePath;
+            sPathToBundleID[exePath] = bid;
+            added++;
         }
+    }
 
+    // ─── 尝试从 LSApplicationRecord 取 applicationURL（额外补充）─────
+    @try {
+        Class wsClass = NSClassFromString(@"LSApplicationWorkspace");
+        if (wsClass) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            id ws = [wsClass performSelector:NSSelectorFromString(@"defaultWorkspace")];
+            if (ws) {
+                NSArray *records = [ws performSelector:NSSelectorFromString(@"allInstalledApplications")];
+                if (records && records.count > 0) {
+                    for (id record in records) {
+                        @try {
+                            // 尝试从 LSApplicationRecord 获取 applicationURL
+                            // applicationURL → NSURL → .app 目录路径
+                            NSURL *appURL = nil;
+                            if ([record respondsToSelector:NSSelectorFromString(@"applicationURL")]) {
+                                appURL = [record performSelector:NSSelectorFromString(@"applicationURL")];
+                            }
+                            if (!appURL && [record respondsToSelector:NSSelectorFromString(@"bundleURL")]) {
+                                appURL = [record performSelector:NSSelectorFromString(@"bundleURL")];
+                            }
+                            if (!appURL && [record respondsToSelector:NSSelectorFromString(@"installURL")]) {
+                                appURL = [record performSelector:NSSelectorFromString(@"installURL")];
+                            }
+                            if (!appURL) continue;
+
+                            NSString *appDirPath = [appURL path];
+                            if (!appDirPath.length || ![appDirPath hasSuffix:@".app"]) continue;
+
+                            // 如果 NSFileManager 扫描已经缓存了此 bid，跳过
+                            NSString *bid = nil;
+                            if ([record respondsToSelector:NSSelectorFromString(@"bundleIdentifier")]) {
+                                bid = [record performSelector:NSSelectorFromString(@"bundleIdentifier")];
+                            }
+                            if (!bid.length) continue;
+                            if (sBidToExePath[bid]) continue;  // 已缓存
+
+                            // 读取 Info.plist 获取 executable name
+                            NSString *plistPath = [appDirPath stringByAppendingPathComponent:@"Info.plist"];
+                            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+                            NSString *exeName = info[@"CFBundleExecutable"];
+                            if (!exeName.length) continue;
+
+                            NSString *exePath = [appDirPath stringByAppendingPathComponent:exeName];
+                            sBidToExePath[bid] = exePath;
+                            sPathToBundleID[exePath] = bid;
+                            added++;
+                        } @catch (NSException *e) {
+                            // 单条异常不中断整体
+                        }
+                    }
+                }
+            }
+#pragma clang diagnostic pop
+        }
     } @catch (NSException *e) {
-        RDLog(@"LSProxy top-level exception: %@", e.reason);
+        RDLog(@"LSRecord fallback exception: %@", e.reason);
+    }
+
+    sPathCacheReady = YES;
+    RDLog(@"PathCache: cached %d apps via NSFileManager + LSRecord", added);
+
+    // 诊断：打印几个示例
+    NSArray *sample = [sBidToExePath allKeys];
+    for (int i = 0; i < MIN(5, (int)sample.count); i++) {
+        RDLog(@"PathCache sample: %@ → %@", sample[i], sBidToExePath[sample[i]]);
     }
 }
 
-// ─── 策略 1：进程枚举（proc_listallpids）──────────────────
+// ─── 策略 1：SBApplicationController.runningApplications（启动初始同步）───
+static void MKInitRunningFromSBAppCtrl() {
+    @try {
+        Class ctrlClass = NSClassFromString(@"SBApplicationController");
+        if (!ctrlClass) { RDLog(@"SBAppCtrl: class NOT found"); return; }
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        id ctrl = [ctrlClass performSelector:NSSelectorFromString(@"sharedInstance")];
+        if (!ctrl) { RDLog(@"SBAppCtrl: sharedInstance nil"); return; }
+
+        // 尝试 runningApplications
+        NSArray *running = nil;
+        if ([ctrl respondsToSelector:NSSelectorFromString(@"runningApplications")]) {
+            running = [ctrl performSelector:NSSelectorFromString(@"runningApplications")];
+            RDLog(@"SBAppCtrl: runningApplications returned %lu apps",
+                  (unsigned long)(running ? running.count : 0));
+        } else {
+            RDLog(@"SBAppCtrl: runningApplications NOT available, fallback to allApplications");
+            // 回退：遍历 allApplications 并逐个检查
+            NSArray *all = [ctrl performSelector:NSSelectorFromString(@"allApplications")];
+            if (all) {
+                NSMutableArray *filtered = [NSMutableArray array];
+                for (id app in all) {
+                    // 检查 pid > 0 表示有运行进程
+                    pid_t pid = 0;
+                    if ([app respondsToSelector:NSSelectorFromString(@"pid")]) {
+                        pid = (pid_t)[[app performSelector:NSSelectorFromString(@"pid")] intValue];
+                    }
+                    if (pid > 0) {
+                        [filtered addObject:app];
+                    }
+                }
+                running = filtered;
+                RDLog(@"SBAppCtrl: allApplications filter by pid>0 → %lu running",
+                      (unsigned long)running.count);
+            }
+        }
+#pragma clang diagnostic pop
+
+        if (!running || !running.count) {
+            RDLog(@"SBAppCtrl: no running apps found");
+            return;
+        }
+
+        // 从 SBApplication 对象提取 bundleIdentifier
+        if (!sRunningSet) sRunningSet = [NSMutableSet set];
+        int added = 0;
+        for (id app in running) {
+            NSString *bid = nil;
+            if ([app respondsToSelector:NSSelectorFromString(@"bundleIdentifier")]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                bid = [app performSelector:NSSelectorFromString(@"bundleIdentifier")];
+#pragma clang diagnostic pop
+            }
+            if (bid.length) {
+                [sRunningSet addObject:bid];
+                added++;
+            }
+        }
+        RDLog(@"SBAppCtrl: added %d bundleIDs to runningSet", added);
+        RDLog(@"SBAppCtrl initial: %@", [[sRunningSet allObjects] componentsJoinedByString:@", "]);
+
+    } @catch (NSException *e) {
+        RDLog(@"SBAppCtrl exception: %@", e.reason);
+    }
+}
+
+// ─── 策略 2：Hook SBMainWorkspace（实时检测，最核心）────────────
+// 见下方 %hook SBMainWorkspace 部分
+
+// ─── 策略 3：进程枚举回退（proc_listallpids）──────────────────
 static void MKAddToRunningSet(NSString *bid) {
     if (!bid.length) return;
     if (!sRunningSet) sRunningSet = [NSMutableSet set];
@@ -211,41 +365,40 @@ static void MKRemoveFromRunningSet(NSString *bid) {
     [sRunningSet removeObject:bid];
 }
 
-// 从进程路径提取 bundleID 的多策略方法
+// 从进程路径提取 bundleID
 static NSString *MKBidFromPath(NSString *fullPath) {
-    // ─── 方法 1：LSProxy 缓存直查（最可靠）─────────
+    // ─── 方法 1：PathCache 直查 ──────────────
     NSString *bid = sPathToBundleID[fullPath];
     if (bid) return bid;
 
-    // ─── 方法 2：Info.plist 回退 ──────────────────────
-    // fullPath 格式: .../UUID/AppName.app/Executable 或 .../AppName.app/Executable
-    // Info.plist 在 .app 目录里
-    NSString *appBundlePath = [fullPath stringByDeletingLastPathComponent];  // → .../AppName.app
+    // ─── 方法 2：Info.plist 回退 ──────────────
+    NSString *appBundlePath = [fullPath stringByDeletingLastPathComponent];
+    // 处理 App Extension: .../AppName.app/PlugIns/Ext.appex/Executable
+    //                    → 需要向上再跳两层到 AppName.app
+    if ([appBundlePath hasSuffix:@".appex"]) {
+        appBundlePath = [[appBundlePath stringByDeletingLastPathComponent]
+                         stringByDeletingLastPathComponent];  // → .../AppName.app
+    }
     if ([appBundlePath hasSuffix:@".app"]) {
         NSString *infoPath = [appBundlePath stringByAppendingPathComponent:@"Info.plist"];
         NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPath];
-        bid = info[@"CFBundleIdentifier"];
-        if (bid) {
-            sPathToBundleID[fullPath] = bid;  // 缓存
-            RDLog(@"PROC: Info.plist fallback: %@", bid);
-            return bid;
+        NSString *bidFromInfo = info[@"CFBundleIdentifier"];
+        if (bidFromInfo) {
+            sPathToBundleID[fullPath] = bidFromInfo;
+            RDLog(@"PROC: Info.plist fallback: %@", bidFromInfo);
+            return bidFromInfo;
         }
     }
 
-    // ─── 方法 3：从 .app 目录名启发式猜测 ──────────
-    // 有些越狱 App 的 Info.plist 不在标准位置
-    // 如果 LSProxy 缓存可用，可以用 .app 目录名做模糊匹配
-    NSString *appName = [appBundlePath lastPathComponent];  // AppName.app
-    if ([appName hasSuffix:@".app"]) {
-        // 在 LSProxy 缓存中查找 executablePath 包含此 .app 名的
-        if (sBidToExePath) {
-            for (NSString *cachedBid in sBidToExePath) {
-                NSString *cachedPath = sBidToExePath[cachedBid];
-                if ([cachedPath containsString:appName]) {
-                    sPathToBundleID[fullPath] = cachedBid;
-                    RDLog(@"PROC: fuzzy match %@ → %@", appName, cachedBid);
-                    return cachedBid;
-                }
+    // ─── 方法 3：.app 目录名模糊匹配 ──────────
+    NSString *appName = [appBundlePath lastPathComponent];
+    if ([appName hasSuffix:@".app"] && sBidToExePath) {
+        for (NSString *cachedBid in sBidToExePath) {
+            NSString *cachedPath = sBidToExePath[cachedBid];
+            if ([cachedPath containsString:appName]) {
+                sPathToBundleID[fullPath] = cachedBid;
+                RDLog(@"PROC: fuzzy match %@ → %@", appName, cachedBid);
+                return cachedBid;
             }
         }
     }
@@ -255,17 +408,9 @@ static NSString *MKBidFromPath(NSString *fullPath) {
 
 static void MKComputeRunningSet() {
     @try {
-        // ★ 固定缓冲区（已验证 v1.4.0 成功）★
         int pidBuf[512];
         int bufBytes = sizeof(pidBuf);
-
         int retBytes = proc_listallpids(pidBuf, bufBytes);
-
-        static int sProcEntryLogs = 0;
-        if (sProcEntryLogs < 5) {
-            sProcEntryLogs++;
-            RDLog(@"PROC entry: proc_listallpids ret=%d buf=%d", retBytes, bufBytes);
-        }
 
         if (retBytes <= 0) {
             RDLog(@"PROC: proc_listallpids FAILED ret=%d", retBytes);
@@ -274,19 +419,35 @@ static void MKComputeRunningSet() {
 
         int numPids = retBytes / sizeof(int);
 
-        static int sPidCountLogs = 0;
-        if (sPidCountLogs < 3) {
-            sPidCountLogs++;
-            RDLog(@"PROC: %d total PIDs", numPids);
+        static int sProcEntryLogs = 0;
+        if (sProcEntryLogs < 5) {
+            sProcEntryLogs++;
+            RDLog(@"PROC: %d total PIDs (ret=%d)", numPids, retBytes);
+        }
+
+        // ─── 诊断：首次扫描时 dump 所有路径 ──────────
+        static int sFullDumpDone = 0;
+        if (sFullDumpDone == 0) {
+            sFullDumpDone = 1;
+            RDLog(@"PROC: === FULL PATH DUMP (first scan only) ===");
+            int dumpCount = 0;
+            for (int i = 0; i < numPids && dumpCount < 100; i++) {
+                char pathBuf[PROC_PIDPATHINFO_MAXSIZE];
+                if (proc_pidpath(pidBuf[i], pathBuf, sizeof(pathBuf)) <= 0) continue;
+                NSString *p = [NSString stringWithUTF8String:pathBuf];
+                if (p.length > 0) {
+                    RDLog(@"PROC dump [%d]: pid=%d path=%@", dumpCount, pidBuf[i], p);
+                    dumpCount++;
+                }
+            }
+            RDLog(@"PROC: === END DUMP (%d paths) ===", dumpCount);
         }
 
         // ─── 遍历进程路径 → 匹配 App → 反查 bundleID ──────
-        NSMutableSet *newSet = [NSMutableSet set];
+        NSMutableSet *procSet = [NSMutableSet set];
         int appProcessCount = 0;
         int matchedCount = 0;
         int unmatchedPaths = 0;
-
-        static int sPathDiagLogs = 0;
 
         for (int i = 0; i < numPids; i++) {
             char pathBuf[PROC_PIDPATHINFO_MAXSIZE];
@@ -295,68 +456,82 @@ static void MKComputeRunningSet() {
             NSString *fullPath = [NSString stringWithUTF8String:pathBuf];
 
             // 过滤：只关注 App 进程路径
-            // 识别特征：
-            //   /var/containers/Bundle/Application/...（标准 iOS App Store 路径）
-            //   /private/var/containers/Bundle/Application/...（带 /private 前缀）
-            //   /private/var/containers/Bundle/Application/.jbroot-XXX/...（roothide 路径）
-            //   /Applications/App.app/...（系统内置 App）
             BOOL isAppPath = NO;
             if ([fullPath containsString:@"/Bundle/Application/"]) {
                 isAppPath = YES;
-            } else if ([fullPath containsString:@"/Applications/"]) {
-                NSRange r = [fullPath rangeOfString:@"/Applications/"];
-                if (r.location != NSNotFound) {
-                    NSString *after = [fullPath substringFromIndex:r.location + r.length];
-                    isAppPath = [after containsString:@".app/"];
+            } else if ([fullPath containsString:@".app/"]) {
+                // 放宽过滤：任何包含 .app/ 的路径（包括 /Applications/）
+                // 排除 /var/jb/ 和 /usr/ 等系统路径
+                if (![fullPath containsString:@"/var/jb/"] &&
+                    ![fullPath hasPrefix:@"/usr/"]) {
+                    isAppPath = YES;
                 }
             }
 
             if (!isAppPath) continue;
             appProcessCount++;
 
-            // ★ 诊断：打印所有 App 进程路径 ★
-            if (sPathDiagLogs < 20) {
-                sPathDiagLogs++;
-                RDLog(@"PROC app path: %@", fullPath);
-            }
-
-            // ─── 路径 → bundleID（多策略）─────────
             NSString *bid = MKBidFromPath(fullPath);
 
             if (bid) {
-                [newSet addObject:bid];
+                // 如果是 App Extension，映射到父 App 的 bundleID
+                // Extension 的 bundleID 格式：parentBundleID.extensionName
+                // 我们要显示的是父 App 的指示点
+                if ([bid containsString:@"."]) {
+                    // 检查是否是已知 App 的 Extension
+                    // Extension bundleID 通常是 parent.appName.extName
+                    // 我们需要找到父 App 的 bundleID
+                    // 简单方法：在 bidToExePath 中查找
+                    NSString *parentBid = sBidToExePath[bid];
+                    if (parentBid) {
+                        // 这是已知 Extension，它的进程说明父 App 在运行
+                        // 但 Extension bundleID 和 父 App bundleID 不同
+                        // 我们需要从 Extension bundleID 推导父 App bundleID
+                        // 目前不做推导，直接用 Extension 的 bundleID
+                    }
+                }
+                [procSet addObject:bid];
                 matchedCount++;
             } else {
                 unmatchedPaths++;
-                RDLog(@"PROC: UNMATCHED %@", fullPath);
+                static int sUnmatchLogs = 0;
+                if (sUnmatchLogs < 10) {
+                    sUnmatchLogs++;
+                    RDLog(@"PROC: UNMATCHED %@", fullPath);
+                }
             }
         }
 
-        // ─── 输出结果 ──────────────────────────────────────────
-        RDLog(@"PROC result: %lu running (appProc=%d matched=%d unmatched=%d)",
-              (unsigned long)newSet.count, appProcessCount, matchedCount, unmatchedPaths);
-
-        static int sProcDetailLogs = 0;
-        static NSSet *sLastProcSet = nil;
-        if (sProcDetailLogs < 10 && (!sLastProcSet || ![newSet isEqualToSet:sLastProcSet])) {
-            sProcDetailLogs++;
-            RDLog(@"PROC enum: %lu → %@",
-                  (unsigned long)newSet.count,
-                  [[newSet allObjects] componentsJoinedByString:@", "]);
+        // ─── 进程枚举结果不直接覆盖 runningSet，而是作为补充 ──────
+        // 主策略（SBMainWorkspace hook + SBAppCtrl）已经维护了 runningSet
+        // 进程枚举只补充尚未被 hook 检测到的 App
+        int supplemented = 0;
+        for (NSString *bid in procSet) {
+            if (!sRunningSet || ![sRunningSet containsObject:bid]) {
+                MKAddToRunningSet(bid);
+                supplemented++;
+                RDLog(@"PROC supplement: %@ (not in runningSet)", bid);
+            }
         }
-        sLastProcSet = [newSet copy];
-        sRunningSet = newSet;
+
+        static int sProcResultLogs = 0;
+        if (sProcResultLogs < 10) {
+            sProcResultLogs++;
+            RDLog(@"PROC result: appProc=%d matched=%d unmatched=%d supplemented=%d runningSet=%lu",
+                  appProcessCount, matchedCount, unmatchedPaths, supplemented,
+                  (unsigned long)sRunningSet.count);
+        }
 
     } @catch (NSException *e) {
         RDLog(@"PROC exception: %@", e.reason);
     }
 }
 
-static BOOL MKIsAppLit(NSString *bid) {
-    return sRunningSet && [sRunningSet containsObject:bid];
+static BOOL MKIsAppRunning(NSString *bundleID) {
+    return sRunningSet && [sRunningSet containsObject:bundleID];
 }
 
-// ─── 从通知提取 bundleID（增强版）───────────────────────────
+// ─── 从通知提取 bundleID（保留用于补充）───────────────────────────
 static NSString *MKBidFromNote(NSNotification *note) {
     @try {
         id obj = note.object;
@@ -383,16 +558,9 @@ static NSString *MKBidFromNote(NSNotification *note) {
         if (info) {
             for (NSString *key in @[@"bundleIdentifier", @"applicationBundleID",
                                     @"bundleID", @"displayIdentifier",
-                                    @"applicationIdentifier", @"processIdentifier"]) {
+                                    @"applicationIdentifier"]) {
                 id v = info[key];
                 if ([v isKindOfClass:[NSString class]] && [(NSString *)v containsString:@"."] && ![(NSString *)v containsString:@"/"]) return v;
-            }
-            for (id k in info) {
-                id v = info[k];
-                if ([v isKindOfClass:[NSString class]]) {
-                    NSString *sv = (NSString *)v;
-                    if ([sv containsString:@"."] && ![sv containsString:@"/"] && ![sv containsString:@"://"]) return sv;
-                }
             }
         }
 
@@ -406,10 +574,6 @@ static NSString *MKBidFromNote(NSNotification *note) {
         }
     } @catch (NSException *e) {}
     return nil;
-}
-
-static BOOL MKIsAppRunning(NSString *bundleID) {
-    return MKIsAppLit(bundleID);
 }
 
 // ====================================================================
@@ -583,7 +747,7 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 }
 
 // ====================================================================
-// Hook（所有 %hook 在 %ctor 之前）
+// Hook — SBIconView
 // ====================================================================
 
 %hook SBIconView
@@ -604,8 +768,141 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 
 %end
 
-// 尝试 hook SBMainSwitcherController（iOS 16+ App 切换器）
-// 如果类不存在于当前 iOS 版本，Theos 跳过不崩溃
+// ====================================================================
+// Hook — SBMainWorkspace（v1.4.2 核心新增：实时进程状态检测）
+// iOS 16 的关键切入点：
+//   process:stateDidChangeFromState:toState:
+//   arg1 = FBApplicationProcess（有 bundleIdentifier）
+//   arg3 = FBProcessState（有 taskState: 1=Dead, 2=Running, 3=Suspended）
+// ====================================================================
+
+%hook SBMainWorkspace
+
+- (void)process:(id)arg1 stateDidChangeFromState:(id)arg2 toState:(id)arg3 {
+    %orig;
+
+    @try {
+        // ─── 提取 bundleIdentifier ──────────
+        NSString *bid = nil;
+        if ([arg1 respondsToSelector:NSSelectorFromString(@"bundleIdentifier")]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            bid = [arg1 performSelector:NSSelectorFromString(@"bundleIdentifier")];
+#pragma clang diagnostic pop
+        }
+        // 也可以尝试从 applicationInfo 取
+        if (!bid && [arg1 respondsToSelector:NSSelectorFromString(@"applicationInfo")]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            id appInfo = [arg1 performSelector:NSSelectorFromString(@"applicationInfo")];
+            if (appInfo && [appInfo respondsToSelector:NSSelectorFromString(@"bundleIdentifier")]) {
+                bid = [appInfo performSelector:NSSelectorFromString(@"bundleIdentifier")];
+            }
+#pragma clang diagnostic pop
+        }
+
+        // ─── 提取 taskState ──────────────────
+        int newState = 0;
+        if ([arg3 respondsToSelector:NSSelectorFromString(@"taskState")]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            newState = [[arg3 performSelector:NSSelectorFromString(@"taskState")] intValue];
+#pragma clang diagnostic pop
+        }
+        // 如果 taskState 不响应，尝试 rawDescription 或其他属性
+        if (newState == 0 && arg3) {
+            NSString *desc = [arg3 description];
+            RDLog(@"SBWS: state desc: %@", desc);
+        }
+
+        static int sHookLogs = 0;
+        if (sHookLogs < 50) {
+            sHookLogs++;
+            RDLog(@"SBWS: %@ state=%d (arg1=%s arg3=%s)",
+                  bid ?: @"(nil)", newState,
+                  arg1 ? NSStringFromClass([arg1 class]).UTF8String : "nil",
+                  arg3 ? NSStringFromClass([arg3 class]).UTF8String : "nil");
+        }
+
+        if (!bid.length) {
+            RDLog(@"SBWS: no bundleID extracted from arg1 class=%s",
+                  arg1 ? NSStringFromClass([arg1 class]).UTF8String : "nil");
+            return;
+        }
+
+        // ─── 更新 runningSet ──────────────
+        // taskState 2=Running, 3=Suspended → 进程还在 → 显示绿点
+        // taskState 1=Dead → 进程已杀 → 移除绿点
+        if (newState == kTaskStateRunning || newState == kTaskStateSuspended) {
+            MKAddToRunningSet(bid);
+            RDLog(@"SBWS: + %@ (state=%d)", bid, newState);
+            MKRefreshAllIcons();
+        } else if (newState == kTaskStateDead) {
+            MKRemoveFromRunningSet(bid);
+            RDLog(@"SBWS: - %@ (state=%d)", bid, newState);
+            MKRefreshAllIcons();
+        } else if (newState == 0) {
+            // 无法解析 state，不做修改（由 proc enum 或 SBAppCtrl 校准）
+            RDLog(@"SBWS: %@ (state unknown, skip)", bid);
+        }
+
+    } @catch (NSException *e) {
+        RDLog(@"SBWS exception: %@", e.reason);
+    }
+}
+
+%end
+
+// ====================================================================
+// Hook — SBApplication（补充：进程状态变更通知）
+// 有些 iOS 版本通过 SBApplication 发送 _noteProcess:didChangeToState:
+// ====================================================================
+
+%hook SBApplication
+
+- (void)_noteProcess:(id)process didChangeToState:(id)state {
+    %orig;
+
+    @try {
+        NSString *bid = nil;
+        if ([self respondsToSelector:NSSelectorFromString(@"bundleIdentifier")]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            bid = [self performSelector:NSSelectorFromString(@"bundleIdentifier")];
+#pragma clang diagnostic pop
+        }
+
+        int taskState = 0;
+        if ([state respondsToSelector:NSSelectorFromString(@"taskState")]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            taskState = [[state performSelector:NSSelectorFromString(@"taskState")] intValue];
+#pragma clang diagnostic pop
+        }
+
+        static int sNoteProcessLogs = 0;
+        if (sNoteProcessLogs < 30) {
+            sNoteProcessLogs++;
+            RDLog(@"SBApp._noteProc: %@ state=%d", bid ?: @"(nil)", taskState);
+        }
+
+        if (bid.length) {
+            if (taskState == kTaskStateRunning || taskState == kTaskStateSuspended) {
+                MKAddToRunningSet(bid);
+            } else if (taskState == kTaskStateDead) {
+                MKRemoveFromRunningSet(bid);
+            }
+            MKRefreshAllIcons();
+        }
+    } @catch (NSException *e) {}
+}
+
+%end
+
+// ====================================================================
+// Hook — SBMainSwitcherController（保留，作为补充检测入口）
+// ====================================================================
+
 %hook SBMainSwitcherController
 
 - (void)_appActivationStateDidChange:(NSNotification *)notification {
@@ -630,8 +927,7 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
                 MKRemoveFromRunningSet(bid);
                 RDLog(@"_appActState: REMOVE %@ state=%d", bid, state);
             }
-        } else {
-            RDLog(@"_appActState: %@ (no state, proc enum will calibrate)", bid);
+            MKRefreshAllIcons();
         }
     } @catch (NSException *e) {
         RDLog(@"_appActState exception: %@", e.reason);
@@ -649,6 +945,7 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
         if (bid.length) {
             RDLog(@"_appActState(SBScene): %@", bid);
             MKAddToRunningSet(bid);
+            MKRefreshAllIcons();
         }
     } @catch (NSException *e) {}
 }
@@ -662,8 +959,8 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.4.1 loaded (fixed LSProxy cache + path matching)");
-    RDLog(@"======== v1.4.1 loading ========");
+    NSLog(@"[RunningDotIndicator] v1.4.2 loaded (SBMainWorkspace hook + NSFileManager + SBAppCtrl)");
+    RDLog(@"======== v1.4.2 loading ========");
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; doing nothing.");
         return;
@@ -683,25 +980,34 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
         CFSTR("com.mk.runningdotindicator.respring"),
         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
-    // ─── 构建 LSApplicationProxy 缓存（v1.4.1 修复版）─────
-    MKBuildLSProxyCache();
+    // ─── 步骤 1：NSFileManager 扫描构建路径缓存 ──────
+    MKBuildPathCache();
 
-    // ─── 进程枚举：立即执行一次 ──────────────────────
+    // ─── 步骤 2：SBApplicationController 初始同步 ──────
+    MKInitRunningFromSBAppCtrl();
+
+    // ─── 步骤 3：进程枚举补充 ──────────────────────
     MKComputeRunningSet();
-    RDLog(@"Initial scan: %lu items in sRunningSet", (unsigned long)sRunningSet.count);
 
-    // ─── 定时刷新：每 3 秒 ────────────────────────────
+    RDLog(@"Initial scan: %lu items in runningSet", (unsigned long)sRunningSet.count);
+    RDLog(@"runningSet: %@", [[sRunningSet allObjects] componentsJoinedByString:@", "]);
+
+    // ─── 定时刷新：每 5 秒 ────────────────────────────
+    // 降低频率：SBMainWorkspace hook 已经实时更新
+    // 定时器主要用于 proc_enum 补充检测 + 刷新图标
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                                       dispatch_get_main_queue());
     dispatch_source_set_timer(timer,
-                              dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
-                              3 * NSEC_PER_SEC, 1.0 * NSEC_PER_SEC);
+                              dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+                              5 * NSEC_PER_SEC, 1.0 * NSEC_PER_SEC);
     dispatch_source_set_event_handler(timer, ^{
         MKSafe(^{ MKComputeRunningSet(); MKRefreshAllIcons(); });
     });
     dispatch_resume(timer);
 
-    // ─── 生命周期通知 ──────────────────────────────────
+    // ─── 生命周期通知（补充）─────────────────────────────
+    // 注意：iOS 16 上只有 SBApplicationDidExitNotification 有效
+    // launch/add 类通知不再发送，由 SBMainWorkspace hook 替代
     if (!sLifecycleObservers) sLifecycleObservers = [NSMutableArray array];
     NSDictionary *lifecycleActions = @{
         @"SBApplicationDidFinishLaunchingNotification":      @"add",
@@ -714,29 +1020,21 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
         @"SBApplicationProcessDidExitNotification":          @"remove",
         @"SBApplicationDidExitNotification":                 @"remove",
         @"SBApplicationWillTerminateNotification":           @"remove",
-        @"SBApplicationWillSuspendNotification":             @"ignore",
-        @"SBApplicationDidSuspendNotification":              @"ignore",
     };
     [lifecycleActions enumerateKeysAndObjectsUsingBlock:^(NSString *nm, NSString *act, BOOL *_) {
         id obs = [[NSNotificationCenter defaultCenter]
             addObserverForName:nm object:nil queue:[NSOperationQueue mainQueue]
             usingBlock:^(NSNotification *note){
             @try {
-                static int sNoteDetailLogs = 0;
                 NSString *bid = MKBidFromNote(note);
+                static int sNoteDetailLogs = 0;
                 if (sNoteDetailLogs < 50) {
                     sNoteDetailLogs++;
-                    RDLog(@"NOTE: %@ obj=%s info=%s bid=%@",
-                          note.name,
-                          note.object ? NSStringFromClass([note.object class]).UTF8String : "nil",
-                          note.userInfo ? "yes" : "nil",
-                          bid ?: @"(nil)");
+                    RDLog(@"NOTE: %@ bid=%@ obj=%s",
+                          note.name, bid ?: @"(nil)",
+                          note.object ? NSStringFromClass([note.object class]).UTF8String : "nil");
                 }
-                if (!bid) {
-                    if ([act isEqualToString:@"add"])
-                        RDLog(@"NOTE add without bid, proc enum will catch it");
-                    return;
-                }
+                if (!bid) return;
                 if ([act isEqualToString:@"add"]) {
                     MKAddToRunningSet(bid);
                     RDLog(@"LIFECYCLE + %@ → %@", nm, bid);
@@ -744,6 +1042,7 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
                     MKRemoveFromRunningSet(bid);
                     RDLog(@"LIFECYCLE - %@ → %@", nm, bid);
                 }
+                MKRefreshAllIcons();
             } @catch (NSException *e) {
                 RDLog(@"NOTE exception: %@", e.reason);
             }
