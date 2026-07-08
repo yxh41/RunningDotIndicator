@@ -12,7 +12,11 @@
 #import "MKIndicatorDotView.h"
 #include <spawn.h>
 #include <objc/runtime.h>
-#include <libproc.h>
+
+// libproc 函数声明（iOS 运行时存在，但 iPhoneOS SDK 不含此头文件，不能 #include <libproc.h>）
+extern int proc_listallpids(void *buffer, int buffersize);
+extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+#define PROC_PIDPATHINFO_MAXSIZE 4096
 
 // ─── 私有类前向声明 ──────────────────────────────────────────
 @interface SBIconView : UIView
