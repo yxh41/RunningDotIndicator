@@ -1,5 +1,8 @@
 //
-//  Tweak.x — RunningDotIndicator v1.5.0
+//  Tweak.x — RunningDotIndicator v1.5.1
+//  v1.5.1: Dock / 文件夹图标指示器放到图标底部边缘（不遮挡图标内容）
+//    ✅ 无名字标签时：指示器在父视图中位于图标底部下方（Lynx2 风格）
+//    ✅ 标签查找加评分机制，避免误把 badge 等当名字标签
 //  v1.5.0: 修复指示器定位 — 标签搜索加 superview 兄弟节点策略
 //    ✅ MKFindLabelView 四重策略：accessor → superview兄弟 → 直接子视图 → 递归
 //    ✅ 指示器定位：标签找到→在标签位置(替换名字)，标签未找到→图标底部(Dock)
@@ -505,17 +508,27 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
         // SBIconView 和 SBIconListLabel 是同一个父容器的子视图
         UIView *parent = iconView.superview;
         if (parent && parent.subviews.count <= 8) {
-            // 父视图子节点 ≤8 → 很可能是 per-icon 容器（icon + label + badge 等）
+            // 用评分机制避免误把 badge/close button 等当标签
+            UIView *bestMatch = nil;
+            NSInteger bestScore = 0;
             for (UIView *sv in parent.subviews) {
                 if (sv == iconView) continue;  // 跳过自己
                 NSString *cls = NSStringFromClass([sv class]);
-                if ([sv isKindOfClass:[UILabel class]] ||
-                    [cls containsString:@"IconLabel"] ||
-                    [cls containsString:@"ListLabel"] ||
-                    [cls containsString:@"Label"] ||
-                    [cls containsString:@"label"]) {
-                    return sv;
+                NSInteger score = 0;
+                if ([cls isEqualToString:@"SBIconListLabel"])        score = 100;
+                else if ([cls containsString:@"IconListLabel"])      score = 90;
+                else if ([cls containsString:@"ListLabel"])          score = 80;
+                else if ([cls containsString:@"IconLabel"])          score = 70;
+                else if ([sv isKindOfClass:[UILabel class]])          score = 60;
+                else if ([cls containsString:@"LabelView"])           score = 50;
+                else if ([cls containsString:@"Label"])              score = 40;
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestMatch = sv;
                 }
+            }
+            if (bestMatch && bestScore >= 50) {
+                return bestMatch;
             }
         }
 
@@ -573,7 +586,7 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
 }
 
 // ====================================================================
-// 主更新函数 — v1.5.0：标签找到→指示器在标签位置，标签未找到→图标底部居中(Dock)
+// 主更新函数 — v1.5.1：标签找到→指示器在标签位置，标签未找到→图标底部边缘（不遮挡）
 // ====================================================================
 
 static void MKUpdate(SBIconView *self) {
@@ -611,6 +624,20 @@ static void MKUpdate(SBIconView *self) {
 
         UIView *label = MKFindLabelView(self);
         UIView *indicator = MKGetIndicator(self);
+
+        // 诊断：记录找到的标签类名和位置（每个 bundleID 仅一次）
+        if (label) {
+            static NSMutableSet<NSString*> *sLabelLogBids = nil;
+            if (!sLabelLogBids) sLabelLogBids = [NSMutableSet set];
+            if (![sLabelLogBids containsObject:bundleID]) {
+                [sLabelLogBids addObject:bundleID];
+                RDLog(@"LABEL for %@: class=%@ frame=(%.0f,%.0f,%.0f,%.0f) super=%@",
+                      bundleID, NSStringFromClass([label class]),
+                      label.frame.origin.x, label.frame.origin.y,
+                      label.frame.size.width, label.frame.size.height,
+                      label.superview ? NSStringFromClass([label.superview class]) : @"nil");
+            }
+        }
 
         if (!running) {
             // ── App 不在运行 → 移除指示器，恢复名字 ──
@@ -650,16 +677,29 @@ static void MKUpdate(SBIconView *self) {
                 indicatorH
             );
         } else {
-            // 无标签（Dock 图标）→ 指示器在图标底部居中
-            hostView = self;
-            CGSize mySize = self.bounds.size;
-            if (mySize.width < 10 || mySize.height < 10) return;
-            indicatorFrame = CGRectMake(
-                (mySize.width - indicatorW) / 2.0f,
-                mySize.height - indicatorH - 4.0f,
-                indicatorW,
-                indicatorH
-            );
+            // 无标签（Dock 图标 / 文件夹）→ 指示器放在图标底部边缘略下方（Lynx2 风格）
+            // 不要放在图标内部遮挡内容，而是放在父视图中的图标下方
+            UIView *host = self.superview;
+            if (host) {
+                hostView = host;
+                CGRect iconFrame = self.frame;
+                indicatorFrame = CGRectMake(
+                    iconFrame.origin.x + (iconFrame.size.width - indicatorW) / 2.0f,
+                    iconFrame.origin.y + iconFrame.size.height - 1.0f,  // 略低于图标底部，1pt 重叠更自然
+                    indicatorW,
+                    indicatorH
+                );
+            } else {
+                hostView = self;
+                CGSize mySize = self.bounds.size;
+                if (mySize.width < 10 || mySize.height < 10) return;
+                indicatorFrame = CGRectMake(
+                    (mySize.width - indicatorW) / 2.0f,
+                    mySize.height - indicatorH - 4.0f,
+                    indicatorW,
+                    indicatorH
+                );
+            }
         }
 
         // 宿主视图变了 → 需要重新添加指示器
@@ -930,8 +970,8 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.5.0 ctor: superview sibling label search + label-frame positioning");
-    RDLog(@"======== v1.5.0 loading (superview sibling label search + label-frame positioning + associated objects) ========");
+    NSLog(@"[RunningDotIndicator] v1.5.1 ctor: Dock indicator below icon + safer label search");
+    RDLog(@"======== v1.5.1 loading (Dock indicator below icon + safer label search) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
