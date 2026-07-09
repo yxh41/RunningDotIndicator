@@ -1,10 +1,11 @@
 //
-//  Tweak.x — RunningDotIndicator v1.5.5
-//  v1.5.5: 修复标签文字与指示器重叠
-//    ✅ layoutSubviews 有指示器时重新强制隐藏标签（防止系统 layout 恢复）
-//    ✅ 隐藏标签时同时设置 alpha + layer.opacity + opaque 三重保险
-//    ✅ icon 变化时同步移除旧指示器
-//    ✅ 增加标签缺失诊断日志
+//  Tweak.x — RunningDotIndicator v1.5.6
+//  v1.5.6: 修复上滑回桌面时"名称→横条"可见闪烁
+//    ✅ 前台→后台时立即隐藏标签（消除名称可见期）
+//    ✅ sPendingBIDs 机制：400ms 等待期内只隐藏标签，不创建指示器
+//    ✅ layoutSubviews / MKUpdate 在 pending 期间只隐藏标签，不创建指示器
+//    ✅ 400ms 后再创建指示器（等返回动画结束）
+//    ✅ 400ms 内 App 又变前台或退出 → 恢复标签
 //  v1.5.4: 修复文件夹图标偶尔出现指示器
 //    ✅ SBIconView 回收复用检测：存储 icon 指针，icon 变化时清缓存
 //    ✅ 过滤文件夹图标：SBFolderIcon 直接跳过
@@ -210,6 +211,21 @@ static BOOL  sDisabled = NO;
 static BOOL  sPathCacheReady = NO;
 static NSMutableDictionary<NSString*, NSNumber*> *sRunLogCounts = nil; // 日志限流
 static NSMutableSet<NSString*> *sForegroundBIDs = nil; // 当前前台 App 不显示其桌面指示器
+static NSMutableSet<NSString*> *sPendingBIDs    = nil; // v1.5.6: 等待400ms后才显示指示器的App（标签已隐藏，指示器待创建）
+
+// ─── sPendingBIDs 辅助 ─── v1.5.6 ───
+// 前台→后台时，立即隐藏标签但延迟400ms创建指示器
+// pending 期间：layoutSubviews/MKUpdate 只隐藏标签，不创建指示器
+static void MKAddPending(NSString *bid) {
+    if (!sPendingBIDs) sPendingBIDs = [NSMutableSet set];
+    [sPendingBIDs addObject:bid];
+}
+static BOOL MKIsPending(NSString *bid) {
+    return sPendingBIDs && [sPendingBIDs containsObject:bid];
+}
+static void MKRemovePending(NSString *bid) {
+    if (sPendingBIDs) [sPendingBIDs removeObject:bid];
+}
 
 // ─── 文件日志 ────────────────────────────────────────────────
 static void RDLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
@@ -725,6 +741,7 @@ static void MKUpdate(SBIconView *self) {
 
         BOOL running = MKIsAppRunning(bundleID);
         BOOL isForeground = MKIsForeground(bundleID);
+        BOOL isPending = MKIsPending(bundleID);  // v1.5.6: 等待400ms的App
 
         // v1.5.3: 使用缓存的标签视图（避免每次都跑 MKFindLabelView 4 重策略）
         UIView *label = MKGetCachedLabel(self);
@@ -740,7 +757,19 @@ static void MKUpdate(SBIconView *self) {
                 label.layer.opacity = 1.0f;
                 label.opaque = YES;
             }
+            MKRemovePending(bundleID);  // v1.5.6: 清除 pending 状态
             return;
+        }
+
+        // v1.5.6: pending 期间只隐藏标签，不创建指示器（等400ms回调）
+        if (isPending) {
+            if (label) {
+                label.hidden = YES;
+                label.alpha = 0.0f;
+                label.layer.opacity = 0.0f;
+                label.opaque = NO;
+            }
+            return;  // 不创建指示器，等400ms后 MKRefreshIconForBundleID 回调
         }
 
         RDLogRunning(bundleID);
@@ -886,7 +915,72 @@ static void MKRefreshIconForBundleID(NSString *bid) {
 }
 
 // ====================================================================
-// 动画感知的状态变更处理（v1.5.3）
+// v1.5.6: 立即隐藏/恢复指定 bundleID 的标签（不创建/删除指示器）
+// 用于前台→后台过渡期：标签立即消失，指示器延迟400ms后创建
+// ====================================================================
+
+static void MKHideLabelForBundleID(NSString *bid) {
+    MKSafe(^{
+        if (!sInitDone || !bid.length) return;
+        NSArray *windows = [UIApplication sharedApplication].windows;
+        for (UIWindow *window in windows) {
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
+            while (stack.count > 0) {
+                UIView *current = [stack lastObject];
+                [stack removeLastObject];
+                if ([current isKindOfClass:NSClassFromString(@"SBIconView")]) {
+                    SBIconView *iv = (SBIconView *)current;
+                    NSString *ivBid = MKGetCachedBid(iv);
+                    if (ivBid && [ivBid isEqualToString:bid]) {
+                        UIView *label = MKGetCachedLabel(iv);
+                        if (label) {
+                            label.hidden = YES;
+                            label.alpha = 0.0f;
+                            label.layer.opacity = 0.0f;
+                            label.opaque = NO;
+                        }
+                    }
+                }
+                for (UIView *child in current.subviews) {
+                    [stack addObject:child];
+                }
+            }
+        }
+    });
+}
+
+static void MKRestoreLabelForBundleID(NSString *bid) {
+    MKSafe(^{
+        if (!sInitDone || !bid.length) return;
+        NSArray *windows = [UIApplication sharedApplication].windows;
+        for (UIWindow *window in windows) {
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
+            while (stack.count > 0) {
+                UIView *current = [stack lastObject];
+                [stack removeLastObject];
+                if ([current isKindOfClass:NSClassFromString(@"SBIconView")]) {
+                    SBIconView *iv = (SBIconView *)current;
+                    NSString *ivBid = MKGetCachedBid(iv);
+                    if (ivBid && [ivBid isEqualToString:bid]) {
+                        UIView *label = MKGetCachedLabel(iv);
+                        if (label) {
+                            label.hidden = NO;
+                            label.alpha = 1.0f;
+                            label.layer.opacity = 1.0f;
+                            label.opaque = YES;
+                        }
+                    }
+                }
+                for (UIView *child in current.subviews) {
+                    [stack addObject:child];
+                }
+            }
+        }
+    });
+}
+
+// ====================================================================
+// 动画感知的状态变更处理（v1.5.6）
 // - App 进入前台：立即移除指示器（0ms 延迟，避免动画残留）
 // - App 返回后台：延迟 400ms 再显示指示器（等返回动画结束，避免闪烁）
 // - App 退出：立即移除指示器
@@ -901,20 +995,35 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
 
     if (foreground) {
         // ── App 进入前台 → 立即移除指示器（避免动画残留）──
+        MKRemovePending(bid);  // v1.5.6: 清除可能残留的 pending 状态
         dispatch_async(dispatch_get_main_queue(), ^{
             MKRefreshIconForBundleID(bid);
         });
     } else if (running) {
-        // ── App 返回后台 → 延迟 400ms 显示指示器（等返回动画结束）──
+        // ── App 返回后台 → v1.5.6: 立即隐藏标签，延迟400ms创建指示器 ──
+        // 之前：400ms 内标签仍可见 → 用户看到"名称→横条"闪烁
+        // 现在：标签立即消失，400ms 后指示器才出现 → 过渡更自然
+        MKAddPending(bid);  // 标记为"等待指示器"
+
+        // 立即隐藏标签（消除名称可见期）
+        dispatch_async(dispatch_get_main_queue(), ^{
+            MKHideLabelForBundleID(bid);
+        });
+
+        // 延迟400ms创建指示器（等返回动画结束，避免动画残留）
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
-            // 再次检查：如果在这 400ms 内 App 又变前台了，就不要显示
+            MKRemovePending(bid);  // 清除 pending 状态
             if (!MKIsForeground(bid) && MKIsAppRunning(bid)) {
-                MKRefreshIconForBundleID(bid);
+                MKRefreshIconForBundleID(bid);  // 创建指示器
+            } else {
+                // 400ms内App又变前台或退出了 → 恢复标签
+                MKRestoreLabelForBundleID(bid);
             }
         });
     } else {
-        // ── App 退出 → 立即移除指示器 ──
+        // ── App 退出 → 立即移除指示器 + 恢复标签 ──
+        MKRemovePending(bid);  // v1.5.6: 清除 pending 状态
         dispatch_async(dispatch_get_main_queue(), ^{
             MKRefreshIconForBundleID(bid);
         });
@@ -1017,6 +1126,19 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
         // 无指示器 → 只有运行中的后台 App 才需要创建
         NSString *bid = MKGetCachedBid(self);
         if (!bid || !MKIsAppRunning(bid) || MKIsForeground(bid)) return;
+
+        // v1.5.6: pending 期间只隐藏标签，不创建指示器
+        if (MKIsPending(bid)) {
+            UIView *label = MKGetCachedLabel(self);
+            if (label) {
+                label.hidden = YES;
+                label.alpha = 0.0f;
+                label.layer.opacity = 0.0f;
+                label.opaque = NO;
+            }
+            return;  // 等待400ms后才创建指示器
+        }
+
         // 运行中的后台 App → 需要 MKUpdate 创建指示器
         MKUpdate(self);
         return;
@@ -1208,8 +1330,8 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.5.5 ctor: fix label overlap — re-hide on layout + layer.opacity");
-    RDLog(@"======== v1.5.5 loading (fix: label text overlapping indicator — re-hide on layout + layer.opacity) ========");
+    NSLog(@"[RunningDotIndicator] v1.5.6 ctor: fix name→indicator flash — immediate label hide + delayed indicator");
+    RDLog(@"======== v1.5.6 loading (fix: name→indicator flash on swipe-back — immediate label hide + sPendingBIDs) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
