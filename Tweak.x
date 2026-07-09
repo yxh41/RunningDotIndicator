@@ -1,5 +1,8 @@
 //
-//  Tweak.x — RunningDotIndicator v1.5.3
+//  Tweak.x — RunningDotIndicator v1.5.4
+//  v1.5.4: 修复文件夹图标偶尔出现指示器
+//    ✅ SBIconView 回收复用检测：存储 icon 指针，icon 变化时清缓存
+//    ✅ 过滤文件夹图标：SBFolderIcon 直接跳过
 //  v1.5.3: 性能优化 + 转场闪烁修复
 //    ✅ 状态去重：同一 (running, foreground) 不变时跳过刷新（消除重复 hook 触发）
 //    ✅ 定向刷新：只更新状态变化的 App 图标（不再全量遍历视图层级）
@@ -80,6 +83,7 @@ static NSInteger const kDotTag  = 9999;
 static char kMKIndicatorKey;
 static char kMKLabelKey;     // 缓存的名字标签视图
 static char kMKBidKey;       // 缓存的 bundleID
+static char kMKIconKey;      // 缓存的 icon 指针（检测视图回收复用）
 static char kMKLastLayoutKey; // 上次 layoutSubviews 时间戳（限流）
 
 static UIView *MKGetIndicator(SBIconView *iv) {
@@ -93,11 +97,27 @@ static void MKSetIndicator(SBIconView *iv, UIView *dot) {
 static UIView *MKFindLabelView(SBIconView *iconView);
 
 // 缓存 bundleID（避免每次 layoutSubviews 都调 applicationBundleID）
+// v1.5.4: 检测 icon 变化（SBIconView 回收复用）+ 过滤文件夹图标
 static NSString *MKGetCachedBid(SBIconView *iv) {
+    id icon = [iv icon];
+    if (!icon) return nil;
+
+    // 检测图标是否变了（SBIconView 回收复用：同一个 view 可能从 App A 变成文件夹）
+    id cachedIcon = objc_getAssociatedObject(iv, &kMKIconKey);
+    if (cachedIcon && cachedIcon != icon) {
+        // icon 变了 → 清除所有缓存
+        objc_setAssociatedObject(iv, &kMKBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(iv, &kMKLabelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    objc_setAssociatedObject(iv, &kMKIconKey, icon, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    // 过滤文件夹图标：SBFolderIcon 不是 App 图标，不显示指示器
+    NSString *iconCls = NSStringFromClass([icon class]);
+    if ([iconCls containsString:@"Folder"]) return nil;
+
     NSString *bid = objc_getAssociatedObject(iv, &kMKBidKey);
     if (bid) return bid;
-    id icon = [iv icon];
-    if (icon && [icon respondsToSelector:@selector(applicationBundleID)]) {
+    if ([icon respondsToSelector:@selector(applicationBundleID)]) {
         bid = [icon applicationBundleID];
         if (bid) objc_setAssociatedObject(iv, &kMKBidKey, bid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
@@ -118,6 +138,7 @@ static UIView *MKGetCachedLabel(SBIconView *iv) {
 static void MKClearCaches(SBIconView *iv) {
     objc_setAssociatedObject(iv, &kMKLabelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(iv, &kMKBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(iv, &kMKIconKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 // ─── 状态去重：同一个 bundleID 的 (running, foreground) 没变就不刷新 ──
@@ -1006,7 +1027,15 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
         return;
     }
 
-    // 有指示器 → 只需要重新定位（不用跑完整 MKUpdate + MKFindLabelView）
+    // 有指示器 → 先检查是否还应该有（icon 可能变成文件夹或 App 退出了）
+    NSString *bid = MKGetCachedBid(self);
+    if (!bid || !MKIsAppRunning(bid) || MKIsForeground(bid)) {
+        // 不再需要指示器 → 走 MKUpdate 移除
+        MKUpdate(self);
+        return;
+    }
+
+    // 仍然需要指示器 → 只需要重新定位（不用跑完整 MKUpdate + MKFindLabelView）
     MKConfig *cfg = [MKConfig sharedConfig];
     if (!cfg || !cfg.enabled) return;
 
@@ -1178,8 +1207,8 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.5.3 ctor: perf optimization + transition flash fix");
-    RDLog(@"======== v1.5.3 loading (perf: targeted refresh + caching + dedup; visual: 400ms delay for bg return) ========");
+    NSLog(@"[RunningDotIndicator] v1.5.4 ctor: fix folder icon indicator via icon recycling detection");
+    RDLog(@"======== v1.5.4 loading (fix: folder icon indicator — icon recycling detection + SBFolderIcon filter) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
