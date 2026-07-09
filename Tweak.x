@@ -1,11 +1,10 @@
 //
-//  Tweak.x — RunningDotIndicator v1.5.8
-//  v1.5.8: 自然过渡 — 标签渐隐 + 指示器渐显的交叉淡入淡出
-//    ✅ 标签不再瞬间消失：前台→后台时 label alpha 1→0 的 250ms 渐隐动画
-//    ✅ sFadingLabelBIDs 机制：渐隐期间 layoutSubviews 不干扰动画
-//    ✅ 指示器 200ms 渐显 + 标签 250ms 渐隐 → 只约 50ms 空档，在返回动画中不可感知
-//    ✅ 退出/前台恢复：渐隐期间 App 变前台或退出 → 立即恢复标签
-//  v1.5.4: 修复文件夹图标偶尔出现指示器
+//  Tweak.x — RunningDotIndicator v1.5.9
+//  v1.5.9: 修复横条渐显被打断 + NO LABEL 位置优化
+//    ✅ layoutSubviews 不再调用 applyConfig（之前会打断 200ms 渐显动画）
+//    ✅ MKUpdate 已有指示器时也不调用 applyConfig（防止打断渐显）
+//    ✅ NO LABEL 估算 fallback 位置：图标下方居中（替代图标底部边缘）
+//    ✅ 添加指示器创建/渐显日志，方便追踪
 //    ✅ SBIconView 回收复用检测：存储 icon 指针，icon 变化时清缓存
 //    ✅ 过滤文件夹图标：SBFolderIcon 直接跳过
 //  v1.5.3: 性能优化 + 转场闪烁修复
@@ -999,15 +998,18 @@ static void MKUpdate(SBIconView *self) {
                 indicatorH
             );
         } else {
-            // 无标签（Dock 图标 / 文件夹）→ 指示器放在图标底部边缘略下方（Lynx2 风格）
-            // 不要放在图标内部遮挡内容，而是放在父视图中的图标下方
+            // v1.5.9: 无标签 → 估算标签位置（图标下方居中）
+            // 对于 Dock 图标：确实没有标签，估算位置跟之前差不多
+            // 对于系统 App（AppStore/Preferences）：标签不在视图层级中，但指示器应出现在名字区域
             UIView *host = self.superview;
             if (host) {
                 hostView = host;
                 CGRect iconFrame = self.frame;
+                CGFloat estimatedLabelY = iconFrame.origin.y + iconFrame.size.height + 4.0f;
+                CGFloat estimatedLabelH = 14.0f;
                 indicatorFrame = CGRectMake(
                     iconFrame.origin.x + (iconFrame.size.width - indicatorW) / 2.0f,
-                    iconFrame.origin.y + iconFrame.size.height - 1.0f,  // 略低于图标底部，1pt 重叠更自然
+                    estimatedLabelY + (estimatedLabelH - indicatorH) / 2.0f,
                     indicatorW,
                     indicatorH
                 );
@@ -1047,11 +1049,17 @@ static void MKUpdate(SBIconView *self) {
             BOOL shouldAnimate = MKShouldAnimateIndicator(bundleID);
             MKRemoveAnimateIndicator(bundleID);  // 消费标记（一次性）
 
+            // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
+            RDLog(@"Indicator CREATE: %@ shape=%d animate=%d label=%@",
+                  bundleID, (int)cfg.shape, shouldAnimate,
+                  label ? @"YES" : @"NO(FALLBACK)");
+
             if (shouldAnimate) {
                 indicator.alpha = 0.0f;  // 从不可见开始
                 [hostView addSubview:indicator];
                 MKSetIndicator(self, indicator);
                 CGFloat finalAlpha = cfg.opacity;
+                RDLog(@"Indicator FADE-IN: %@ alpha 0→%.2f", bundleID, finalAlpha);
                 [UIView animateWithDuration:0.2 animations:^{
                     indicator.alpha = finalAlpha;
                 }];
@@ -1060,8 +1068,10 @@ static void MKUpdate(SBIconView *self) {
                 MKSetIndicator(self, indicator);
             }
         } else {
+            // v1.5.9: 只重定位指示器，不调用 applyConfig
+            // applyConfig 会设置 self.alpha = cfg.opacity，打断渐显动画
+            // 指示器外观只在创建时和配置变更时设置，layoutSubviews 不需要
             indicator.frame = indicatorFrame;
-            [(MKIndicatorDotView *)indicator applyConfig];
             indicator.hidden = NO;
         }
     });
@@ -1432,11 +1442,15 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
             indW, indH
         );
     } else if (self.superview) {
-        // 无标签（Dock）→ 图标底部边缘
+        // v1.5.9: 无标签 → 估算标签位置（图标下方居中，替代图标底部边缘）
+        // 对于非 Dock 的系统 App（AppStore/Preferences 等），标签可能不在视图层级中
+        // 但指示器应该出现在名字标签应该出现的位置，而不是图标底部
         CGRect icf = self.frame;
+        CGFloat estimatedLabelY = icf.origin.y + icf.size.height + 4.0f;  // 图标下方4pt间隙
+        CGFloat estimatedLabelH = 14.0f;  // iOS 标签典型高度
         indicator.frame = CGRectMake(
             icf.origin.x + (icf.size.width - indW) / 2.0f,
-            icf.origin.y + icf.size.height - 1.0f,
+            estimatedLabelY + (estimatedLabelH - indH) / 2.0f,
             indW, indH
         );
     }
@@ -1581,8 +1595,8 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.5.8 ctor: natural label fade-out + indicator fade-in crossfade transition");
-    RDLog(@"======== v1.5.8 loading (natural transition: label 250ms fade-out → indicator 200ms fade-in) ========");
+    NSLog(@"[RunningDotIndicator] v1.5.9 ctor: fix bar fade-in interrupted by layoutSubviews + NO LABEL estimated position");
+    RDLog(@"======== v1.5.9 loading (fix: applyConfig interrupts fade-in → remove from layoutSubviews; NO LABEL → estimated label position) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
