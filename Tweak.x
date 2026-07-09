@@ -1,12 +1,10 @@
 //
-//  Tweak.x — RunningDotIndicator v1.5.7
-//  v1.5.7: 平滑过渡 + 图标平均色模式
-//    ✅ 指示器渐显动画：前台→后台时指示器 alpha 0→cfg.opacity 200ms 渐显
-//    ✅ 缩短延迟：300ms（原400ms），减少空档期
-//    ✅ sAnimateIndicatorBIDs 标记：只在状态切换时渐显，初始刷新不渐显
-//    ✅ 新增 MKColorModeAutoIcon：从 App 图标取平均色作为指示器颜色（Lynx2 风格）
-//    ✅ 1x1 位图采样 + 亮度调整（暗色提亮、亮色压暗保证可见性）
-//    ✅ per-bundleID 缓存（sIconColorCache），避免重复计算
+//  Tweak.x — RunningDotIndicator v1.5.8
+//  v1.5.8: 自然过渡 — 标签渐隐 + 指示器渐显的交叉淡入淡出
+//    ✅ 标签不再瞬间消失：前台→后台时 label alpha 1→0 的 250ms 渐隐动画
+//    ✅ sFadingLabelBIDs 机制：渐隐期间 layoutSubviews 不干扰动画
+//    ✅ 指示器 200ms 渐显 + 标签 250ms 渐隐 → 只约 50ms 空档，在返回动画中不可感知
+//    ✅ 退出/前台恢复：渐隐期间 App 变前台或退出 → 立即恢复标签
 //  v1.5.4: 修复文件夹图标偶尔出现指示器
 //    ✅ SBIconView 回收复用检测：存储 icon 指针，icon 变化时清缓存
 //    ✅ 过滤文件夹图标：SBFolderIcon 直接跳过
@@ -217,6 +215,7 @@ static NSMutableDictionary<NSString*, NSNumber*> *sRunLogCounts = nil; // 日志
 static NSMutableSet<NSString*> *sForegroundBIDs = nil; // 当前前台 App 不显示其桌面指示器
 static NSMutableSet<NSString*> *sPendingBIDs    = nil; // v1.5.6+: 等待300ms后才显示指示器的App（标签已隐藏，指示器待创建）
 static NSMutableSet<NSString*> *sAnimateIndicatorBIDs = nil; // v1.5.7: 指示器需要渐显动画的 App（状态切换时创建）
+static NSMutableSet<NSString*> *sFadingLabelBIDs    = nil; // v1.5.8: 标签正在渐隐中的 App（250ms 动画期间不干扰）
 static NSMutableDictionary<NSString*, UIColor*> *sIconColorCache = nil; // v1.5.7: bundleID → 图标平均色缓存
 
 // ─── sPendingBIDs 辅助 ─── v1.5.6+ ───
@@ -244,6 +243,19 @@ static BOOL MKShouldAnimateIndicator(NSString *bid) {
 }
 static void MKRemoveAnimateIndicator(NSString *bid) {
     if (sAnimateIndicatorBIDs) [sAnimateIndicatorBIDs removeObject:bid];
+}
+
+// ─── sFadingLabelBIDs 辅助 ─── v1.5.8 ───
+// 标签正在渐隐中的 App（250ms 动画期间，layoutSubviews 不干扰）
+static void MKAddFadingLabel(NSString *bid) {
+    if (!sFadingLabelBIDs) sFadingLabelBIDs = [NSMutableSet set];
+    [sFadingLabelBIDs addObject:bid];
+}
+static BOOL MKIsFadingLabel(NSString *bid) {
+    return sFadingLabelBIDs && [sFadingLabelBIDs containsObject:bid];
+}
+static void MKRemoveFadingLabel(NSString *bid) {
+    if (sFadingLabelBIDs) [sFadingLabelBIDs removeObject:bid];
 }
 
 // ─── 图标平均色采样 ─── v1.5.7 ───
@@ -908,7 +920,8 @@ static void MKUpdate(SBIconView *self) {
 
         BOOL running = MKIsAppRunning(bundleID);
         BOOL isForeground = MKIsForeground(bundleID);
-        BOOL isPending = MKIsPending(bundleID);  // v1.5.6: 等待400ms的App
+        BOOL isPending = MKIsPending(bundleID);       // v1.5.6+: 等待300ms的App
+        BOOL isFading = MKIsFadingLabel(bundleID);    // v1.5.8: 标签正在渐隐中
 
         // v1.5.3: 使用缓存的标签视图（避免每次都跑 MKFindLabelView 4 重策略）
         UIView *label = MKGetCachedLabel(self);
@@ -924,11 +937,19 @@ static void MKUpdate(SBIconView *self) {
                 label.layer.opacity = 1.0f;
                 label.opaque = YES;
             }
-            MKRemovePending(bundleID);  // v1.5.6: 清除 pending 状态
+            MKRemovePending(bundleID);  // v1.5.6+: 清除 pending 状态
+            MKRemoveFadingLabel(bundleID); // v1.5.8: 清除渐隐状态
             return;
         }
 
-        // v1.5.6: pending 期间只隐藏标签，不创建指示器（等300ms回调）
+        // v1.5.8: 标签正在渐隐中 → 不干扰动画，不创建指示器
+        // 让 250ms 渐隐动画自然播放，300ms后才创建指示器
+        if (isFading) {
+            return;  // 不做任何操作，让渐隐动画继续
+        }
+
+        // v1.5.6+: pending 期间只隐藏标签，不创建指示器（等300ms回调）
+        // 标签渐隐已完成（alpha=0），但仍需保持隐藏状态防止系统恢复
         if (isPending) {
             if (label) {
                 label.hidden = YES;
@@ -1104,13 +1125,15 @@ static void MKRefreshIconForBundleID(NSString *bid) {
 }
 
 // ====================================================================
-// v1.5.6+: 立即隐藏/恢复指定 bundleID 的标签（不创建/删除指示器）
-// 用于前台→后台过渡期：标签立即消失，指示器延迟300ms后渐显创建
+// v1.5.8: 标签渐隐动画（前台→后台时，标签 alpha 1→0 的 250ms 渐隐）
+// 替代 v1.5.6 的瞬间隐藏，让过渡更自然
 // ====================================================================
 
-static void MKHideLabelForBundleID(NSString *bid) {
+static void MKFadeOutLabelForBundleID(NSString *bid) {
     MKSafe(^{
         if (!sInitDone || !bid.length) return;
+        MKAddFadingLabel(bid);  // v1.5.8: 标记渐隐状态
+
         NSArray *windows = [UIApplication sharedApplication].windows;
         for (UIWindow *window in windows) {
             NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
@@ -1123,10 +1146,19 @@ static void MKHideLabelForBundleID(NSString *bid) {
                     if (ivBid && [ivBid isEqualToString:bid]) {
                         UIView *label = MKGetCachedLabel(iv);
                         if (label) {
-                            label.hidden = YES;
-                            label.alpha = 0.0f;
-                            label.layer.opacity = 0.0f;
-                            label.opaque = NO;
+                            // v1.5.8: 250ms 渐隐动画（alpha 1→0）
+                            [UIView animateWithDuration:0.25
+                                                  delay:0
+                                                options:UIViewAnimationOptionAllowAnimatedContent
+                                             animations:^{
+                                label.alpha = 0.0f;
+                                label.layer.opacity = 0.0f;
+                            } completion:^(BOOL finished) {
+                                // 渐隐完成 → 确保完全隐藏 + 清除渐隐标记
+                                label.hidden = YES;
+                                label.opaque = NO;
+                                MKRemoveFadingLabel(bid);
+                            }];
                         }
                     }
                 }
@@ -1141,6 +1173,8 @@ static void MKHideLabelForBundleID(NSString *bid) {
 static void MKRestoreLabelForBundleID(NSString *bid) {
     MKSafe(^{
         if (!sInitDone || !bid.length) return;
+        MKRemoveFadingLabel(bid);  // v1.5.8: 清除渐隐标记
+        MKRemovePending(bid);      // v1.5.8: 清除 pending 标记
         NSArray *windows = [UIApplication sharedApplication].windows;
         for (UIWindow *window in windows) {
             NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
@@ -1153,10 +1187,14 @@ static void MKRestoreLabelForBundleID(NSString *bid) {
                     if (ivBid && [ivBid isEqualToString:bid]) {
                         UIView *label = MKGetCachedLabel(iv);
                         if (label) {
-                            label.hidden = NO;
-                            label.alpha = 1.0f;
-                            label.layer.opacity = 1.0f;
-                            label.opaque = YES;
+                            // v1.5.8: 如果标签正在渐隐中，需要动画恢复
+                            // 否则直接恢复可见性
+                            [UIView animateWithDuration:0.15 animations:^{
+                                label.hidden = NO;
+                                label.alpha = 1.0f;
+                                label.layer.opacity = 1.0f;
+                                label.opaque = YES;
+                            }];
                         }
                     }
                 }
@@ -1169,9 +1207,10 @@ static void MKRestoreLabelForBundleID(NSString *bid) {
 }
 
 // ====================================================================
-// 动画感知的状态变更处理（v1.5.7）
+// 动画感知的状态变更处理（v1.5.8）
 // - App 进入前台：立即移除指示器（0ms 延迟，避免动画残留）
-// - App 返回后台：立即隐藏标签 + 延迟 300ms 渐显指示器（200ms fade-in）
+// - App 返回后台：标签 250ms 渐隐 + 300ms 后指示器 200ms 渐显
+//   → 自然交叉淡入淡出，只有约 50ms 空档
 // - App 退出：立即移除指示器 + 恢复标签
 // ====================================================================
 
@@ -1184,23 +1223,24 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
 
     if (foreground) {
         // ── App 进入前台 → 立即移除指示器（避免动画残留）──
-        MKRemovePending(bid);  // v1.5.6: 清除可能残留的 pending 状态
+        MKRemovePending(bid);     // 清除 pending 状态
+        MKRemoveFadingLabel(bid); // v1.5.8: 清除渐隐状态
         dispatch_async(dispatch_get_main_queue(), ^{
             MKRefreshIconForBundleID(bid);
         });
     } else if (running) {
-        // ── App 返回后台 → v1.5.7: 立即隐藏标签 + 渐显指示器 ──
-        // 标签立即消失（消除名称可见期）
-        // 300ms 后创建指示器并渐显（等返回动画结束 + 200ms fade-in）
-        MKAddPending(bid);        // 标记为"等待指示器"
-        MKAddAnimateIndicator(bid); // v1.5.7: 标记渐显动画（一次性消费）
+        // ── App 返回后台 → v1.5.8: 标签渐隐 + 指示器渐显 ──
+        // 标签不再瞬间消失：250ms 渐隐 alpha 1→0
+        // 300ms 后创建指示器并 200ms 渐显 alpha 0→cfg.opacity
+        MKAddPending(bid);          // 标记为"等待指示器"
+        MKAddAnimateIndicator(bid); // 标记渐显动画（一次性消费）
 
-        // 立即隐藏标签（消除名称可见期）
+        // v1.5.8: 标签渐隐动画（替代 v1.5.6 的瞬间隐藏）
         dispatch_async(dispatch_get_main_queue(), ^{
-            MKHideLabelForBundleID(bid);
+            MKFadeOutLabelForBundleID(bid);
         });
 
-        // 延迟300ms创建指示器（等返回动画结束，避免动画残留）
+        // 延迟300ms创建指示器（等返回动画结束 + 标签渐隐接近完成）
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
             MKRemovePending(bid);  // 清除 pending 状态
@@ -1214,7 +1254,8 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
         });
     } else {
         // ── App 退出 → 立即移除指示器 + 恢复标签 ──
-        MKRemovePending(bid);  // v1.5.6: 清除 pending 状态
+        MKRemovePending(bid);     // 清除 pending 状态
+        MKRemoveFadingLabel(bid); // v1.5.8: 清除渐隐状态
         dispatch_async(dispatch_get_main_queue(), ^{
             MKRefreshIconForBundleID(bid);
         });
@@ -1318,7 +1359,10 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
         NSString *bid = MKGetCachedBid(self);
         if (!bid || !MKIsAppRunning(bid) || MKIsForeground(bid)) return;
 
-        // v1.5.6: pending 期间只隐藏标签，不创建指示器
+        // v1.5.8: 标签正在渐隐中 → 不干扰动画，等渐隐完成后再处理
+        if (MKIsFadingLabel(bid)) return;
+
+        // v1.5.6+: pending 期间只隐藏标签，不创建指示器
         if (MKIsPending(bid)) {
             UIView *label = MKGetCachedLabel(self);
             if (label) {
@@ -1343,8 +1387,24 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
         return;
     }
 
-    // 仍然需要指示器 → 只需要重新定位 + 重新隐藏标签
-    // v1.5.5: 系统 layout 会恢复标签可见性，每次都要强制隐藏
+    // v1.5.8: 标签正在渐隐 → 只重定位指示器，不操作标签（让动画自然播放）
+    if (MKIsFadingLabel(bid)) {
+        UIView *label = MKGetCachedLabel(self);
+        if (indicator && label && label.superview) {
+            CGRect lf = label.frame;
+            CGFloat indW, indH;
+            MKConfig *cfg = [MKConfig sharedConfig];
+            if (cfg.shape == MKShapeDot) { indW = cfg.dotSize; indH = cfg.dotSize; }
+            else { indW = cfg.barWidth; indH = cfg.barHeight; }
+            indicator.frame = CGRectMake(
+                lf.origin.x + (lf.size.width - indW) / 2.0f,
+                lf.origin.y + (lf.size.height - indH) / 2.0f,
+                indW, indH);
+        }
+        return;
+    }
+
+    // 仍然需要指示器 → 重新定位 + 重新隐藏标签
     MKConfig *cfg = [MKConfig sharedConfig];
     if (!cfg || !cfg.enabled) return;
 
@@ -1521,8 +1581,8 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.5.7 ctor: smooth indicator fade-in + icon average color mode");
-    RDLog(@"======== v1.5.7 loading (smooth fade-in + icon average color AutoIcon mode) ========");
+    NSLog(@"[RunningDotIndicator] v1.5.8 ctor: natural label fade-out + indicator fade-in crossfade transition");
+    RDLog(@"======== v1.5.8 loading (natural transition: label 250ms fade-out → indicator 200ms fade-in) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
