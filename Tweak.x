@@ -1,9 +1,12 @@
 //
-//  Tweak.x — RunningDotIndicator v1.5.2
-//  v1.5.2: 修复 App 打开/返回时指示器在动画中残留
-//    ✅ 前台 App 不显示桌面指示器（避免启动动画跟随残留）
-//    ✅ 状态变化时先清理全部指示器再刷新，清除动画容器中的残留
-//    ✅ 维持后台运行 App 在桌面正常显示
+//  Tweak.x — RunningDotIndicator v1.5.3
+//  v1.5.3: 性能优化 + 转场闪烁修复
+//    ✅ 状态去重：同一 (running, foreground) 不变时跳过刷新（消除重复 hook 触发）
+//    ✅ 定向刷新：只更新状态变化的 App 图标（不再全量遍历视图层级）
+//    ✅ 动画感知延迟：返回桌面延迟 400ms 显示指示器（等动画结束，不再闪烁）
+//    ✅ layoutSubviews 优化：跳过非运行 App，有指示器时只重定位不重查找
+//    ✅ bundleID + 标签缓存（associated objects）：避免重复调用 applicationBundleID / MKFindLabelView
+//    ✅ 移除状态变化时的 MKClearAllIndicators（消除 name→indicator 闪烁）
 //  v1.5.1: Dock / 文件夹图标指示器放到图标底部边缘（不遮挡图标内容）
 //    ✅ 无名字标签时：指示器在父视图中位于图标底部下方（Lynx2 风格）
 //    ✅ 标签查找加评分机制，避免误把 badge 等当名字标签
@@ -75,11 +78,58 @@ static NSInteger const kDotTag  = 9999;
 
 // ─── 关联对象：SBIconView ↔ 指示器视图（跨层级追踪）──
 static char kMKIndicatorKey;
+static char kMKLabelKey;     // 缓存的名字标签视图
+static char kMKBidKey;       // 缓存的 bundleID
+static char kMKLastLayoutKey; // 上次 layoutSubviews 时间戳（限流）
+
 static UIView *MKGetIndicator(SBIconView *iv) {
     return objc_getAssociatedObject(iv, &kMKIndicatorKey);
 }
 static void MKSetIndicator(SBIconView *iv, UIView *dot) {
     objc_setAssociatedObject(iv, &kMKIndicatorKey, dot, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// 前向声明（MKFindLabelView 定义在后面，但 MKGetCachedLabel 需要调用它）
+static UIView *MKFindLabelView(SBIconView *iconView);
+
+// 缓存 bundleID（避免每次 layoutSubviews 都调 applicationBundleID）
+static NSString *MKGetCachedBid(SBIconView *iv) {
+    NSString *bid = objc_getAssociatedObject(iv, &kMKBidKey);
+    if (bid) return bid;
+    id icon = [iv icon];
+    if (icon && [icon respondsToSelector:@selector(applicationBundleID)]) {
+        bid = [icon applicationBundleID];
+        if (bid) objc_setAssociatedObject(iv, &kMKBidKey, bid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return bid;
+}
+
+// 缓存名字标签视图（避免每次 layoutSubviews 都跑 MKFindLabelView 4 重策略）
+static UIView *MKGetCachedLabel(SBIconView *iv) {
+    UIView *label = objc_getAssociatedObject(iv, &kMKLabelKey);
+    if (label && label.superview) return label;  // 仍然有效
+    // 缓存失效 → 重新查找
+    label = MKFindLabelView(iv);
+    if (label) objc_setAssociatedObject(iv, &kMKLabelKey, label, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return label;
+}
+
+// 清除 SBIconView 的所有缓存（didMoveToWindow 时调用，防止 view 回收后缓存过期）
+static void MKClearCaches(SBIconView *iv) {
+    objc_setAssociatedObject(iv, &kMKLabelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(iv, &kMKBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// ─── 状态去重：同一个 bundleID 的 (running, foreground) 没变就不刷新 ──
+static NSMutableDictionary<NSString*, NSDictionary*> *sLastState = nil;
+static BOOL MKStateDidChange(NSString *bid, BOOL running, BOOL foreground) {
+    if (!sLastState) sLastState = [NSMutableDictionary dictionary];
+    NSDictionary *prev = sLastState[bid];
+    BOOL prevRun = prev ? [prev[@"r"] boolValue] : NO;
+    BOOL prevFg = prev ? [prev[@"f"] boolValue] : NO;
+    if (prevRun == running && prevFg == foreground) return NO;
+    sLastState[bid] = @{@"r": @(running), @"f": @(foreground)};
+    return YES;
 }
 
 // ─── 系统进程黑名单（只过滤无桌面图标的纯后台服务 + 越狱工具）─────────
@@ -616,54 +666,36 @@ static void MKUpdate(SBIconView *self) {
 
         sCallCount++;
         if (MKIsDisabled()) {
-            // 禁用时：移除指示器，恢复名字标签
             UIView *indicator = MKGetIndicator(self);
             if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
-            UIView *label = MKFindLabelView(self);
+            UIView *label = MKGetCachedLabel(self);
             if (label) { label.hidden = NO; label.alpha = 1.0f; }
             return;
         }
 
         MKConfig *cfg = [MKConfig sharedConfig];
         if (!cfg || !cfg.enabled) {
-            // 未启用：移除指示器，恢复名字标签
             UIView *indicator = MKGetIndicator(self);
             if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
-            UIView *label = MKFindLabelView(self);
+            UIView *label = MKGetCachedLabel(self);
             if (label) { label.hidden = NO; label.alpha = 1.0f; }
             return;
         }
 
-        id icon = [self icon];
-        NSString *bundleID = nil;
-        if (icon && [icon respondsToSelector:@selector(applicationBundleID)]) {
-            bundleID = [icon applicationBundleID];
-        }
+        // v1.5.3: 使用缓存的 bundleID（避免每次都调 applicationBundleID）
+        NSString *bundleID = MKGetCachedBid(self);
         if (!bundleID || bundleID.length == 0) return;
 
         BOOL running = MKIsAppRunning(bundleID);
         BOOL isForeground = MKIsForeground(bundleID);
 
-        UIView *label = MKFindLabelView(self);
+        // v1.5.3: 使用缓存的标签视图（避免每次都跑 MKFindLabelView 4 重策略）
+        UIView *label = MKGetCachedLabel(self);
         UIView *indicator = MKGetIndicator(self);
-
-        // 诊断：记录找到的标签类名和位置（每个 bundleID 仅一次）
-        if (label) {
-            static NSMutableSet<NSString*> *sLabelLogBids = nil;
-            if (!sLabelLogBids) sLabelLogBids = [NSMutableSet set];
-            if (![sLabelLogBids containsObject:bundleID]) {
-                [sLabelLogBids addObject:bundleID];
-                RDLog(@"LABEL for %@: class=%@ frame=(%.0f,%.0f,%.0f,%.0f) super=%@",
-                      bundleID, NSStringFromClass([label class]),
-                      label.frame.origin.x, label.frame.origin.y,
-                      label.frame.size.width, label.frame.size.height,
-                      label.superview ? NSStringFromClass([label.superview class]) : @"nil");
-            }
-        }
 
         // 当前被用户打开在前台的 App，桌面上不再显示指示器（避免启动动画残留）
         if (!running || isForeground) {
-            // ── App 不在运行 → 移除指示器，恢复名字 ──
+            // ── App 不在运行 / 在前台 → 移除指示器，恢复名字 ──
             if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
             if (label) { label.hidden = NO; label.alpha = 1.0f; }
             return;
@@ -814,6 +846,71 @@ static void MKRefreshAllIcons() {
 }
 
 // ====================================================================
+// 定向刷新：只更新指定 bundleID 对应的 SBIconView（v1.5.3 性能优化）
+// 避免每次状态变化都遍历整个视图层级
+// ====================================================================
+
+static void MKRefreshIconForBundleID(NSString *bid) {
+    MKSafe(^{
+        if (!sInitDone || !bid.length) return;
+        NSArray *windows = [UIApplication sharedApplication].windows;
+        for (UIWindow *window in windows) {
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
+            while (stack.count > 0) {
+                UIView *current = [stack lastObject];
+                [stack removeLastObject];
+                if ([current isKindOfClass:NSClassFromString(@"SBIconView")]) {
+                    SBIconView *iv = (SBIconView *)current;
+                    NSString *ivBid = MKGetCachedBid(iv);
+                    if (ivBid && [ivBid isEqualToString:bid]) {
+                        MKUpdate(iv);
+                    }
+                }
+                for (UIView *child in current.subviews) {
+                    [stack addObject:child];
+                }
+            }
+        }
+    });
+}
+
+// ====================================================================
+// 动画感知的状态变更处理（v1.5.3）
+// - App 进入前台：立即移除指示器（0ms 延迟，避免动画残留）
+// - App 返回后台：延迟 400ms 再显示指示器（等返回动画结束，避免闪烁）
+// - App 退出：立即移除指示器
+// ====================================================================
+
+static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
+    if (!sInitDone || !bid.length) return;
+
+    // 状态去重：同一 bundleID 的 (running, foreground) 没变就跳过
+    // 这能消除 _noteProcess + _setInternalProcessState 重复触发的问题
+    if (!MKStateDidChange(bid, running, foreground)) return;
+
+    if (foreground) {
+        // ── App 进入前台 → 立即移除指示器（避免动画残留）──
+        dispatch_async(dispatch_get_main_queue(), ^{
+            MKRefreshIconForBundleID(bid);
+        });
+    } else if (running) {
+        // ── App 返回后台 → 延迟 400ms 显示指示器（等返回动画结束）──
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            // 再次检查：如果在这 400ms 内 App 又变前台了，就不要显示
+            if (!MKIsForeground(bid) && MKIsAppRunning(bid)) {
+                MKRefreshIconForBundleID(bid);
+            }
+        });
+    } else {
+        // ── App 退出 → 立即移除指示器 ──
+        dispatch_async(dispatch_get_main_queue(), ^{
+            MKRefreshIconForBundleID(bid);
+        });
+    }
+}
+
+// ====================================================================
 // 延迟初始化（15 秒后执行，不阻塞 SpringBoard 启动）
 // ====================================================================
 
@@ -879,11 +976,12 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 - (void)didMoveToWindow {
     %orig;
     if (!self.window) {
-        // View 从窗口移除 → 清理指示器 + 恢复标签
+        // View 从窗口移除 → 清理指示器 + 恢复标签 + 清除缓存
         UIView *indicator = MKGetIndicator(self);
         if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
-        UIView *label = MKFindLabelView(self);
+        UIView *label = MKGetCachedLabel(self);
         if (label) { label.hidden = NO; label.alpha = 1.0f; }
+        MKClearCaches(self);
         return;
     }
     if (sInitDone) {
@@ -895,7 +993,50 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 
 - (void)layoutSubviews {
     %orig;
-    if (sInitDone) MKUpdate(self);
+    if (!sInitDone) return;
+
+    // v1.5.3 性能优化：快速跳过不需要处理的图标
+    UIView *indicator = MKGetIndicator(self);
+    if (!indicator) {
+        // 无指示器 → 只有运行中的后台 App 才需要创建
+        NSString *bid = MKGetCachedBid(self);
+        if (!bid || !MKIsAppRunning(bid) || MKIsForeground(bid)) return;
+        // 运行中的后台 App → 需要 MKUpdate 创建指示器
+        MKUpdate(self);
+        return;
+    }
+
+    // 有指示器 → 只需要重新定位（不用跑完整 MKUpdate + MKFindLabelView）
+    MKConfig *cfg = [MKConfig sharedConfig];
+    if (!cfg || !cfg.enabled) return;
+
+    CGFloat indW, indH;
+    if (cfg.shape == MKShapeDot) {
+        indW = cfg.dotSize;
+        indH = cfg.dotSize;
+    } else {
+        indW = cfg.barWidth;
+        indH = cfg.barHeight;
+    }
+
+    UIView *label = MKGetCachedLabel(self);
+    if (label && label.superview) {
+        // 标签找到 → 指示器在标签中心
+        CGRect lf = label.frame;
+        indicator.frame = CGRectMake(
+            lf.origin.x + (lf.size.width - indW) / 2.0f,
+            lf.origin.y + (lf.size.height - indH) / 2.0f,
+            indW, indH
+        );
+    } else if (self.superview) {
+        // 无标签（Dock）→ 图标底部边缘
+        CGRect icf = self.frame;
+        indicator.frame = CGRectMake(
+            icf.origin.x + (icf.size.width - indW) / 2.0f,
+            icf.origin.y + icf.size.height - 1.0f,
+            indW, indH
+        );
+    }
 }
 
 %end
@@ -934,18 +1075,16 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
         // FBProcessState.taskState: 2=Running, 3=Suspended → app alive
         // FBProcessState.taskState: 1=NotRunning/Dead → app exited
         // FBProcessState.isRunning: YES → app process exists
-        if (isRunning || taskState == 2 || taskState == 3) {
+        BOOL isRunningNow = (isRunning || taskState == 2 || taskState == 3);
+        if (isRunningNow) {
             MKAddToRunningSet(bid);
-        } else if (taskState == 1 || !isRunning) {
+        } else {
             MKRemoveFromRunningSet(bid);
+            isRunningNow = NO;
         }
 
-        if (sInitDone) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                MKClearAllIndicators();
-                MKRefreshAllIcons();
-            });
-        }
+        // v1.5.3: 定向+延迟刷新（替代 MKClearAllIndicators + MKRefreshAllIcons）
+        MKOnStateChange(bid, isRunningNow, isForeground);
     } @catch (NSException *e) {
         RDLog(@"_noteProcess EXCEPTION: %@", e.reason);
     }
@@ -977,18 +1116,16 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
         RDLog(@"SBApp._setInternalProcState: %@ → isRunning=%d taskState=%d foreground=%d",
               bid, isRunning, taskState, isForeground);
 
-        if (isRunning || taskState == 2 || taskState == 3) {
+        BOOL isRunningNow = (isRunning || taskState == 2 || taskState == 3);
+        if (isRunningNow) {
             MKAddToRunningSet(bid);
-        } else if (taskState == 1 || !isRunning) {
+        } else {
             MKRemoveFromRunningSet(bid);
+            isRunningNow = NO;
         }
 
-        if (sInitDone) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                MKClearAllIndicators();
-                MKRefreshAllIcons();
-            });
-        }
+        // v1.5.3: 定向+延迟刷新（替代 MKClearAllIndicators + MKRefreshAllIcons）
+        MKOnStateChange(bid, isRunningNow, isForeground);
     } @catch (NSException *e) {
         RDLog(@"_setInternalProcState EXCEPTION: %@", e.reason);
     }
@@ -1016,20 +1153,17 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 
         MKSetForeground(bid, state == 2);
 
-        if (state >= 1) {
-            // Background 或 Foreground → App 在内存中运行
+        BOOL isRunningNow = (state >= 1);
+        if (isRunningNow) {
             MKAddToRunningSet(bid);
         } else {
-            // Inactive/Dead → App 已退出
             MKRemoveFromRunningSet(bid);
+            isRunningNow = NO;
         }
 
-        if (sInitDone) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                MKClearAllIndicators();
-                MKRefreshAllIcons();
-            });
-        }
+        // v1.5.3: 定向+延迟刷新（替代 MKClearAllIndicators + MKRefreshAllIcons）
+        BOOL isFg = (state == 2);
+        MKOnStateChange(bid, isRunningNow, isFg);
     } @catch (NSException *e) {
         RDLog(@"_setActivationState EXCEPTION: %@", e.reason);
     }
@@ -1044,8 +1178,8 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.5.2 ctor: hide indicator for foreground app + clear on transition");
-    RDLog(@"======== v1.5.2 loading (hide indicator for foreground app + clear on transition) ========");
+    NSLog(@"[RunningDotIndicator] v1.5.3 ctor: perf optimization + transition flash fix");
+    RDLog(@"======== v1.5.3 loading (perf: targeted refresh + caching + dedup; visual: 400ms delay for bg return) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
@@ -1080,7 +1214,7 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
                 RDLog(@"EXIT NOTE: %@ bid=%@", nm, bid ?: @"(nil)");
                 if (!bid) return;
                 MKRemoveFromRunningSet(bid);
-                if (sInitDone) MKRefreshAllIcons();
+                if (sInitDone) MKOnStateChange(bid, NO, NO);
             } @catch (NSException *e) {
                 RDLog(@"EXIT NOTE exception: %@", e.reason);
             }
