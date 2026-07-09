@@ -39,6 +39,9 @@
 #include <spawn.h>
 #include <objc/runtime.h>
 
+// ─── RDLog 前向声明（避免 C99 "use before declaration" 错误）──
+static void RDLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
+
 // libproc 函数声明（iOS 运行时存在，但 iPhoneOS SDK 不含此头文件）
 extern int proc_listallpids(void *buffer, int buffersize);
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
@@ -393,7 +396,6 @@ static UIColor *MKCachedIconColorForBundleID(NSString *bid) {
 }
 
 // ─── 文件日志 ────────────────────────────────────────────────
-static void RDLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
 static void RDLog(NSString *fmt, ...) {
     va_list args;
     va_start(args, fmt);
