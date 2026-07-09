@@ -14,4 +14,7 @@
 // 根据当前 MKConfig 刷新外观(颜色/形状/不透明度)
 - (void)applyConfig;
 
+// per-icon 颜色（AutoIcon 模式时覆盖 cfg.color）
+@property (nonatomic, strong) UIColor *indicatorColor;
+
 @end

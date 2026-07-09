@@ -62,6 +62,11 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
     return v ? [v boolValue] : YES;
 }
 
+- (MKColorMode)colorMode {
+    id v = _prefs[@"colorMode"];
+    return v ? (MKColorMode)[v integerValue] : MKColorModeFixed;
+}
+
 - (MKShape)shape {
     id v = _prefs[@"shape"];
     return v ? (MKShape)[v integerValue] : MKShapeDot;

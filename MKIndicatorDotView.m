@@ -32,7 +32,7 @@
 
 - (void)drawRect:(CGRect)rect {
     MKConfig *cfg = [MKConfig sharedConfig];
-    UIColor *color = cfg.color;
+    UIColor *color = self.indicatorColor ?: cfg.color;
 
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (!ctx) return;

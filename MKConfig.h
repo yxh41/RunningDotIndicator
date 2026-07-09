@@ -12,6 +12,11 @@ typedef NS_ENUM(NSInteger, MKShape) {
     MKShapeBar   = 1   // 横条（pill 形状，类似 Lynx2 条形指示器）
 };
 
+typedef NS_ENUM(NSInteger, MKColorMode) {
+    MKColorModeFixed    = 0,  // 固定颜色（用户配置的 #RRGGBB）
+    MKColorModeAutoIcon = 1   // 从图标取平均色（Lynx2 风格）
+};
+
 @interface MKConfig : NSObject
 
 + (instancetype)sharedConfig;
@@ -21,6 +26,7 @@ typedef NS_ENUM(NSInteger, MKShape) {
 
 @property (nonatomic, readonly) BOOL       enabled;        // 总开关, 默认 YES
 @property (nonatomic, readonly) UIColor   *color;          // 指示器颜色, 默认 #34C759
+@property (nonatomic, readonly) MKColorMode colorMode;     // 颜色模式, 默认 Fixed
 @property (nonatomic, readonly) MKShape    shape;          // 形状, 默认 圆点
 @property (nonatomic, readonly) CGFloat    dotSize;        // 圆点直径(pt), 默认 6
 @property (nonatomic, readonly) CGFloat    barWidth;       // 横条宽度(pt), 默认 24

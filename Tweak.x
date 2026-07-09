@@ -1,11 +1,12 @@
 //
-//  Tweak.x — RunningDotIndicator v1.5.6
-//  v1.5.6: 修复上滑回桌面时"名称→横条"可见闪烁
-//    ✅ 前台→后台时立即隐藏标签（消除名称可见期）
-//    ✅ sPendingBIDs 机制：400ms 等待期内只隐藏标签，不创建指示器
-//    ✅ layoutSubviews / MKUpdate 在 pending 期间只隐藏标签，不创建指示器
-//    ✅ 400ms 后再创建指示器（等返回动画结束）
-//    ✅ 400ms 内 App 又变前台或退出 → 恢复标签
+//  Tweak.x — RunningDotIndicator v1.5.7
+//  v1.5.7: 平滑过渡 + 图标平均色模式
+//    ✅ 指示器渐显动画：前台→后台时指示器 alpha 0→cfg.opacity 200ms 渐显
+//    ✅ 缩短延迟：300ms（原400ms），减少空档期
+//    ✅ sAnimateIndicatorBIDs 标记：只在状态切换时渐显，初始刷新不渐显
+//    ✅ 新增 MKColorModeAutoIcon：从 App 图标取平均色作为指示器颜色（Lynx2 风格）
+//    ✅ 1x1 位图采样 + 亮度调整（暗色提亮、亮色压暗保证可见性）
+//    ✅ per-bundleID 缓存（sIconColorCache），避免重复计算
 //  v1.5.4: 修复文件夹图标偶尔出现指示器
 //    ✅ SBIconView 回收复用检测：存储 icon 指针，icon 变化时清缓存
 //    ✅ 过滤文件夹图标：SBFolderIcon 直接跳过
@@ -211,10 +212,12 @@ static BOOL  sDisabled = NO;
 static BOOL  sPathCacheReady = NO;
 static NSMutableDictionary<NSString*, NSNumber*> *sRunLogCounts = nil; // 日志限流
 static NSMutableSet<NSString*> *sForegroundBIDs = nil; // 当前前台 App 不显示其桌面指示器
-static NSMutableSet<NSString*> *sPendingBIDs    = nil; // v1.5.6: 等待400ms后才显示指示器的App（标签已隐藏，指示器待创建）
+static NSMutableSet<NSString*> *sPendingBIDs    = nil; // v1.5.6+: 等待300ms后才显示指示器的App（标签已隐藏，指示器待创建）
+static NSMutableSet<NSString*> *sAnimateIndicatorBIDs = nil; // v1.5.7: 指示器需要渐显动画的 App（状态切换时创建）
+static NSMutableDictionary<NSString*, UIColor*> *sIconColorCache = nil; // v1.5.7: bundleID → 图标平均色缓存
 
-// ─── sPendingBIDs 辅助 ─── v1.5.6 ───
-// 前台→后台时，立即隐藏标签但延迟400ms创建指示器
+// ─── sPendingBIDs 辅助 ─── v1.5.6+ ───
+// 前台→后台时，立即隐藏标签但延迟300ms创建指示器
 // pending 期间：layoutSubviews/MKUpdate 只隐藏标签，不创建指示器
 static void MKAddPending(NSString *bid) {
     if (!sPendingBIDs) sPendingBIDs = [NSMutableSet set];
@@ -225,6 +228,168 @@ static BOOL MKIsPending(NSString *bid) {
 }
 static void MKRemovePending(NSString *bid) {
     if (sPendingBIDs) [sPendingBIDs removeObject:bid];
+}
+
+// ─── sAnimateIndicatorBIDs 辅助 ─── v1.5.7 ───
+// 标记哪些 App 的指示器需要渐显动画（只在状态切换时触发，初始刷新不渐显）
+static void MKAddAnimateIndicator(NSString *bid) {
+    if (!sAnimateIndicatorBIDs) sAnimateIndicatorBIDs = [NSMutableSet set];
+    [sAnimateIndicatorBIDs addObject:bid];
+}
+static BOOL MKShouldAnimateIndicator(NSString *bid) {
+    return sAnimateIndicatorBIDs && [sAnimateIndicatorBIDs containsObject:bid];
+}
+static void MKRemoveAnimateIndicator(NSString *bid) {
+    if (sAnimateIndicatorBIDs) [sAnimateIndicatorBIDs removeObject:bid];
+}
+
+// ─── 图标平均色采样 ─── v1.5.7 ───
+// 从 App 图标取平均色，用于 AutoIcon 颜色模式
+// 方法：尝试 SBIcon/SBIconView accessor 获取图标 UIImage → 渲染到 1x1 位图 → 取像素值
+// 加亮度/饱和度调整保证指示器在桌面背景上可见
+static UIColor *MKAverageColorFromImage(UIImage *image) {
+    if (!image) return nil;
+    CGImageRef cgImg = image.CGImage;
+    if (!cgImg) return nil;
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    unsigned char pixels[4] = {0};
+    CGContextRef ctx = CGBitmapContextCreate(pixels, 1, 1, 8, 4, colorSpace,
+                                             (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    if (!ctx) {
+        CGColorSpaceRelease(colorSpace);
+        return nil;
+    }
+
+    // 渲染图标到 1x1 位图 → 所有像素被平均为单点
+    CGContextDrawImage(ctx, CGRectMake(0, 0, 1, 1), cgImg);
+
+    CGFloat r = pixels[0] / 255.0f;
+    CGFloat g = pixels[1] / 255.0f;
+    CGFloat b = pixels[2] / 255.0f;
+
+    CGContextRelease(ctx);
+    CGColorSpaceRelease(colorSpace);
+
+    // 转换到 HSB 调整亮度/饱和度保证可见性
+    UIColor *raw = [UIColor colorWithRed:r green:g blue:b alpha:1.0f];
+    CGFloat hue, sat, brightness, alpha;
+    [raw getHue:&hue saturation:&sat brightness:&brightness alpha:&alpha];
+
+    // 暗色提亮（亮度 < 0.3 → 提到 0.3+），亮色压暗（亮度 > 0.85 → 压到 0.85-）
+    if (brightness < 0.3f) {
+        brightness = 0.3f + brightness * 0.5f;
+    } else if (brightness > 0.85f) {
+        brightness = 0.85f - (1.0f - brightness) * 0.5f;
+    }
+    // 略增饱和度让指示器更鲜艳
+    sat = MIN(sat * 1.3f, 1.0f);
+
+    return [UIColor colorWithHue:hue saturation:sat brightness:brightness alpha:1.0f];
+}
+
+// 尝试从 SBIconView/SBIcon 获取图标 UIImage
+static UIImage *MKGetIconImage(SBIconView *iv) {
+    @try {
+        id icon = [iv icon];
+        if (!icon) return nil;
+
+        // 策略 1: SBIcon 的 iconImageForScreenScale: / applicationIconImageForScreenScale:
+        NSArray *iconImageSelectors = @[
+            @"applicationIconImageForScreenScale:",
+            @"iconImageForScreenScale:",
+            @"applicationIconImage",
+            @"iconImage",
+            @"getImage"
+        ];
+        CGFloat scale = [UIScreen mainScreen].scale;
+        NSNumber *scaleNum = @(scale);
+
+        for (NSString *selName in iconImageSelectors) {
+            SEL sel = NSSelectorFromString(selName);
+            if ([icon respondsToSelector:sel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                // 含 scale 参数的方法
+                if ([selName hasSuffix:@":"]) {
+                    NSMethodSignature *sig = [icon methodSignatureForSelector:sel];
+                    if (sig.numberOfArguments == 3) {  // self, _cmd, scale
+                        id result = [icon performSelector:sel withObject:scaleNum];
+                        if ([result isKindOfClass:[UIImage class]]) return result;
+                    }
+                } else {
+                    id result = [icon performSelector:sel];
+                    if ([result isKindOfClass:[UIImage class]]) return result;
+                }
+#pragma clang diagnostic pop
+            }
+        }
+
+        // 策略 2: SBIconView 的 iconImage accessor
+        NSArray *viewImageSelectors = @[@"iconImage", @"_iconImage", @"image"];
+        for (NSString *selName in viewImageSelectors) {
+            SEL sel = NSSelectorFromString(selName);
+            if ([iv respondsToSelector:sel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                id result = [iv performSelector:sel];
+#pragma clang diagnostic pop
+                if ([result isKindOfClass:[UIImage class]]) return result;
+            }
+        }
+
+        // 策略 3: 快照 SBIconView（兜底）
+        UIGraphicsBeginImageContextWithOptions(CGSizeMake(1, 1), NO, 1.0);
+        [iv drawViewHierarchyInRect:iv.bounds afterScreenUpdates:NO];
+        UIImage *snapshot = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        return snapshot;
+
+    } @catch (NSException *e) {
+        RDLog(@"MKGetIconImage exception: %@", e.reason);
+    }
+    return nil;
+}
+
+// 获取指定 bundleID 的图标平均色（带缓存）
+static UIColor *MKCachedIconColorForBundleID(NSString *bid) {
+    if (!sIconColorCache) sIconColorCache = [NSMutableDictionary dictionary];
+    UIColor *cached = sIconColorCache[bid];
+    if (cached) return cached;
+
+    // 需要找到对应的 SBIconView 才能获取图标
+    // 从当前视图层级搜索
+    UIColor *result = nil;
+    NSArray *windows = [UIApplication sharedApplication].windows;
+    for (UIWindow *window in windows) {
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
+        while (stack.count > 0) {
+            UIView *current = [stack lastObject];
+            [stack removeLastObject];
+            if ([current isKindOfClass:NSClassFromString(@"SBIconView")]) {
+                SBIconView *iv = (SBIconView *)current;
+                NSString *ivBid = MKGetCachedBid(iv);
+                if (ivBid && [ivBid isEqualToString:bid]) {
+                    UIImage *img = MKGetIconImage(iv);
+                    result = MKAverageColorFromImage(img);
+                    if (result) break;  // 找到就停
+                }
+            }
+            for (UIView *child in current.subviews) {
+                [stack addObject:child];
+            }
+        }
+        if (result) break;
+    }
+
+    if (result) {
+        sIconColorCache[bid] = result;
+        RDLog(@"IconColor: %@ → %@", bid, result);
+    } else {
+        // 无图标 → 用配置的固定色作为 fallback
+        sIconColorCache[bid] = [[MKConfig sharedConfig] color];
+    }
+    return sIconColorCache[bid];
 }
 
 // ─── 文件日志 ────────────────────────────────────────────────
@@ -761,7 +926,7 @@ static void MKUpdate(SBIconView *self) {
             return;
         }
 
-        // v1.5.6: pending 期间只隐藏标签，不创建指示器（等400ms回调）
+        // v1.5.6: pending 期间只隐藏标签，不创建指示器（等300ms回调）
         if (isPending) {
             if (label) {
                 label.hidden = YES;
@@ -769,7 +934,7 @@ static void MKUpdate(SBIconView *self) {
                 label.layer.opacity = 0.0f;
                 label.opaque = NO;
             }
-            return;  // 不创建指示器，等400ms后 MKRefreshIconForBundleID 回调
+            return;  // 不创建指示器，等300ms后 MKRefreshIconForBundleID 回调
         }
 
         RDLogRunning(bundleID);
@@ -847,8 +1012,30 @@ static void MKUpdate(SBIconView *self) {
             indicator = [[MKIndicatorDotView alloc] initWithFrame:indicatorFrame];
             indicator.tag = kDotTag;
             [(MKIndicatorDotView *)indicator applyConfig];
-            [hostView addSubview:indicator];
-            MKSetIndicator(self, indicator);
+
+            // v1.5.7: AutoIcon 模式 — 从图标取平均色作为指示器颜色
+            if (cfg.colorMode == MKColorModeAutoIcon) {
+                UIColor *iconColor = MKCachedIconColorForBundleID(bundleID);
+                [(MKIndicatorDotView *)indicator setIndicatorColor:iconColor];
+                [indicator setNeedsDisplay];  // 用新颜色重绘
+            }
+
+            // v1.5.7: 渐显动画 — 状态切换时指示器 alpha 0→cfg.opacity 200ms
+            BOOL shouldAnimate = MKShouldAnimateIndicator(bundleID);
+            MKRemoveAnimateIndicator(bundleID);  // 消费标记（一次性）
+
+            if (shouldAnimate) {
+                indicator.alpha = 0.0f;  // 从不可见开始
+                [hostView addSubview:indicator];
+                MKSetIndicator(self, indicator);
+                CGFloat finalAlpha = cfg.opacity;
+                [UIView animateWithDuration:0.2 animations:^{
+                    indicator.alpha = finalAlpha;
+                }];
+            } else {
+                [hostView addSubview:indicator];
+                MKSetIndicator(self, indicator);
+            }
         } else {
             indicator.frame = indicatorFrame;
             [(MKIndicatorDotView *)indicator applyConfig];
@@ -915,8 +1102,8 @@ static void MKRefreshIconForBundleID(NSString *bid) {
 }
 
 // ====================================================================
-// v1.5.6: 立即隐藏/恢复指定 bundleID 的标签（不创建/删除指示器）
-// 用于前台→后台过渡期：标签立即消失，指示器延迟400ms后创建
+// v1.5.6+: 立即隐藏/恢复指定 bundleID 的标签（不创建/删除指示器）
+// 用于前台→后台过渡期：标签立即消失，指示器延迟300ms后渐显创建
 // ====================================================================
 
 static void MKHideLabelForBundleID(NSString *bid) {
@@ -980,10 +1167,10 @@ static void MKRestoreLabelForBundleID(NSString *bid) {
 }
 
 // ====================================================================
-// 动画感知的状态变更处理（v1.5.6）
+// 动画感知的状态变更处理（v1.5.7）
 // - App 进入前台：立即移除指示器（0ms 延迟，避免动画残留）
-// - App 返回后台：延迟 400ms 再显示指示器（等返回动画结束，避免闪烁）
-// - App 退出：立即移除指示器
+// - App 返回后台：立即隐藏标签 + 延迟 300ms 渐显指示器（200ms fade-in）
+// - App 退出：立即移除指示器 + 恢复标签
 // ====================================================================
 
 static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
@@ -1000,25 +1187,27 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
             MKRefreshIconForBundleID(bid);
         });
     } else if (running) {
-        // ── App 返回后台 → v1.5.6: 立即隐藏标签，延迟400ms创建指示器 ──
-        // 之前：400ms 内标签仍可见 → 用户看到"名称→横条"闪烁
-        // 现在：标签立即消失，400ms 后指示器才出现 → 过渡更自然
-        MKAddPending(bid);  // 标记为"等待指示器"
+        // ── App 返回后台 → v1.5.7: 立即隐藏标签 + 渐显指示器 ──
+        // 标签立即消失（消除名称可见期）
+        // 300ms 后创建指示器并渐显（等返回动画结束 + 200ms fade-in）
+        MKAddPending(bid);        // 标记为"等待指示器"
+        MKAddAnimateIndicator(bid); // v1.5.7: 标记渐显动画（一次性消费）
 
         // 立即隐藏标签（消除名称可见期）
         dispatch_async(dispatch_get_main_queue(), ^{
             MKHideLabelForBundleID(bid);
         });
 
-        // 延迟400ms创建指示器（等返回动画结束，避免动画残留）
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC),
+        // 延迟300ms创建指示器（等返回动画结束，避免动画残留）
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
             MKRemovePending(bid);  // 清除 pending 状态
             if (!MKIsForeground(bid) && MKIsAppRunning(bid)) {
-                MKRefreshIconForBundleID(bid);  // 创建指示器
+                MKRefreshIconForBundleID(bid);  // 创建指示器（带渐显动画）
             } else {
-                // 400ms内App又变前台或退出了 → 恢复标签
+                // 300ms内App又变前台或退出了 → 恢复标签
                 MKRestoreLabelForBundleID(bid);
+                MKRemoveAnimateIndicator(bid);  // 清除渐显标记
             }
         });
     } else {
@@ -1136,7 +1325,7 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
                 label.layer.opacity = 0.0f;
                 label.opaque = NO;
             }
-            return;  // 等待400ms后才创建指示器
+            return;  // 等待300ms后才创建指示器
         }
 
         // 运行中的后台 App → 需要 MKUpdate 创建指示器
@@ -1330,8 +1519,8 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.5.6 ctor: fix name→indicator flash — immediate label hide + delayed indicator");
-    RDLog(@"======== v1.5.6 loading (fix: name→indicator flash on swipe-back — immediate label hide + sPendingBIDs) ========");
+    NSLog(@"[RunningDotIndicator] v1.5.7 ctor: smooth indicator fade-in + icon average color mode");
+    RDLog(@"======== v1.5.7 loading (smooth fade-in + icon average color AutoIcon mode) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
