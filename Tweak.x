@@ -1548,7 +1548,7 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
     // SBFolderController is UIViewController subclass
     // Use performSelector to avoid forward-class receiver warning
     #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-    UIView *fv = [self performSelector:@selector(view)];
+    UIView *fv = [(id)self performSelector:@selector(view)];
     if (fv.window && sInitDone) {
         RDLog(@"FOLDER OPEN: SBFolderController.viewDidAppear");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
