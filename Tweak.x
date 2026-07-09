@@ -84,7 +84,6 @@ static char kMKIndicatorKey;
 static char kMKLabelKey;     // 缓存的名字标签视图
 static char kMKBidKey;       // 缓存的 bundleID
 static char kMKIconKey;      // 缓存的 icon 指针（检测视图回收复用）
-static char kMKLastLayoutKey; // 上次 layoutSubviews 时间戳（限流）
 
 static UIView *MKGetIndicator(SBIconView *iv) {
     return objc_getAssociatedObject(iv, &kMKIndicatorKey);
@@ -802,45 +801,6 @@ static void MKUpdate(SBIconView *self) {
 // ====================================================================
 // 清理所有指示器（处理动画容器残留）
 // ====================================================================
-
-static void MKClearAllIndicators() {
-    MKSafe(^ {
-        if (!sInitDone) return;
-        // 1) 从所有窗口移除我们的 MKIndicatorDotView 实例
-        NSArray *windows = [UIApplication sharedApplication].windows;
-        for (UIWindow *window in windows) {
-            NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
-            while (stack.count > 0) {
-                UIView *current = [stack lastObject];
-                [stack removeLastObject];
-                if ([current isKindOfClass:[MKIndicatorDotView class]]) {
-                    [current removeFromSuperview];
-                }
-                for (UIView *child in current.subviews) {
-                    [stack addObject:child];
-                }
-            }
-        }
-        // 2) 遍历所有 SBIconView 清空关联对象并恢复标签可见
-        for (UIWindow *window in windows) {
-            NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
-            while (stack.count > 0) {
-                UIView *current = [stack lastObject];
-                [stack removeLastObject];
-                if ([current isKindOfClass:NSClassFromString(@"SBIconView")]) {
-                    SBIconView *iv = (SBIconView *)current;
-                    UIView *indicator = MKGetIndicator(iv);
-                    if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(iv, nil); }
-                    UIView *label = MKFindLabelView(iv);
-                    if (label) { label.hidden = NO; label.alpha = 1.0f; }
-                }
-                for (UIView *child in current.subviews) {
-                    [stack addObject:child];
-                }
-            }
-        }
-    });
-}
 
 // ====================================================================
 // 刷新所有图标
