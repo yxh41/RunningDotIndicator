@@ -1,5 +1,10 @@
 //
-//  Tweak.x — RunningDotIndicator v1.5.4
+//  Tweak.x — RunningDotIndicator v1.5.5
+//  v1.5.5: 修复标签文字与指示器重叠
+//    ✅ layoutSubviews 有指示器时重新强制隐藏标签（防止系统 layout 恢复）
+//    ✅ 隐藏标签时同时设置 alpha + layer.opacity + opaque 三重保险
+//    ✅ icon 变化时同步移除旧指示器
+//    ✅ 增加标签缺失诊断日志
 //  v1.5.4: 修复文件夹图标偶尔出现指示器
 //    ✅ SBIconView 回收复用检测：存储 icon 指针，icon 变化时清缓存
 //    ✅ 过滤文件夹图标：SBFolderIcon 直接跳过
@@ -101,12 +106,14 @@ static NSString *MKGetCachedBid(SBIconView *iv) {
     id icon = [iv icon];
     if (!icon) return nil;
 
-    // 检测图标是否变了（SBIconView 回收复用：同一个 view 可能从 App A 变成文件夹）
+// 检测图标是否变了（SBIconView 回收复用：同一个 view 可能从 App A 变成文件夹）
     id cachedIcon = objc_getAssociatedObject(iv, &kMKIconKey);
     if (cachedIcon && cachedIcon != icon) {
-        // icon 变了 → 清除所有缓存
+        // icon 变了 → 清除所有缓存 + 移除旧指示器
         objc_setAssociatedObject(iv, &kMKBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(iv, &kMKLabelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        UIView *oldIndicator = MKGetIndicator(iv);
+        if (oldIndicator) { [oldIndicator removeFromSuperview]; MKSetIndicator(iv, nil); }
     }
     objc_setAssociatedObject(iv, &kMKIconKey, icon, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
@@ -689,7 +696,12 @@ static void MKUpdate(SBIconView *self) {
             UIView *indicator = MKGetIndicator(self);
             if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
             UIView *label = MKGetCachedLabel(self);
-            if (label) { label.hidden = NO; label.alpha = 1.0f; }
+            if (label) {
+                label.hidden = NO;
+                label.alpha = 1.0f;
+                label.layer.opacity = 1.0f;
+                label.opaque = YES;
+            }
             return;
         }
 
@@ -698,7 +710,12 @@ static void MKUpdate(SBIconView *self) {
             UIView *indicator = MKGetIndicator(self);
             if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
             UIView *label = MKGetCachedLabel(self);
-            if (label) { label.hidden = NO; label.alpha = 1.0f; }
+            if (label) {
+                label.hidden = NO;
+                label.alpha = 1.0f;
+                label.layer.opacity = 1.0f;
+                label.opaque = YES;
+            }
             return;
         }
 
@@ -717,14 +734,27 @@ static void MKUpdate(SBIconView *self) {
         if (!running || isForeground) {
             // ── App 不在运行 / 在前台 → 移除指示器，恢复名字 ──
             if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
-            if (label) { label.hidden = NO; label.alpha = 1.0f; }
+            if (label) {
+                label.hidden = NO;
+                label.alpha = 1.0f;
+                label.layer.opacity = 1.0f;
+                label.opaque = YES;
+            }
             return;
         }
 
         RDLogRunning(bundleID);
 
         // ── App 正在运行 → 隐藏名字，显示指示器 ──
-        if (label) { label.hidden = YES; label.alpha = 0.0f; }
+        if (label) {
+            label.hidden = YES;
+            label.alpha = 0.0f;
+            label.layer.opacity = 0.0f;
+            label.opaque = NO;
+        } else {
+            // v1.5.5 诊断：App 在运行但找不到标签
+            RDLog(@"NO LABEL for running app: %@", bundleID);
+        }
 
         // 指示器尺寸
         CGFloat indicatorW, indicatorH;
@@ -961,7 +991,12 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
         UIView *indicator = MKGetIndicator(self);
         if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
         UIView *label = MKGetCachedLabel(self);
-        if (label) { label.hidden = NO; label.alpha = 1.0f; }
+        if (label) {
+            label.hidden = NO;
+            label.alpha = 1.0f;
+            label.layer.opacity = 1.0f;
+            label.opaque = YES;
+        }
         MKClearCaches(self);
         return;
     }
@@ -995,7 +1030,8 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
         return;
     }
 
-    // 仍然需要指示器 → 只需要重新定位（不用跑完整 MKUpdate + MKFindLabelView）
+    // 仍然需要指示器 → 只需要重新定位 + 重新隐藏标签
+    // v1.5.5: 系统 layout 会恢复标签可见性，每次都要强制隐藏
     MKConfig *cfg = [MKConfig sharedConfig];
     if (!cfg || !cfg.enabled) return;
 
@@ -1010,6 +1046,11 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 
     UIView *label = MKGetCachedLabel(self);
     if (label && label.superview) {
+        // 重新强制隐藏标签（防止系统 layout 恢复）
+        label.hidden = YES;
+        label.alpha = 0.0f;
+        label.layer.opacity = 0.0f;
+        label.opaque = NO;
         // 标签找到 → 指示器在标签中心
         CGRect lf = label.frame;
         indicator.frame = CGRectMake(
@@ -1167,8 +1208,8 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.5.4 ctor: fix folder icon indicator via icon recycling detection");
-    RDLog(@"======== v1.5.4 loading (fix: folder icon indicator — icon recycling detection + SBFolderIcon filter) ========");
+    NSLog(@"[RunningDotIndicator] v1.5.5 ctor: fix label overlap — re-hide on layout + layer.opacity");
+    RDLog(@"======== v1.5.5 loading (fix: label text overlapping indicator — re-hide on layout + layer.opacity) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
