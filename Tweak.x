@@ -1525,15 +1525,16 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 
 - (void)didMoveToWindow {
     %orig;
-    if (self.window && sInitDone) {
+    UIView *me = (UIView *)self;
+    if (me.window && sInitDone) {
         RDLog(@"FOLDER OPEN: SBFolderView appeared in window");
         // 文件夹打开 → 延迟 300ms 后刷新内部所有图标
         // 延迟是为了等文件夹视图布局完成
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
-            MKRefreshSubviews(self);
+            MKRefreshSubviews(me);
         });
-    } else if (!self.window) {
+    } else if (!me.window) {
         RDLog(@"FOLDER CLOSE: SBFolderView removed from window");
     }
 }
@@ -1542,13 +1543,17 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 
 %hook SBFolderController
 
-- (void)didMoveToWindow {
+- (void)viewDidAppear:(BOOL)animated {
     %orig;
-    if (self.window && sInitDone) {
-        RDLog(@"FOLDER OPEN: SBFolderController appeared in window");
+    // SBFolderController is UIViewController subclass
+    // Use performSelector to avoid forward-class receiver warning
+    #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    UIView *fv = [self performSelector:@selector(view)];
+    if (fv.window && sInitDone) {
+        RDLog(@"FOLDER OPEN: SBFolderController.viewDidAppear");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
-            MKRefreshSubviews(self);
+            MKRefreshSubviews(fv);
         });
     }
 }
@@ -1564,11 +1569,12 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 
 - (void)didMoveToWindow {
     %orig;
-    if (self.window && sInitDone) {
-        RDLog(@"ICONLIST PAGE appeared: %@", NSStringFromClass([self class]));
+    UIView *me = (UIView *)self;
+    if (me.window && sInitDone) {
+        RDLog(@"ICONLIST PAGE appeared: %@", NSStringFromClass(object_getClass(self)));
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
-            MKRefreshSubviews(self);
+            MKRefreshSubviews(me);
         });
     }
 }
@@ -1586,9 +1592,10 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
     %orig;
     if (sInitDone) {
         RDLog(@"PAGE SCROLL: decelerating ended");
+        UIView *me = (UIView *)self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
-            MKRefreshSubviews(self);
+            MKRefreshSubviews(me);
         });
     }
 }
@@ -1597,9 +1604,10 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
     %orig;
     if (sInitDone) {
         RDLog(@"PAGE SCROLL: animation ended");
+        UIView *me = (UIView *)self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
-            MKRefreshSubviews(self);
+            MKRefreshSubviews(me);
         });
     }
 }
