@@ -1,5 +1,11 @@
 //
-//  Tweak.x — RunningDotIndicator v1.5.9
+//  Tweak.x — RunningDotIndicator v1.6.0
+//  v1.6.0: 文件夹内App指示器 + 上滑回桌面指示器可靠性
+//    ✅ 修复文件夹内App完全无指示器 — Hook SBFolderView/SBFolderController 打开事件
+//    ✅ 文件夹图标过滤改为精确匹配 SBFolderIcon（避免误杀文件夹内App）
+//    ✅ 上滑回桌面指示器延迟 — 增加 800ms 备用刷新（动画期间主线程堆积）
+//    ✅ didMoveToWindow 添加诊断日志（追踪 App 图标出现时机）
+//    ✅ MKRefreshSubviews 辅助函数（遍历容器内所有 SBIconView）
 //  v1.5.9: 修复横条渐显被打断 + NO LABEL 位置优化
 //    ✅ layoutSubviews 不再调用 applyConfig（之前会打断 200ms 渐显动画）
 //    ✅ MKUpdate 已有指示器时也不调用 applyConfig（防止打断渐显）
@@ -119,9 +125,16 @@ static NSString *MKGetCachedBid(SBIconView *iv) {
     }
     objc_setAssociatedObject(iv, &kMKIconKey, icon, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    // 过滤文件夹图标：SBFolderIcon 不是 App 图标，不显示指示器
+    // v1.6.0: 过滤文件夹图标 — 精确匹配，不误杀文件夹内App
+    // 旧版 containsString:@"Folder" 可能误杀类名含 Folder 的App图标
+    // 只过滤 SBFolderIcon（文件夹本身的复合图标），不过滤文件夹内的App图标
     NSString *iconCls = NSStringFromClass([icon class]);
-    if ([iconCls containsString:@"Folder"]) return nil;
+    Class folderIconClass = NSClassFromString(@"SBFolderIcon");
+    if ((folderIconClass && [icon isKindOfClass:folderIconClass]) ||
+        [iconCls isEqualToString:@"SBFolderIcon"] ||
+        [iconCls isEqualToString:@"SBIconFolderIcon"]) {
+        return nil;
+    }
 
     NSString *bid = objc_getAssociatedObject(iv, &kMKBidKey);
     if (bid) return bid;
@@ -1082,6 +1095,30 @@ static void MKUpdate(SBIconView *self) {
 // ====================================================================
 
 // ====================================================================
+// v1.6.0: 刷新容器视图内所有 SBIconView（用于文件夹打开等场景）
+// ====================================================================
+
+static void MKRefreshSubviews(UIView *containerView) {
+    MKSafe(^{
+        if (!sInitDone || !containerView) return;
+        NSMutableArray *stack = [NSMutableArray arrayWithArray:containerView.subviews];
+        int refreshed = 0;
+        while (stack.count > 0) {
+            UIView *v = [stack lastObject];
+            [stack removeLastObject];
+            if ([v isKindOfClass:NSClassFromString(@"SBIconView")]) {
+                MKUpdate((SBIconView *)v);
+                refreshed++;
+            }
+            [stack addObjectsFromArray:v.subviews];
+        }
+        if (refreshed > 0) {
+            RDLog(@"FOLDER REFRESH: refreshed %d icons inside container", refreshed);
+        }
+    });
+}
+
+// ====================================================================
 // 刷新所有图标
 // ====================================================================
 
@@ -1262,6 +1299,16 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
                 MKRemoveAnimateIndicator(bid);  // 清除渐显标记
             }
         });
+
+        // v1.6.0: 备用刷新 — 800ms后再试一次
+        // 300ms dispatch_after 在动画期间可能被堆积，主线程忙碌导致延迟
+        // 800ms 后动画一定已结束，此时再刷新确保指示器可靠创建
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (MKIsAppRunning(bid) && !MKIsForeground(bid)) {
+                MKRefreshIconForBundleID(bid);
+            }
+        });
     } else {
         // ── App 退出 → 立即移除指示器 + 恢复标签 ──
         MKRemovePending(bid);     // 清除 pending 状态
@@ -1352,6 +1399,15 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
         return;
     }
     if (sInitDone) {
+        // v1.6.0: 诊断日志 — 追踪 App 图标出现时机（特别是文件夹内图标）
+        NSString *bid = MKGetCachedBid(self);
+        if (bid && MKIsAppRunning(bid)) {
+            RDLog(@"IconView.APPEAR: %@ running=YES fg=%d hasIndicator=%@ iconCls=%@ superviewCls=%@",
+                  bid, MKIsForeground(bid),
+                  MKGetIndicator(self) ? @"YES" : @"NO",
+                  NSStringFromClass([[self icon] class] ?: [NSObject class]),
+                  NSStringFromClass([self.superview class] ?: [NSObject class]));
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
             MKUpdate(self);
         });
@@ -1453,6 +1509,98 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
             estimatedLabelY + (estimatedLabelH - indH) / 2.0f,
             indW, indH
         );
+    }
+}
+
+%end
+
+// ====================================================================
+// v1.6.0: Hook — SBFolderView / SBFolderController
+// 文件夹打开时，内部 SBIconView 需要刷新以显示运行指示器
+// iOS 16 文件夹内的 App 图标可能在文件夹打开时才出现在视图层级
+// 如果 SBFolderView/SBFolderController 类不存在，hook 自动跳过
+// ====================================================================
+
+%hook SBFolderView
+
+- (void)didMoveToWindow {
+    %orig;
+    if (self.window && sInitDone) {
+        RDLog(@"FOLDER OPEN: SBFolderView appeared in window");
+        // 文件夹打开 → 延迟 300ms 后刷新内部所有图标
+        // 延迟是为了等文件夹视图布局完成
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            MKRefreshSubviews(self);
+        });
+    } else if (!self.window) {
+        RDLog(@"FOLDER CLOSE: SBFolderView removed from window");
+    }
+}
+
+%end
+
+%hook SBFolderController
+
+- (void)didMoveToWindow {
+    %orig;
+    if (self.window && sInitDone) {
+        RDLog(@"FOLDER OPEN: SBFolderController appeared in window");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            MKRefreshSubviews(self);
+        });
+    }
+}
+
+%end
+
+// ====================================================================
+// v1.6.0: Hook — SBIconListPageView (文件夹内的图标列表容器)
+// 当文件夹内的图标列表出现时，刷新其中的 SBIconView
+// ====================================================================
+
+%hook SBIconListPageView
+
+- (void)didMoveToWindow {
+    %orig;
+    if (self.window && sInitDone) {
+        RDLog(@"ICONLIST PAGE appeared: %@", NSStringFromClass([self class]));
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            MKRefreshSubviews(self);
+        });
+    }
+}
+
+%end
+
+// ====================================================================
+// v1.6.0: Hook — SBIconScrollView (桌面页面滚动)
+// 当用户滚动到不同页面时，刷新新页面上的图标指示器
+// ====================================================================
+
+%hook SBIconScrollView
+
+- (void)scrollViewDidEndDecelerating:(id)scrollView {
+    %orig;
+    if (sInitDone) {
+        RDLog(@"PAGE SCROLL: decelerating ended");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            MKRefreshSubviews(self);
+        });
+    }
+}
+
+- (void)scrollViewDidEndScrollingAnimation:(id)scrollView {
+    %orig;
+    if (sInitDone) {
+        RDLog(@"PAGE SCROLL: animation ended");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            MKRefreshSubviews(self);
+        });
     }
 }
 
@@ -1595,8 +1743,8 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.5.9 ctor: fix bar fade-in interrupted by layoutSubviews + NO LABEL estimated position");
-    RDLog(@"======== v1.5.9 loading (fix: applyConfig interrupts fade-in → remove from layoutSubviews; NO LABEL → estimated label position) ========");
+    NSLog(@"[RunningDotIndicator] v1.6.0 ctor: folder app indicators + swipe-back fallback refresh");
+    RDLog(@"======== v1.6.0 loading (fix: folder app indicators via SBFolderView/SBFolderController hooks; precise FolderIcon filter; 800ms fallback refresh) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
