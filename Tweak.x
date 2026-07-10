@@ -1,5 +1,10 @@
 //
-//  Tweak.x — RunningDotIndicator v1.6.0
+//  Tweak.x — RunningDotIndicator v1.6.1
+//  v1.6.1: 修复文件夹/Dock指示器不显示 + 设置页添加图标平均色
+//    ✅ 修复文件夹内App指示器不显示 — sFadingLabelBIDs 卡住（渐隐动画没启动→MKRemoveFadingLabel从没调用）
+//    ✅ 修复Dock App指示器不显示 — 同根因（Dock无label→渐隐跳过→isFading永远=YES）
+//    ✅ MKFadeOutLabelForBundleID: 渐隐没启动时250ms后自动清除fading状态
+//    ✅ 300ms/800ms回调也清除fading+pending状态（双重保险）
 //  v1.6.0: 文件夹内App指示器 + 上滑回桌面指示器可靠性
 //    ✅ 修复文件夹内App完全无指示器 — Hook SBFolderView/SBFolderController 打开事件
 //    ✅ 文件夹图标过滤改为精确匹配 SBFolderIcon（避免误杀文件夹内App）
@@ -1181,6 +1186,7 @@ static void MKFadeOutLabelForBundleID(NSString *bid) {
         if (!sInitDone || !bid.length) return;
         MKAddFadingLabel(bid);  // v1.5.8: 标记渐隐状态
 
+        BOOL fadeStarted = NO;  // v1.6.0: 追踪是否实际启动了渐隐动画
         NSArray *windows = [UIApplication sharedApplication].windows;
         for (UIWindow *window in windows) {
             NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
@@ -1194,6 +1200,7 @@ static void MKFadeOutLabelForBundleID(NSString *bid) {
                         UIView *label = MKGetCachedLabel(iv);
                         if (label) {
                             // v1.5.8: 250ms 渐隐动画（alpha 1→0）
+                            fadeStarted = YES;
                             [UIView animateWithDuration:0.25
                                                   delay:0
                                                 options:UIViewAnimationOptionAllowAnimatedContent
@@ -1213,6 +1220,16 @@ static void MKFadeOutLabelForBundleID(NSString *bid) {
                     [stack addObject:child];
                 }
             }
+        }
+
+        // v1.6.0: 如果渐隐动画没有启动（找不到图标或label=nil），
+        // 250ms后自动清除fading状态，防止isFading永远卡住
+        // 这处理了文件夹内图标（关闭时不在视图层级）和Dock图标（无label）的情况
+        if (!fadeStarted) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                MKRemoveFadingLabel(bid);
+            });
         }
     });
 }
@@ -1290,7 +1307,8 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
         // 延迟300ms创建指示器（等返回动画结束 + 标签渐隐接近完成）
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
-            MKRemovePending(bid);  // 清除 pending 状态
+            MKRemovePending(bid);      // 清除 pending 状态
+            MKRemoveFadingLabel(bid);  // v1.6.0: 清除渐隐状态（防文件夹/Dock无label导致isFading卡住）
             if (!MKIsForeground(bid) && MKIsAppRunning(bid)) {
                 MKRefreshIconForBundleID(bid);  // 创建指示器（带渐显动画）
             } else {
@@ -1303,8 +1321,11 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
         // v1.6.0: 备用刷新 — 800ms后再试一次
         // 300ms dispatch_after 在动画期间可能被堆积，主线程忙碌导致延迟
         // 800ms 后动画一定已结束，此时再刷新确保指示器可靠创建
+        // 同时清除残留的 pending/fading 状态（文件夹/Dock图标可能找不到label导致状态卡住）
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
+            MKRemoveFadingLabel(bid);  // v1.6.0: 确保清除（防止文件夹/Dock标签找不到导致isFading卡住）
+            MKRemovePending(bid);      // v1.6.0: 确保清除
             if (MKIsAppRunning(bid) && !MKIsForeground(bid)) {
                 MKRefreshIconForBundleID(bid);
             }
@@ -1751,8 +1772,8 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.6.0 ctor: folder app indicators + swipe-back fallback refresh");
-    RDLog(@"======== v1.6.0 loading (fix: folder app indicators via SBFolderView/SBFolderController hooks; precise FolderIcon filter; 800ms fallback refresh) ========");
+    NSLog(@"[RunningDotIndicator] v1.6.1 ctor: fix folder/Dock indicators (sFadingLabel stuck) + settings AutoIcon");
+    RDLog(@"======== v1.6.1 loading (fix: sFadingLabelBIDs stuck for folder/Dock icons → auto-clear at 250ms/300ms/800ms; settings page colorMode) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");

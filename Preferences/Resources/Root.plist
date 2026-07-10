@@ -10,7 +10,7 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>RunningDotIndicator 1.4.8</string>
+			<string>RunningDotIndicator 1.6.1</string>
 			<key>footerText</key>
 			<string>为运行中的 App 图标添加指示器。App 运行时自动替换图标下方的名称文字，退出后恢复原名称。灵感来自 Lynx2 Dock 指示器。</string>
 		</dict>
@@ -157,6 +157,43 @@
 			<true/>
 			<key>PostNotification</key>
 			<string>com.mk.runningdotindicator.reload</string>
+		</dict>
+
+		<!-- ===== 颜色模式 ===== -->
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>颜色模式</string>
+			<key>footerText</key>
+			<string>固定颜色：使用下方选择的预设/自定义颜色。图标平均色：自动从 App 图标提取平均色作为指示器颜色，类似 Lynx2。</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSLinkListCell</string>
+			<key>detail</key>
+			<string>PSListItemsController</string>
+			<key>label</key>
+			<string>颜色模式</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>colorMode</string>
+			<key>default</key>
+			<integer>0</integer>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+			<key>validTitles</key>
+			<array>
+				<string>固定颜色</string>
+				<string>图标平均色</string>
+			</array>
+			<key>validValues</key>
+			<array>
+				<integer>0</integer>
+				<integer>1</integer>
+			</array>
 		</dict>
 
 		<!-- ===== 颜色 ===== -->
