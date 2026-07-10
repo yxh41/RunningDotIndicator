@@ -327,8 +327,8 @@ static UIColor *MKDominantColorFromImage(UIImage *image) {
         if (a < 0.1f) continue;
 
         CGFloat hue, sat, brightness;
-        [UIColor colorWithRed:r green:g blue:b alpha:1.0f
-            getHue:&hue saturation:&sat brightness:&brightness alpha:nil];
+        UIColor *pxColor = [UIColor colorWithRed:r green:g blue:b alpha:1.0f];
+        [pxColor getHue:&hue saturation:&sat brightness:&brightness alpha:nil];
 
         // 跳过接近黑色/白色/灰色的像素（饱和度太低 → 不算有色彩）
         if (sat < 0.15f) continue;
