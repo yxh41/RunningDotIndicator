@@ -325,43 +325,63 @@ static UIColor *MKAverageColorFromImage(UIImage *image) {
 }
 
 // 尝试从 SBIconView/SBIcon 获取图标 UIImage
+// v1.6.2: 修复 performSelector:withObject: 传递 NSNumber* 给期望 CGFloat 参数的方法导致 ABI 不匹配
 static UIImage *MKGetIconImage(SBIconView *iv) {
     @try {
         id icon = [iv icon];
         if (!icon) return nil;
 
-        // 策略 1: SBIcon 的 iconImageForScreenScale: / applicationIconImageForScreenScale:
-        NSArray *iconImageSelectors = @[
-            @"applicationIconImageForScreenScale:",
-            @"iconImageForScreenScale:",
+        // 策略 1: 无参数的 iconImage accessor（最可靠，无 ABI 风险）
+        NSArray *noArgSelectors = @[
             @"applicationIconImage",
             @"iconImage",
-            @"getImage"
+            @"getImage",
+            @"_iconImage"
         ];
-        CGFloat scale = [UIScreen mainScreen].scale;
-        NSNumber *scaleNum = @(scale);
-
-        for (NSString *selName in iconImageSelectors) {
+        for (NSString *selName in noArgSelectors) {
             SEL sel = NSSelectorFromString(selName);
             if ([icon respondsToSelector:sel]) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                // 含 scale 参数的方法
-                if ([selName hasSuffix:@":"]) {
-                    NSMethodSignature *sig = [icon methodSignatureForSelector:sel];
-                    if (sig.numberOfArguments == 3) {  // self, _cmd, scale
-                        id result = [icon performSelector:sel withObject:scaleNum];
-                        if ([result isKindOfClass:[UIImage class]]) return result;
-                    }
-                } else {
-                    id result = [icon performSelector:sel];
-                    if ([result isKindOfClass:[UIImage class]]) return result;
-                }
+                id result = [icon performSelector:sel];
 #pragma clang diagnostic pop
+                if ([result isKindOfClass:[UIImage class]]) {
+                    RDLog(@"IconImage: %@ → OK (no-arg)", selName);
+                    return result;
+                }
             }
         }
 
-        // 策略 2: SBIconView 的 iconImage accessor
+        // 策略 2: 带 CGFloat 参数的方法 — 用 NSInvocation 正确传递原始类型
+        // 修复: performSelector:withObject:NSNumber* 在 arm64 上 ABI 不匹配
+        // CGFloat 在寄存器中传递，NSNumber* 对象指针解释不同 → 得到错误图标或 nil
+        CGFloat scale = [UIScreen mainScreen].scale;
+        NSArray *scaleSelectors = @[
+            @"applicationIconImageForScreenScale:",
+            @"iconImageForScreenScale:"
+        ];
+        for (NSString *selName in scaleSelectors) {
+            SEL sel = NSSelectorFromString(selName);
+            if ([icon respondsToSelector:sel]) {
+                NSMethodSignature *sig = [icon methodSignatureForSelector:sel];
+                if (sig.numberOfArguments == 3) {
+                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                    [inv setTarget:icon];
+                    [inv setSelector:sel];
+                    // 正确传递 CGFloat（不是 NSNumber*）
+                    [inv setArgument:&scale atIndex:2];
+                    [inv invoke];
+                    UIImage *result = nil;
+                    [inv getReturnValue:&result];
+                    if (result) {
+                        RDLog(@"IconImage: %@ → OK (scale=%.0f)", selName, scale);
+                        return result;
+                    }
+                }
+            }
+        }
+
+        // 策略 3: SBIconView 的 iconImage accessor
         NSArray *viewImageSelectors = @[@"iconImage", @"_iconImage", @"image"];
         for (NSString *selName in viewImageSelectors) {
             SEL sel = NSSelectorFromString(selName);
@@ -370,15 +390,24 @@ static UIImage *MKGetIconImage(SBIconView *iv) {
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
                 id result = [iv performSelector:sel];
 #pragma clang diagnostic pop
-                if ([result isKindOfClass:[UIImage class]]) return result;
+                if ([result isKindOfClass:[UIImage class]]) {
+                    RDLog(@"IconImage: %@ (SBIconView) → OK", selName);
+                    return result;
+                }
             }
         }
 
-        // 策略 3: 快照 SBIconView（兜底）
-        UIGraphicsBeginImageContextWithOptions(CGSizeMake(1, 1), NO, 1.0);
-        [iv drawViewHierarchyInRect:iv.bounds afterScreenUpdates:NO];
+        // 策略 4: 快照 SBIconView（最终兜底）
+        // v1.6.2: 不要用 1x1 快照（动画期间可能捕获空白），改用完整尺寸再缩放
+        CGSize iconSize = iv.bounds.size;
+        if (iconSize.width < 10 || iconSize.height < 10) {
+            iconSize = CGSizeMake(60, 60);  // fallback 尺寸
+        }
+        UIGraphicsBeginImageContextWithOptions(iconSize, NO, 0);  // scale=0 使用屏幕 scale
+        [iv drawViewHierarchyInRect:CGRectMake(0, 0, iconSize.width, iconSize.height) afterScreenUpdates:NO];
         UIImage *snapshot = UIGraphicsGetImageFromCurrentImageContext();
         UIGraphicsEndImageContext();
+        RDLog(@"IconImage: snapshot (%.0fx%.0f) → %@", iconSize.width, iconSize.height, snapshot ? @"OK" : @"FAIL");
         return snapshot;
 
     } @catch (NSException *e) {
