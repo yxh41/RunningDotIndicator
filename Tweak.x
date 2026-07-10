@@ -1,9 +1,10 @@
 //
 //  Tweak.x — RunningDotIndicator v1.6.3
-//  v1.6.3: 修复系统 App 图标主色不对 — 改进图标获取策略
+//  v1.6.3: 修复系统 App 图标主色不对 + 去掉注销按钮
 //    ✅ MKGetIconImage: 先遍历 SBIconView.subviews 找 UIImageView.image
 //    ✅ 兜底改用 layer.renderInContext 替代 drawViewHierarchyInRect
-//    ✅ 主色提取算法改为 16x16 采样 + 色相分桶统计
+//    ✅ 主色提取算法改为 16x16 采样 + 色相分桶 + 中心加权 + 饱和度加权
+//    ✅ 去掉 Root.plist 中的注销按钮（功能无效）
 //  v1.6.2: 去掉 Lynx2 字眼 + 修复图标平均色全灰 bug
 //    ✅ Root.plist: 移除 "灵感来自 Lynx2" 和 "类似 Lynx2" 字眼
 //    ✅ MKGetIconImage: 修复 performSelector:withObject: 传递 NSNumber* 给期望 CGFloat 参数的方法导致 ABI 不匹配
@@ -283,16 +284,19 @@ static void MKRemoveFadingLabel(NSString *bid) {
     if (sFadingLabelBIDs) [sFadingLabelBIDs removeObject:bid];
 }
 
-// ─── 图标主色提取 ─── v1.6.2 ───
+// ─── 图标主色提取 ─── v1.6.3 ───
 // 从 App 图标提取主色（dominant color），用于 AutoIcon 颜色模式
-// 方法：将图标缩小到 16x16 采样所有像素 → 按色相分桶统计 → 取最高频色相的平均颜色
-// 跳过接近黑色/白色/灰色的像素（不算"有色彩"的像素）
+// 改进：
+//   • 中心区域采样加权（图标中心比边缘圆角区域更重要）
+//   • 色相分桶 + 饱和度加权（越鲜艳的像素权重越高）
+//   • 降低饱和度阈值，避免柔和主色被跳过
+//   • fallback 改为取最鲜艳的彩色像素，而不是 1x1 平均色（避免发灰）
 static UIColor *MKDominantColorFromImage(UIImage *image) {
     if (!image) return nil;
     CGImageRef cgImg = image.CGImage;
     if (!cgImg) return nil;
 
-    // 采样分辨率：16x16 = 256 像素，足够统计又不过慢
+    // 采样分辨率：16x16 = 256 像素
     const int SW = 16, SH = 16;
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     unsigned char *pixels = (unsigned char *)malloc(SW * SH * 4);
@@ -313,88 +317,126 @@ static UIColor *MKDominantColorFromImage(UIImage *image) {
     CGContextRelease(ctx);
     CGColorSpaceRelease(colorSpace);
 
-    // 按色相分桶（12 个桶，每个 30°）
-    // 每个桶累计 r/g/b 总和 + 有效像素计数
-    const int HUE_BUCKETS = 12;
-    float hueSum[HUE_BUCKETS] = {0};    // 色相角度累计
-    float satSum[HUE_BUCKETS] = {0};    // 饱和度累计
-    float briSum[HUE_BUCKETS] = {0};    // 亮度累计
-    int    count[HUE_BUCKETS] = {0};     // 有效像素计数
+    const int HUE_BUCKETS = 12;            // 每个桶 30°
+    float hueSum[HUE_BUCKETS] = {0};       // 按饱和度加权的色相累计
+    float satSum[HUE_BUCKETS] = {0};       // 按饱和度加权的饱和度累计
+    float briSum[HUE_BUCKETS] = {0};       // 按饱和度加权的亮度累计
+    float weightedCount[HUE_BUCKETS] = {0}; // 饱和度权重和
 
-    for (int i = 0; i < SW * SH; i++) {
-        CGFloat r = pixels[i * 4]     / 255.0f;
-        CGFloat g = pixels[i * 4 + 1] / 255.0f;
-        CGFloat b = pixels[i * 4 + 2] / 255.0f;
-        CGFloat a = pixels[i * 4 + 3] / 255.0f;
+    // fallback: 记录最鲜艳的像素（saturation 最大）
+    CGFloat bestSat = -1.0f;
+    CGFloat bestHue = 0, bestBri = 0;
+    CGFloat bestR = 0, bestG = 0, bestB = 0;
 
-        // 跳过透明像素
-        if (a < 0.1f) continue;
+    // 每个像素亮度阈值：排除纯黑/纯白/纯灰
+    const CGFloat kMinSat = 0.06f;          // 饱和度阈值（柔和颜色也能被识别）
+    const CGFloat kMinBri = 0.08f;          // 排除过暗像素
+    const CGFloat kMaxBri = 0.96f;          // 排除过亮像素（接近白色）
 
-        CGFloat hue, sat, brightness;
-        UIColor *pxColor = [UIColor colorWithRed:r green:g blue:b alpha:1.0f];
-        [pxColor getHue:&hue saturation:&sat brightness:&brightness alpha:nil];
+    for (int y = 0; y < SH; y++) {
+        for (int x = 0; x < SW; x++) {
+            int i = y * SW + x;
+            CGFloat r = pixels[i * 4]     / 255.0f;
+            CGFloat g = pixels[i * 4 + 1] / 255.0f;
+            CGFloat b = pixels[i * 4 + 2] / 255.0f;
+            CGFloat a = pixels[i * 4 + 3] / 255.0f;
 
-        // 跳过接近黑色/白色/灰色的像素（饱和度太低 → 不算有色彩）
-        if (sat < 0.15f) continue;
-        // 跳过太暗/太亮的像素
-        if (brightness < 0.1f || brightness > 0.95f) continue;
+            // 跳过透明像素
+            if (a < 0.1f) continue;
 
-        int bucket = (int)(hue * HUE_BUCKETS) % HUE_BUCKETS;
-        hueSum[bucket] += hue;
-        satSum[bucket] += sat;
-        briSum[bucket] += brightness;
-        count[bucket]++;
+            // 跳过接近纯黑像素（透明图标常见阴影/边框）
+            if (r < 0.04f && g < 0.04f && b < 0.04f) continue;
+
+            CGFloat hue, sat, brightness;
+            UIColor *pxColor = [UIColor colorWithRed:r green:g blue:b alpha:1.0f];
+            [pxColor getHue:&hue saturation:&sat brightness:&brightness alpha:nil];
+
+            // 中心区域加权：图标中心的像素比边缘更重要
+            // 中心坐标 (7.5, 7.5)，最大距离约 10.6
+            CGFloat dx = x - (SW - 1) / 2.0f;
+            CGFloat dy = y - (SH - 1) / 2.0f;
+            CGFloat dist = sqrtf(dx*dx + dy*dy);
+            CGFloat centerWeight = 1.0f - (dist / 11.0f) * 0.4f;  // 中心 1.0，边缘 0.6
+            if (centerWeight < 0.5f) centerWeight = 0.5f;
+
+            // 记录最鲜艳的彩色像素作为 fallback
+            if (sat > bestSat) {
+                bestSat = sat;
+                bestHue = hue; bestBri = brightness;
+                bestR = r; bestG = g; bestB = b;
+            }
+
+            // 跳过中性色（黑/白/灰）
+            if (sat < kMinSat) continue;
+            if (brightness < kMinBri || brightness > kMaxBri) continue;
+
+            int bucket = (int)(hue * HUE_BUCKETS) % HUE_BUCKETS;
+            CGFloat weight = sat * centerWeight;  // 越鲜艳 + 越靠中心 权重越高
+
+            hueSum[bucket]      += hue * weight;
+            satSum[bucket]      += sat * weight;
+            briSum[bucket]      += brightness * weight;
+            weightedCount[bucket] += weight;
+        }
     }
 
     free(pixels);
 
-    // 找最高频的有色彩桶
+    // 找最高权重的有色彩桶
     int bestBucket = -1;
-    int bestCount = 0;
+    float bestWeight = 0;
     for (int i = 0; i < HUE_BUCKETS; i++) {
-        if (count[i] > bestCount) {
-            bestCount = count[i];
+        if (weightedCount[i] > bestWeight) {
+            bestWeight = weightedCount[i];
             bestBucket = i;
         }
     }
 
-    // 如果没有找到有色彩的像素 → fallback 到平均色方法
-    if (bestBucket < 0 || bestCount < 3) {
-        // 回退：渲染到 1x1 取平均色
-        CGColorSpaceRef cs2 = CGColorSpaceCreateDeviceRGB();
-        unsigned char px[4] = {0};
-        CGContextRef ctx2 = CGBitmapContextCreate(px, 1, 1, 8, 4, cs2,
-                                                   (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
-        if (ctx2) {
-            CGContextDrawImage(ctx2, CGRectMake(0, 0, 1, 1), cgImg);
-            CGFloat rr = px[0] / 255.0f, gg = px[1] / 255.0f, bb = px[2] / 255.0f;
-            CGContextRelease(ctx2);
-            CGColorSpaceRelease(cs2);
-            UIColor *raw = [UIColor colorWithRed:rr green:gg blue:bb alpha:1.0f];
-            CGFloat h, s, br;
-            [raw getHue:&h saturation:&s brightness:&br alpha:nil];
-            s = MIN(s * 1.3f, 1.0f);
-            return [UIColor colorWithHue:h saturation:s brightness:br alpha:1.0f];
-        }
-        CGColorSpaceRelease(cs2);
-        return nil;
-    }
+    CGFloat finalHue, finalSat, finalBri;
 
-    // 取最高频桶的平均色相/饱和度/亮度
-    CGFloat avgHue = hueSum[bestBucket] / count[bestBucket];
-    CGFloat avgSat = satSum[bestBucket] / count[bestBucket];
-    CGFloat avgBri = briSum[bestBucket] / count[bestBucket];
+    // 如果没找到足够有色彩的像素 → fallback 到最鲜艳的像素
+    if (bestBucket < 0 || bestWeight < 0.5f || bestSat < kMinSat) {
+        if (bestSat < 0) {
+            // 整张图都没有颜色信息 → 返回图标平均色（最后一次 fallback）
+            CGColorSpaceRef cs2 = CGColorSpaceCreateDeviceRGB();
+            unsigned char px[4] = {0};
+            CGContextRef ctx2 = CGBitmapContextCreate(px, 1, 1, 8, 4, cs2,
+                                                       (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+            if (ctx2) {
+                CGContextDrawImage(ctx2, CGRectMake(0, 0, 1, 1), cgImg);
+                CGFloat rr = px[0] / 255.0f, gg = px[1] / 255.0f, bb = px[2] / 255.0f;
+                CGContextRelease(ctx2);
+                CGColorSpaceRelease(cs2);
+                UIColor *raw = [UIColor colorWithRed:rr green:gg blue:bb alpha:1.0f];
+                CGFloat h, s, br;
+                [raw getHue:&h saturation:&s brightness:&br alpha:nil];
+                s = MIN(s * 1.3f, 1.0f);
+                return [UIColor colorWithHue:h saturation:s brightness:br alpha:1.0f];
+            }
+            CGColorSpaceRelease(cs2);
+            return nil;
+        }
+        finalHue = bestHue;
+        finalSat = bestSat;
+        finalBri = bestBri;
+        RDLog(@"IconColor: fallback to most-saturated pixel (%.2f,%.2f,%.2f) sat=%.2f",
+              bestR, bestG, bestB, bestSat);
+    } else {
+        finalHue = hueSum[bestBucket] / weightedCount[bestBucket];
+        finalSat = satSum[bestBucket] / weightedCount[bestBucket];
+        finalBri = briSum[bestBucket] / weightedCount[bestBucket];
+    }
 
     // 亮度调整：保证指示器在桌面背景上可见
-    if (avgBri < 0.3f) {
-        avgBri = 0.3f + avgBri * 0.5f;
-    } else if (avgBri > 0.85f) {
-        avgBri = 0.85f - (1.0f - avgBri) * 0.5f;
+    if (finalBri < 0.3f) {
+        finalBri = 0.3f + finalBri * 0.5f;
+    } else if (finalBri > 0.85f) {
+        finalBri = 0.85f - (1.0f - finalBri) * 0.5f;
     }
-    // 略增饱和度
-    avgSat = MIN(avgSat * 1.3f, 1.0f);
+    // 略增饱和度，让指示器更鲜艳
+    finalSat = MIN(finalSat * 1.25f, 1.0f);
 
-    return [UIColor colorWithHue:avgHue saturation:avgSat brightness:avgBri alpha:1.0f];
+    return [UIColor colorWithHue:finalHue saturation:finalSat brightness:finalBri alpha:1.0f];
 }
 
 // 尝试从 SBIconView/SBIcon 获取图标 UIImage
@@ -1502,25 +1544,6 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     MKRefreshAllIcons();
 }
 
-static void MKDoRespring() {
-    RDLog(@"RESPRING: executing");
-    pid_t pid;
-    const char *shArgs[] = {
-        "/bin/sh", "-c",
-        "PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH; "
-        "sbreload 2>/dev/null || killall -9 SpringBoard 2>/dev/null || killall -9 backboardd 2>/dev/null",
-        NULL
-    };
-    int ret = posix_spawn(&pid, "/bin/sh", NULL, NULL, (char *const *)shArgs, NULL);
-    RDLog(@"RESPRING: ret=%d pid=%d", ret, pid);
-}
-
-static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
-                               CFStringRef name, const void *object,
-                               CFDictionaryRef userInfo) {
-    MKSafe(^{ MKDoRespring(); });
-}
-
 // ====================================================================
 // Hook — SBIconView
 // ====================================================================
@@ -1909,12 +1932,6 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
         CFNotificationCenterGetDarwinNotifyCenter(),
         NULL, MKPrefsChangedCallback,
         CFSTR("com.mk.runningdotindicator.reload"),
-        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-
-    CFNotificationCenterAddObserver(
-        CFNotificationCenterGetDarwinNotifyCenter(),
-        NULL, MKRespringCallback,
-        CFSTR("com.mk.runningdotindicator.respring"),
         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
     // ─── 生命周期通知（只保留 exit，iOS 16 上只有 exit 有效）──────────

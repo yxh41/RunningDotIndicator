@@ -16,15 +16,6 @@ static NSString * const kReloadNotification = @"com.mk.runningdotindicator.reloa
 - (NSArray *)specifiers {
     if (!_specifiers) {
         _specifiers = [self loadSpecifiersFromPlistName:@"Root" target:self];
-
-        // 手动绑定注销按钮：PSButtonCell 仅靠 plist 中的 action 有时不触发
-        // 通过 setButtonAction 确保点击后调用 respring 方法
-        for (PSSpecifier *spec in _specifiers) {
-            NSString *action = [spec propertyForKey:@"action"];
-            if ([action isEqualToString:@"respring"]) {
-                [spec setButtonAction:@selector(respring)];
-            }
-        }
     }
     return _specifiers;
 }
@@ -62,24 +53,6 @@ static NSString * const kReloadNotification = @"com.mk.runningdotindicator.reloa
         return result;
     }
     return [specifier propertyForKey:@"default"];
-}
-
-// 注销按钮(无参版): 某些 PreferenceLoader 版本使用此签名
-- (void)respring {
-    [self respring:nil];
-}
-
-// 注销按钮(带参版): 多数 PreferenceLoader 当 action="respring" 时调用此签名
-// 注意：设置 App 处于沙盒内，无法直接 posix_spawn/kill，因此这里只广播通知，
-//       真正的 respring 由运行在 SpringBoard(非沙盒)中的 Tweak 监听并执行。
-- (void)respring:(PSSpecifier *)specifier {
-    NSLog(@"[RD-Prefs] respring requested -> posting Darwin notification");
-    // 确保最新配置已写入
-    CFPreferencesAppSynchronize((__bridge CFStringRef)kPrefsDomain);
-    CFNotificationCenterPostNotification(
-        CFNotificationCenterGetDarwinNotifyCenter(),
-        CFSTR("com.mk.runningdotindicator.respring"),
-        NULL, NULL, TRUE);
 }
 
 @end

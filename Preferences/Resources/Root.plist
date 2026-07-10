@@ -312,25 +312,14 @@
 			<string>com.mk.runningdotindicator.reload</string>
 		</dict>
 
-		<!-- ===== 操作 ===== -->
+		<!-- ===== 说明 ===== -->
 		<dict>
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>操作</string>
+			<string>说明</string>
 			<key>footerText</key>
-			<string>修改后即时生效无需注销。如遇异常可注销重启 SpringBoard。</string>
-		</dict>
-
-		<dict>
-			<key>cell</key>
-			<string>PSButtonCell</string>
-			<key>label</key>
-			<string>注销(重启 SpringBoard)</string>
-			<key>action</key>
-			<string>respring</string>
-			<key>isDestructive</key>
-			<false/>
+			<string>修改后即时生效，无需注销。</string>
 		</dict>
 
 	</array>
