@@ -279,49 +279,118 @@ static void MKRemoveFadingLabel(NSString *bid) {
     if (sFadingLabelBIDs) [sFadingLabelBIDs removeObject:bid];
 }
 
-// ─── 图标平均色采样 ─── v1.5.7 ───
-// 从 App 图标取平均色，用于 AutoIcon 颜色模式
-// 方法：尝试 SBIcon/SBIconView accessor 获取图标 UIImage → 渲染到 1x1 位图 → 取像素值
-// 加亮度/饱和度调整保证指示器在桌面背景上可见
-static UIColor *MKAverageColorFromImage(UIImage *image) {
+// ─── 图标主色提取 ─── v1.6.2 ───
+// 从 App 图标提取主色（dominant color），用于 AutoIcon 颜色模式
+// 方法：将图标缩小到 16x16 采样所有像素 → 按色相分桶统计 → 取最高频色相的平均颜色
+// 跳过接近黑色/白色/灰色的像素（不算"有色彩"的像素）
+static UIColor *MKDominantColorFromImage(UIImage *image) {
     if (!image) return nil;
     CGImageRef cgImg = image.CGImage;
     if (!cgImg) return nil;
 
+    // 采样分辨率：16x16 = 256 像素，足够统计又不过慢
+    const int SW = 16, SH = 16;
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    unsigned char pixels[4] = {0};
-    CGContextRef ctx = CGBitmapContextCreate(pixels, 1, 1, 8, 4, colorSpace,
+    unsigned char *pixels = (unsigned char *)malloc(SW * SH * 4);
+    if (!pixels) {
+        CGColorSpaceRelease(colorSpace);
+        return nil;
+    }
+    CGContextRef ctx = CGBitmapContextCreate(pixels, SW, SH, 8, SW * 4, colorSpace,
                                              (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
     if (!ctx) {
+        free(pixels);
         CGColorSpaceRelease(colorSpace);
         return nil;
     }
 
-    // 渲染图标到 1x1 位图 → 所有像素被平均为单点
-    CGContextDrawImage(ctx, CGRectMake(0, 0, 1, 1), cgImg);
-
-    CGFloat r = pixels[0] / 255.0f;
-    CGFloat g = pixels[1] / 255.0f;
-    CGFloat b = pixels[2] / 255.0f;
-
+    // 渲染图标到 SWxSH 位图
+    CGContextDrawImage(ctx, CGRectMake(0, 0, SW, SH), cgImg);
     CGContextRelease(ctx);
     CGColorSpaceRelease(colorSpace);
 
-    // 转换到 HSB 调整亮度/饱和度保证可见性
-    UIColor *raw = [UIColor colorWithRed:r green:g blue:b alpha:1.0f];
-    CGFloat hue, sat, brightness, alpha;
-    [raw getHue:&hue saturation:&sat brightness:&brightness alpha:&alpha];
+    // 按色相分桶（12 个桶，每个 30°）
+    // 每个桶累计 r/g/b 总和 + 有效像素计数
+    const int HUE_BUCKETS = 12;
+    float hueSum[HUE_BUCKETS] = {0};    // 色相角度累计
+    float satSum[HUE_BUCKETS] = {0};    // 饱和度累计
+    float briSum[HUE_BUCKETS] = {0};    // 亮度累计
+    int    count[HUE_BUCKETS] = {0};     // 有效像素计数
 
-    // 暗色提亮（亮度 < 0.3 → 提到 0.3+），亮色压暗（亮度 > 0.85 → 压到 0.85-）
-    if (brightness < 0.3f) {
-        brightness = 0.3f + brightness * 0.5f;
-    } else if (brightness > 0.85f) {
-        brightness = 0.85f - (1.0f - brightness) * 0.5f;
+    for (int i = 0; i < SW * SH; i++) {
+        CGFloat r = pixels[i * 4]     / 255.0f;
+        CGFloat g = pixels[i * 4 + 1] / 255.0f;
+        CGFloat b = pixels[i * 4 + 2] / 255.0f;
+        CGFloat a = pixels[i * 4 + 3] / 255.0f;
+
+        // 跳过透明像素
+        if (a < 0.1f) continue;
+
+        CGFloat hue, sat, brightness;
+        [UIColor colorWithRed:r green:g blue:b alpha:1.0f
+            getHue:&hue saturation:&sat brightness:&brightness alpha:nil];
+
+        // 跳过接近黑色/白色/灰色的像素（饱和度太低 → 不算有色彩）
+        if (sat < 0.15f) continue;
+        // 跳过太暗/太亮的像素
+        if (brightness < 0.1f || brightness > 0.95f) continue;
+
+        int bucket = (int)(hue * HUE_BUCKETS) % HUE_BUCKETS;
+        hueSum[bucket] += hue;
+        satSum[bucket] += sat;
+        briSum[bucket] += brightness;
+        count[bucket]++;
     }
-    // 略增饱和度让指示器更鲜艳
-    sat = MIN(sat * 1.3f, 1.0f);
 
-    return [UIColor colorWithHue:hue saturation:sat brightness:brightness alpha:1.0f];
+    free(pixels);
+
+    // 找最高频的有色彩桶
+    int bestBucket = -1;
+    int bestCount = 0;
+    for (int i = 0; i < HUE_BUCKETS; i++) {
+        if (count[i] > bestCount) {
+            bestCount = count[i];
+            bestBucket = i;
+        }
+    }
+
+    // 如果没有找到有色彩的像素 → fallback 到平均色方法
+    if (bestBucket < 0 || bestCount < 3) {
+        // 回退：渲染到 1x1 取平均色
+        CGColorSpaceRef cs2 = CGColorSpaceCreateDeviceRGB();
+        unsigned char px[4] = {0};
+        CGContextRef ctx2 = CGBitmapContextCreate(px, 1, 1, 8, 4, cs2,
+                                                   (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+        if (ctx2) {
+            CGContextDrawImage(ctx2, CGRectMake(0, 0, 1, 1), cgImg);
+            CGFloat rr = px[0] / 255.0f, gg = px[1] / 255.0f, bb = px[2] / 255.0f;
+            CGContextRelease(ctx2);
+            CGColorSpaceRelease(cs2);
+            UIColor *raw = [UIColor colorWithRed:rr green:gg blue:bb alpha:1.0f];
+            CGFloat h, s, br;
+            [raw getHue:&h saturation:&s brightness:&br alpha:nil];
+            s = MIN(s * 1.3f, 1.0f);
+            return [UIColor colorWithHue:h saturation:s brightness:br alpha:1.0f];
+        }
+        CGColorSpaceRelease(cs2);
+        return nil;
+    }
+
+    // 取最高频桶的平均色相/饱和度/亮度
+    CGFloat avgHue = hueSum[bestBucket] / count[bestBucket];
+    CGFloat avgSat = satSum[bestBucket] / count[bestBucket];
+    CGFloat avgBri = briSum[bestBucket] / count[bestBucket];
+
+    // 亮度调整：保证指示器在桌面背景上可见
+    if (avgBri < 0.3f) {
+        avgBri = 0.3f + avgBri * 0.5f;
+    } else if (avgBri > 0.85f) {
+        avgBri = 0.85f - (1.0f - avgBri) * 0.5f;
+    }
+    // 略增饱和度
+    avgSat = MIN(avgSat * 1.3f, 1.0f);
+
+    return [UIColor colorWithHue:avgHue saturation:avgSat brightness:avgBri alpha:1.0f];
 }
 
 // 尝试从 SBIconView/SBIcon 获取图标 UIImage
@@ -436,7 +505,7 @@ static UIColor *MKCachedIconColorForBundleID(NSString *bid) {
                 NSString *ivBid = MKGetCachedBid(iv);
                 if (ivBid && [ivBid isEqualToString:bid]) {
                     UIImage *img = MKGetIconImage(iv);
-                    result = MKAverageColorFromImage(img);
+                    result = MKDominantColorFromImage(img);
                     if (result) break;  // 找到就停
                 }
             }
