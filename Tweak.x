@@ -284,20 +284,20 @@ static void MKRemoveFadingLabel(NSString *bid) {
     if (sFadingLabelBIDs) [sFadingLabelBIDs removeObject:bid];
 }
 
-// ─── 图标主色提取 ─── v1.6.3 ───
+// ─── 图标主色提取 ─── v1.6.4 ───
 // 从 App 图标提取主色（dominant color），用于 AutoIcon 颜色模式
-// 改进：
-//   • 中心区域采样加权（图标中心比边缘圆角区域更重要）
-//   • 色相分桶 + 饱和度加权（越鲜艳的像素权重越高）
-//   • 降低饱和度阈值，避免柔和主色被跳过
-//   • fallback 改为取最鲜艳的彩色像素，而不是 1x1 平均色（避免发灰）
+// v1.6.4 改进：
+//   • 固定 128x128 渲染分辨率，避免拉伸变形
+//   • 色相桶从 12→24（每桶 15°），提升颜色区分精度
+//   • 移除跳过纯黑像素逻辑（深色图标主色可能就是黑色）
+//   • 圆形遮罩强化中心区域，边缘权重进一步降低
 static UIColor *MKDominantColorFromImage(UIImage *image) {
     if (!image) return nil;
     CGImageRef cgImg = image.CGImage;
     if (!cgImg) return nil;
 
-    // 采样分辨率：16x16 = 256 像素
-    const int SW = 16, SH = 16;
+    // 固定采样分辨率 24x24 = 576 像素，平衡精度与性能
+    const int SW = 24, SH = 24;
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     unsigned char *pixels = (unsigned char *)malloc(SW * SH * 4);
     if (!pixels) {
@@ -312,26 +312,32 @@ static UIColor *MKDominantColorFromImage(UIImage *image) {
         return nil;
     }
 
-    // 渲染图标到 SWxSH 位图
+    // 渲染图标到固定尺寸位图
     CGContextDrawImage(ctx, CGRectMake(0, 0, SW, SH), cgImg);
     CGContextRelease(ctx);
     CGColorSpaceRelease(colorSpace);
 
-    const int HUE_BUCKETS = 12;            // 每个桶 30°
-    float hueSum[HUE_BUCKETS] = {0};       // 按饱和度加权的色相累计
-    float satSum[HUE_BUCKETS] = {0};       // 按饱和度加权的饱和度累计
-    float briSum[HUE_BUCKETS] = {0};       // 按饱和度加权的亮度累计
-    float weightedCount[HUE_BUCKETS] = {0}; // 饱和度权重和
+    // 色相桶数量翻倍（12→24），每个桶 15°，更好区分蓝/紫/粉等相近颜色
+    const int HUE_BUCKETS = 24;
+    float hueSum[HUE_BUCKETS] = {0};
+    float satSum[HUE_BUCKETS] = {0};
+    float briSum[HUE_BUCKETS] = {0};
+    float weightedCount[HUE_BUCKETS] = {0};
 
-    // fallback: 记录最鲜艳的像素（saturation 最大）
+    // fallback: 记录最鲜艳的像素
     CGFloat bestSat = -1.0f;
     CGFloat bestHue = 0, bestBri = 0;
     CGFloat bestR = 0, bestG = 0, bestB = 0;
 
-    // 每个像素亮度阈值：排除纯黑/纯白/纯灰
-    const CGFloat kMinSat = 0.06f;          // 饱和度阈值（柔和颜色也能被识别）
-    const CGFloat kMinBri = 0.08f;          // 排除过暗像素
-    const CGFloat kMaxBri = 0.96f;          // 排除过亮像素（接近白色）
+    // 阈值参数
+    const CGFloat kMinSat = 0.05f;    // 饱和度阈值（柔和颜色也能被识别）
+    const CGFloat kMinBri = 0.06f;    // 排除过暗像素
+    const CGFloat kMaxBri = 0.96f;    // 排除过亮像素（接近白色）
+    const CGFloat kMinAlpha = 0.3f;   // 透明度阈值（过滤半透明像素）
+
+    // 圆形遮罩半径（归一化半径 r=1 对应边缘，r<0.5 在中心圆内）
+    // SW=24 时，最大距离约 16.97
+    const CGFloat kMaxDist = sqrtf((SW/2.0f)*(SW/2.0f) + (SH/2.0f)*(SH/2.0f)); // ≈ 16.97
 
     for (int y = 0; y < SH; y++) {
         for (int x = 0; x < SW; x++) {
@@ -341,23 +347,21 @@ static UIColor *MKDominantColorFromImage(UIImage *image) {
             CGFloat b = pixels[i * 4 + 2] / 255.0f;
             CGFloat a = pixels[i * 4 + 3] / 255.0f;
 
-            // 跳过透明像素
-            if (a < 0.1f) continue;
-
-            // 跳过接近纯黑像素（透明图标常见阴影/边框）
-            if (r < 0.04f && g < 0.04f && b < 0.04f) continue;
+            // 跳过半透明像素（避免背景渗入）
+            if (a < kMinAlpha) continue;
 
             CGFloat hue, sat, brightness;
             UIColor *pxColor = [UIColor colorWithRed:r green:g blue:b alpha:1.0f];
             [pxColor getHue:&hue saturation:&sat brightness:&brightness alpha:nil];
 
-            // 中心区域加权：图标中心的像素比边缘更重要
-            // 中心坐标 (7.5, 7.5)，最大距离约 10.6
+            // 圆形中心加权：中心区域权重高，边缘（圆角）权重低
             CGFloat dx = x - (SW - 1) / 2.0f;
             CGFloat dy = y - (SH - 1) / 2.0f;
             CGFloat dist = sqrtf(dx*dx + dy*dy);
-            CGFloat centerWeight = 1.0f - (dist / 11.0f) * 0.4f;  // 中心 1.0，边缘 0.6
-            if (centerWeight < 0.5f) centerWeight = 0.5f;
+            CGFloat normDist = dist / kMaxDist;  // 0（中心）到 1（边缘）
+            // 圆形渐变：中心 1.0，r=0.5 时约 0.75，r=1.0 时 0.4
+            CGFloat centerWeight = 1.0f - normDist * 0.6f;
+            if (centerWeight < 0.35f) centerWeight = 0.35f;
 
             // 记录最鲜艳的彩色像素作为 fallback
             if (sat > bestSat) {
@@ -371,7 +375,8 @@ static UIColor *MKDominantColorFromImage(UIImage *image) {
             if (brightness < kMinBri || brightness > kMaxBri) continue;
 
             int bucket = (int)(hue * HUE_BUCKETS) % HUE_BUCKETS;
-            CGFloat weight = sat * centerWeight;  // 越鲜艳 + 越靠中心 权重越高
+            // 综合权重：饱和度 × 中心位置
+            CGFloat weight = sat * centerWeight;
 
             hueSum[bucket]      += hue * weight;
             satSum[bucket]      += sat * weight;
@@ -395,9 +400,9 @@ static UIColor *MKDominantColorFromImage(UIImage *image) {
     CGFloat finalHue, finalSat, finalBri;
 
     // 如果没找到足够有色彩的像素 → fallback 到最鲜艳的像素
-    if (bestBucket < 0 || bestWeight < 0.5f || bestSat < kMinSat) {
+    if (bestBucket < 0 || bestWeight < 0.3f || bestSat < kMinSat) {
         if (bestSat < 0) {
-            // 整张图都没有颜色信息 → 返回图标平均色（最后一次 fallback）
+            // 整张图都没有颜色信息 → 提取 1x1 平均色作为最后 fallback
             CGColorSpaceRef cs2 = CGColorSpaceCreateDeviceRGB();
             unsigned char px[4] = {0};
             CGContextRef ctx2 = CGBitmapContextCreate(px, 1, 1, 8, 4, cs2,
@@ -410,7 +415,8 @@ static UIColor *MKDominantColorFromImage(UIImage *image) {
                 UIColor *raw = [UIColor colorWithRed:rr green:gg blue:bb alpha:1.0f];
                 CGFloat h, s, br;
                 [raw getHue:&h saturation:&s brightness:&br alpha:nil];
-                s = MIN(s * 1.3f, 1.0f);
+                // 增强饱和度，避免灰色平均色
+                s = MIN(s * 1.4f, 1.0f);
                 return [UIColor colorWithHue:h saturation:s brightness:br alpha:1.0f];
             }
             CGColorSpaceRelease(cs2);
@@ -419,8 +425,6 @@ static UIColor *MKDominantColorFromImage(UIImage *image) {
         finalHue = bestHue;
         finalSat = bestSat;
         finalBri = bestBri;
-        RDLog(@"IconColor: fallback to most-saturated pixel (%.2f,%.2f,%.2f) sat=%.2f",
-              bestR, bestG, bestB, bestSat);
     } else {
         finalHue = hueSum[bestBucket] / weightedCount[bestBucket];
         finalSat = satSum[bestBucket] / weightedCount[bestBucket];
@@ -428,13 +432,18 @@ static UIColor *MKDominantColorFromImage(UIImage *image) {
     }
 
     // 亮度调整：保证指示器在桌面背景上可见
-    if (finalBri < 0.3f) {
-        finalBri = 0.3f + finalBri * 0.5f;
-    } else if (finalBri > 0.85f) {
-        finalBri = 0.85f - (1.0f - finalBri) * 0.5f;
+    if (finalBri < 0.25f) {
+        finalBri = 0.25f + finalBri * 0.6f;
+    } else if (finalBri > 0.88f) {
+        finalBri = 0.88f - (1.0f - finalBri) * 0.6f;
     }
-    // 略增饱和度，让指示器更鲜艳
-    finalSat = MIN(finalSat * 1.25f, 1.0f);
+    // 增强饱和度，让指示器更鲜艳
+    finalSat = MIN(finalSat * 1.3f, 1.0f);
+    // 如果饱和度仍然偏低（柔和主色），进一步提升
+    if (finalSat < 0.45f) {
+        finalSat = finalSat * 1.5f + 0.15f;
+        if (finalSat > 0.9f) finalSat = 0.9f;
+    }
 
     return [UIColor colorWithHue:finalHue saturation:finalSat brightness:finalBri alpha:1.0f];
 }
@@ -515,8 +524,7 @@ static UIImage *MKGetIconImage(SBIconView *iv) {
         // 策略 4: 快照 SBIconView（最终兜底）
         // v1.6.2: 改用 renderInContext 捕获图层内容（而非屏幕合成）
         // v1.6.3: 先试 iconImageView 的 image，再回退到 snapshot
-        // 问题：之前所有 App 都走到这步，说明策略 1-3 在 iOS 16 上对系统 App 无效
-        // 修复：尝试 SBIconView 的 subviews 里找 UIImageView
+        // v1.6.4: 固定 128x128 渲染尺寸，避免尺寸不一致导致色相偏差
         UIImage *img = nil;
         for (UIView *sv in iv.subviews) {
             if ([sv isKindOfClass:[UIImageView class]]) {
@@ -529,17 +537,14 @@ static UIImage *MKGetIconImage(SBIconView *iv) {
             }
         }
         if (!img) {
-            // 还是没找到 → 用 renderInContext 渲染图层（比 drawViewHierarchy 更可靠）
-            CGSize iconSize = iv.bounds.size;
-            if (iconSize.width < 10 || iconSize.height < 10) {
-                iconSize = CGSizeMake(60, 60);
-            }
-            UIGraphicsBeginImageContextWithOptions(iconSize, NO, 0);
+            // 固定 128x128 渲染，平衡质量与性能
+            CGSize renderSize = CGSizeMake(128, 128);
+            UIGraphicsBeginImageContextWithOptions(renderSize, NO, 0);
             CGContextRef ctx = UIGraphicsGetCurrentContext();
             [iv.layer renderInContext:ctx];
             img = UIGraphicsGetImageFromCurrentImageContext();
             UIGraphicsEndImageContext();
-            RDLog(@"IconImage: renderInContext (%.0fx%.0f) → %@", iconSize.width, iconSize.height, img ? @"OK" : @"FAIL");
+            RDLog(@"IconImage: renderInContext (%.0fx%.0f) → %@", renderSize.width, renderSize.height, img ? @"OK" : @"FAIL");
         }
         return img;
 

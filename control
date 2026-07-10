@@ -1,6 +1,6 @@
 Package: com.mk.runningdotindicator
 Name: RunningDotIndicator
-Version: 1.6.3
+Version: 1.6.4
 Architecture: iphoneos-arm64
 Description: Adds an indicator (dot or bar) to replace app icon names when apps are running on the home screen. Two shapes available: dot or bar. Auto-replace label position.
 Maintainer: 口非口
