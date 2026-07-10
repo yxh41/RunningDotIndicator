@@ -327,7 +327,6 @@ static UIColor *MKDominantColorFromImage(UIImage *image) {
     // fallback: 记录最鲜艳的像素
     CGFloat bestSat = -1.0f;
     CGFloat bestHue = 0, bestBri = 0;
-    CGFloat bestR = 0, bestG = 0, bestB = 0;
 
     // 阈值参数
     const CGFloat kMinSat = 0.05f;    // 饱和度阈值（柔和颜色也能被识别）
@@ -367,7 +366,6 @@ static UIColor *MKDominantColorFromImage(UIImage *image) {
             if (sat > bestSat) {
                 bestSat = sat;
                 bestHue = hue; bestBri = brightness;
-                bestR = r; bestG = g; bestB = b;
             }
 
             // 跳过中性色（黑/白/灰）
