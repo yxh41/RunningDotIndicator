@@ -1,5 +1,9 @@
 //
-//  Tweak.x — RunningDotIndicator v1.6.2
+//  Tweak.x — RunningDotIndicator v1.6.3
+//  v1.6.3: 修复系统 App 图标主色不对 — 改进图标获取策略
+//    ✅ MKGetIconImage: 先遍历 SBIconView.subviews 找 UIImageView.image
+//    ✅ 兜底改用 layer.renderInContext 替代 drawViewHierarchyInRect
+//    ✅ 主色提取算法改为 16x16 采样 + 色相分桶统计
 //  v1.6.2: 去掉 Lynx2 字眼 + 修复图标平均色全灰 bug
 //    ✅ Root.plist: 移除 "灵感来自 Lynx2" 和 "类似 Lynx2" 字眼
 //    ✅ MKGetIconImage: 修复 performSelector:withObject: 传递 NSNumber* 给期望 CGFloat 参数的方法导致 ABI 不匹配
@@ -1892,8 +1896,8 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.6.2 ctor: remove Lynx2 text + fix icon color bug (NSInvocation for CGFloat ABI)");
-    RDLog(@"======== v1.6.2 loading (fix: Lynx2 text removed + icon color ABI bug fixed with NSInvocation) ========");
+    NSLog(@"[RunningDotIndicator] v1.6.3 ctor: fix icon dominant color for system apps (UIImageView + renderInContext)");
+    RDLog(@"======== v1.6.3 loading (fix: icon color wrong for system apps — use UIImageView subview + renderInContext) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
