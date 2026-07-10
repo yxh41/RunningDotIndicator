@@ -1,5 +1,9 @@
 //
-//  Tweak.x — RunningDotIndicator v1.6.1
+//  Tweak.x — RunningDotIndicator v1.6.2
+//  v1.6.2: 去掉 Lynx2 字眼 + 修复图标平均色全灰 bug
+//    ✅ Root.plist: 移除 "灵感来自 Lynx2" 和 "类似 Lynx2" 字眼
+//    ✅ MKGetIconImage: 修复 performSelector:withObject: 传递 NSNumber* 给期望 CGFloat 参数的方法导致 ABI 不匹配
+//    ✅ 图标快照改用完整尺寸渲染（避免动画期间 1x1 快照捕获空白）
 //  v1.6.1: 修复文件夹/Dock指示器不显示 + 设置页添加图标平均色
 //    ✅ 修复文件夹内App指示器不显示 — sFadingLabelBIDs 卡住（渐隐动画没启动→MKRemoveFadingLabel从没调用）
 //    ✅ 修复Dock App指示器不显示 — 同根因（Dock无label→渐隐跳过→isFading永远=YES）
@@ -1772,8 +1776,8 @@ static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.6.1 ctor: fix folder/Dock indicators (sFadingLabel stuck) + settings AutoIcon");
-    RDLog(@"======== v1.6.1 loading (fix: sFadingLabelBIDs stuck for folder/Dock icons → auto-clear at 250ms/300ms/800ms; settings page colorMode) ========");
+    NSLog(@"[RunningDotIndicator] v1.6.2 ctor: remove Lynx2 text + fix icon color bug (NSInvocation for CGFloat ABI)");
+    RDLog(@"======== v1.6.2 loading (fix: Lynx2 text removed + icon color ABI bug fixed with NSInvocation) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
