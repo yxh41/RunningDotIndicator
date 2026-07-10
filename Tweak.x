@@ -467,17 +467,35 @@ static UIImage *MKGetIconImage(SBIconView *iv) {
         }
 
         // 策略 4: 快照 SBIconView（最终兜底）
-        // v1.6.2: 不要用 1x1 快照（动画期间可能捕获空白），改用完整尺寸再缩放
-        CGSize iconSize = iv.bounds.size;
-        if (iconSize.width < 10 || iconSize.height < 10) {
-            iconSize = CGSizeMake(60, 60);  // fallback 尺寸
+        // v1.6.2: 改用 renderInContext 捕获图层内容（而非屏幕合成）
+        // v1.6.3: 先试 iconImageView 的 image，再回退到 snapshot
+        // 问题：之前所有 App 都走到这步，说明策略 1-3 在 iOS 16 上对系统 App 无效
+        // 修复：尝试 SBIconView 的 subviews 里找 UIImageView
+        UIImage *img = nil;
+        for (UIView *sv in iv.subviews) {
+            if ([sv isKindOfClass:[UIImageView class]]) {
+                UIImageView *iview = (UIImageView *)sv;
+                if (iview.image) {
+                    img = iview.image;
+                    RDLog(@"IconImage: from UIImageView subview → OK");
+                    break;
+                }
+            }
         }
-        UIGraphicsBeginImageContextWithOptions(iconSize, NO, 0);  // scale=0 使用屏幕 scale
-        [iv drawViewHierarchyInRect:CGRectMake(0, 0, iconSize.width, iconSize.height) afterScreenUpdates:NO];
-        UIImage *snapshot = UIGraphicsGetImageFromCurrentImageContext();
-        UIGraphicsEndImageContext();
-        RDLog(@"IconImage: snapshot (%.0fx%.0f) → %@", iconSize.width, iconSize.height, snapshot ? @"OK" : @"FAIL");
-        return snapshot;
+        if (!img) {
+            // 还是没找到 → 用 renderInContext 渲染图层（比 drawViewHierarchy 更可靠）
+            CGSize iconSize = iv.bounds.size;
+            if (iconSize.width < 10 || iconSize.height < 10) {
+                iconSize = CGSizeMake(60, 60);
+            }
+            UIGraphicsBeginImageContextWithOptions(iconSize, NO, 0);
+            CGContextRef ctx = UIGraphicsGetCurrentContext();
+            [iv.layer renderInContext:ctx];
+            img = UIGraphicsGetImageFromCurrentImageContext();
+            UIGraphicsEndImageContext();
+            RDLog(@"IconImage: renderInContext (%.0fx%.0f) → %@", iconSize.width, iconSize.height, img ? @"OK" : @"FAIL");
+        }
+        return img;
 
     } @catch (NSException *e) {
         RDLog(@"MKGetIconImage exception: %@", e.reason);
