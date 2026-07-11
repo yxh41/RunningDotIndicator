@@ -1834,8 +1834,8 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.6.19 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI (grouped cards, hero preview centered & matches real home screen)");
-    RDLog(@"======== v1.6.19 loading (1.6.1 baseline; dominant-color icon mode; fix: snapshot full-size for icon capture; no respring button; Lynx2 wording dropped; 2026 glass settings UI with grouped cards; hero preview centered & matches real home screen) ========");
+    NSLog(@"[RunningDotIndicator] v1.6.20 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI (grouped cards, hero preview: icon-left + indicator + text-right, whole block centered)");
+    RDLog(@"======== v1.6.20 loading (1.6.1 baseline; dominant-color icon mode; fix: snapshot full-size for icon capture; no respring button; Lynx2 wording dropped; 2026 glass settings UI with grouped cards; hero preview icon-left/text-right block centered) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");

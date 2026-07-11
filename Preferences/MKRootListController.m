@@ -124,18 +124,18 @@ static UIColor *MKColorFromHex(NSString *hex) {
         glyph.layer.masksToBounds = YES;
         [icon addSubview:glyph];
 
-        // 标题行（居中）
+        // 标题行（图标右侧，左对齐）
         UILabel *title = [[UILabel alloc] initWithFrame:CGRectZero];
         title.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
-        title.textAlignment = NSTextAlignmentCenter;
+        title.textAlignment = NSTextAlignmentLeft;
         if (@available(iOS 13.0, *)) title.textColor = [UIColor labelColor];
         else title.textColor = [UIColor blackColor];
         [content addSubview:title];
 
-        // 副标题（居中）
+        // 副标题（图标右侧，左对齐）
         UILabel *cap = [[UILabel alloc] initWithFrame:CGRectZero];
         cap.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
-        cap.textAlignment = NSTextAlignmentCenter;
+        cap.textAlignment = NSTextAlignmentLeft;
         if (@available(iOS 13.0, *)) cap.textColor = [UIColor secondaryLabelColor];
         else cap.textColor = [UIColor grayColor];
         [content addSubview:cap];
@@ -181,25 +181,42 @@ static UIColor *MKColorFromHex(NSString *hex) {
     self.previewIndicator.layer.cornerRadius = h / 2.0f;
 }
 
-// 头图内子视图按当前宽度排版（整体水平居中，纵向：图标 → 指示器 → 标题 → 副标题）
+// 头图内子视图排版：图标(左) + 指示器(图标下居中) + 标题/副标题(右)，整组水平居中
 - (void)layoutHero {
     if (!self.heroView) return;
     CGFloat W = self.heroView.bounds.size.width;
     if (W < 1) W = (self.view.bounds.size.width > 0) ? self.view.bounds.size.width : 320.0f;
 
-    CGFloat centerX = W / 2.0f;
+    // 文字宽度（用于把整组在头图内居中）
+    CGFloat titleW = 0;
+    @try {
+        NSDictionary *attrs = @{NSFontAttributeName: self.previewTitle.font};
+        titleW = [self.previewTitle.text sizeWithAttributes:attrs].width;
+    } @catch (NSException *e) { titleW = 0; }
+    if (titleW < 1) titleW = 180.0f;          // 文本未就绪时给个估算
+    titleW = MIN(titleW, 220.0f);
 
-    // 图标水平居中
-    self.previewIcon.frame = CGRectMake(centerX - kIconSize / 2.0f, kIconTopY, kIconSize, kIconSize);
+    CGFloat gap = 20.0f;
+    CGFloat blockW = kIconSize + gap + titleW;
+    CGFloat blockLeft = (W - blockW) / 2.0f;
+    if (blockLeft < 12.0f) blockLeft = 12.0f;   // 窄屏兜底，不贴边
 
-    // 指示器放在图标名称区域，与主屏真实位置一致（已按图标中点居中）
+    // 图标（组左侧）
+    self.previewIcon.frame = CGRectMake(blockLeft, kIconTopY, kIconSize, kIconSize);
+
+    // 指示器：图标正下方名称区域，按图标中点居中
     [self updateIndicatorFrame];
 
-    // 标题 / 副标题居中排在指示器下方
-    CGFloat textTop = CGRectGetMaxY(self.previewIcon.frame)
-                    + kLabelAreaH + 18.0f; // 名称区域 + 间距
-    self.previewTitle.frame   = CGRectMake(0, textTop, W, 22);
-    self.previewCaption.frame = CGRectMake(0, textTop + 24, W, 18);
+    // 标题 / 副标题：图标右侧，纵向与图标居中对齐
+    CGFloat textLeft = blockLeft + kIconSize + gap;
+    CGFloat textW = MIN(titleW, W - textLeft - 12.0f);
+    if (textW < 40.0f) textW = 40.0f;
+    CGFloat lineH = 22.0f, capH = 18.0f, capGap = 4.0f;
+    CGFloat textBlockH = lineH + capGap + capH;     // 标题 + 副标题总高
+    CGFloat textTop = kIconTopY + (kIconSize - textBlockH) / 2.0f;
+    if (textTop < 8.0f) textTop = 8.0f;
+    self.previewTitle.frame   = CGRectMake(textLeft, textTop, textW, lineH);
+    self.previewCaption.frame = CGRectMake(textLeft, textTop + lineH + capGap, textW, capH);
 }
 
 // 刷新头图：读取当前设置 → 重绘预览 + 强调色联动
