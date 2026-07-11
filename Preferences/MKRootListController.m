@@ -14,10 +14,10 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
 static NSString * const kReloadNotification = @"com.mk.runningdotindicator.reload";
 
 // ── 2026 玻璃风格常量 ──
-static const CGFloat kHeroHeight = 128.0f;
-static const CGFloat kHeroPad    = 16.0f;
-static const CGFloat kCardRadius = 12.0f;
-static const CGFloat kCardAlpha  = 0.60f; // 卡片半透明 → 透出毛玻璃背景
+static const CGFloat kHeroHeight = 150.0f;
+static const CGFloat kHeroPad    = 24.0f;
+static const CGFloat kCardRadius = 16.0f;
+static const CGFloat kCardAlpha  = 0.62f; // 卡片半透明 → 透出毛玻璃背景
 
 @interface MKRootListController ()
 @property (nonatomic, strong) UIView   *heroView;        // 顶部玻璃头图
@@ -103,13 +103,13 @@ static UIColor *MKColorFromHex(NSString *hex) {
         [hero addSubview:content];
 
         // 模拟 App 图标(圆角方块，强调色填充)
-        UIView *icon = [[UIView alloc] initWithFrame:CGRectMake(kHeroPad, 28, 56, 56)];
-        icon.layer.cornerRadius = 13;
+        UIView *icon = [[UIView alloc] initWithFrame:CGRectMake(kHeroPad, 30, 60, 60)];
+        icon.layer.cornerRadius = 15;
         icon.layer.masksToBounds = YES;
         [content addSubview:icon];
 
         // 图标内白色 glyph
-        UIView *glyph = [[UIView alloc] initWithFrame:CGRectMake(16, 16, 24, 24)];
+        UIView *glyph = [[UIView alloc] initWithFrame:CGRectMake(18, 18, 24, 24)];
         glyph.backgroundColor = [UIColor whiteColor];
         glyph.layer.cornerRadius = 6;
         glyph.layer.masksToBounds = YES;
@@ -117,19 +117,19 @@ static UIColor *MKColorFromHex(NSString *hex) {
 
         // 标题行
         UILabel *title = [[UILabel alloc] initWithFrame:CGRectZero];
-        title.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+        title.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
         if (@available(iOS 13.0, *)) title.textColor = [UIColor labelColor];
         else title.textColor = [UIColor blackColor];
         [content addSubview:title];
 
         // 副标题
         UILabel *cap = [[UILabel alloc] initWithFrame:CGRectZero];
-        cap.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+        cap.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
         if (@available(iOS 13.0, *)) cap.textColor = [UIColor secondaryLabelColor];
         else cap.textColor = [UIColor grayColor];
         [content addSubview:cap];
 
-        // 实时预览指示点/横条(位置在图标右侧，模拟主屏)
+        // 实时预览指示点/横条(放在图标正下方，像主屏那样替换图标名称)
         UIView *ind = [[UIView alloc] initWithFrame:CGRectZero];
         ind.layer.masksToBounds = YES;
         [content addSubview:ind];
@@ -153,18 +153,19 @@ static UIColor *MKColorFromHex(NSString *hex) {
     CGFloat bw  = [[self readValueForKey:@"barWidth"  default:@24] floatValue];
     CGFloat bh  = [[self readValueForKey:@"barHeight" default:@4]  floatValue];
 
-    CGFloat ix = CGRectGetMaxX(self.previewIcon.frame) + 4.0f;
-    CGFloat iy = CGRectGetMidY(self.previewIcon.frame);
-
     CGFloat w, h;
     if (shape == 1) {                 // 横条
-        w = MAX(bw * 0.7f, 12.0f);
+        w = MAX(bw * 0.8f, 14.0f);
         h = MAX(bh * 1.5f, 4.0f);
     } else {                           // 圆点
-        CGFloat side = MAX(dot * 1.6f, 6.0f);
+        CGFloat side = MAX(dot * 1.6f, 7.0f);
         w = side; h = side;
     }
-    self.previewIndicator.frame = CGRectMake(ix, iy - h / 2.0f, w, h);
+
+    // 指示器放在图标正下方，像主屏那样替换图标名称
+    CGFloat ix = CGRectGetMidX(self.previewIcon.frame) - w / 2.0f;
+    CGFloat iy = CGRectGetMaxY(self.previewIcon.frame) + 12.0f;
+    self.previewIndicator.frame = CGRectMake(ix, iy, w, h);
     self.previewIndicator.layer.cornerRadius = h / 2.0f;
 }
 
@@ -174,9 +175,9 @@ static UIColor *MKColorFromHex(NSString *hex) {
     CGFloat W = self.heroView.bounds.size.width;
     if (W < 1) W = (self.view.bounds.size.width > 0) ? self.view.bounds.size.width : 320.0f;
 
-    CGFloat leftW = kHeroPad + 56.0f + 16.0f; // 图标 + 间距
-    CGRect t1 = CGRectMake(leftW, 34, W - leftW - kHeroPad, 20);
-    CGRect t2 = CGRectMake(leftW, 58, W - leftW - kHeroPad, 16);
+    CGFloat leftW = kHeroPad + 60.0f + 20.0f; // 图标 + 标题左侧间距
+    CGRect t1 = CGRectMake(leftW, 44, W - leftW - kHeroPad, 22);
+    CGRect t2 = CGRectMake(leftW, 72, W - leftW - kHeroPad, 18);
     self.previewTitle.frame   = t1;
     self.previewCaption.frame = t2;
     [self updateIndicatorFrame];
@@ -320,17 +321,19 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     @try {
         cell.backgroundColor = [UIColor clearColor];
 
+        // 玻璃卡片：半透明圆角 + 柔和阴影，去掉边框避免"线圈"感
         UIView *bg = [[UIView alloc] init];
         if (@available(iOS 13.0, *)) {
             bg.backgroundColor = [[UIColor systemBackgroundColor] colorWithAlphaComponent:kCardAlpha];
-            bg.layer.borderColor = [[UIColor separatorColor] colorWithAlphaComponent:0.30f].CGColor;
         } else {
             bg.backgroundColor = [UIColor colorWithWhite:1.0f alpha:kCardAlpha];
-            bg.layer.borderColor = [UIColor colorWithWhite:0.6f alpha:0.3f].CGColor;
         }
-        bg.layer.borderWidth  = 0.5f;
         bg.layer.cornerRadius = kCardRadius;
-        bg.layer.masksToBounds = YES;
+        bg.layer.masksToBounds = NO;
+        bg.layer.shadowColor   = [UIColor blackColor].CGColor;
+        bg.layer.shadowOpacity = 0.05f;
+        bg.layer.shadowOffset  = CGSizeMake(0, 2.0f);
+        bg.layer.shadowRadius  = 8.0f;
         cell.backgroundView = bg;
 
         // label 背景透明，文字才浮在玻璃上
