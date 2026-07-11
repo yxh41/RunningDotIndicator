@@ -1,5 +1,10 @@
 //
-//  Tweak.x — RunningDotIndicator v1.6.3
+//  Tweak.x — RunningDotIndicator v1.6.6
+//  v1.6.6: 修复页面滑动指示器消失 + 新增图标最大颜色模式
+//    ✅ didMoveToWindow 不再主动移除指示器，避免桌面滑动后重建闪烁
+//    ✅ MKUpdate 检测到指示器 superview 变化时直接重新挂接（animate=0）
+//    ✅ 新增 MKColorModeMostFrequent：按像素数量取图标中面积最大的颜色
+//    ✅ 偏好设置变更时清空 sIconColorCache，颜色模式切换后立即重新取色
 //  v1.6.3: 修复系统 App 图标主色不对 + 去掉注销按钮
 //    ✅ MKGetIconImage: 先遍历 SBIconView.subviews 找 UIImageView.image
 //    ✅ 兜底改用 layer.renderInContext 替代 drawViewHierarchyInRect
@@ -1412,6 +1417,20 @@ static void MKUpdate(SBIconView *self) {
             // 指示器外观只在创建时和配置变更时设置，layoutSubviews 不需要
             indicator.frame = indicatorFrame;
             indicator.hidden = NO;
+
+            // v1.6.6: 颜色模式变更后，已有的指示器需要刷新颜色
+            if (cfg.colorMode == MKColorModeFixed) {
+                if (((MKIndicatorDotView *)indicator).indicatorColor) {
+                    ((MKIndicatorDotView *)indicator).indicatorColor = nil;
+                    [indicator setNeedsDisplay];
+                }
+            } else {
+                UIColor *iconColor = MKCachedIconColorForBundleID(bundleID);
+                if (iconColor && ![((MKIndicatorDotView *)indicator).indicatorColor isEqual:iconColor]) {
+                    ((MKIndicatorDotView *)indicator).indicatorColor = iconColor;
+                    [indicator setNeedsDisplay];
+                }
+            }
         }
     });
 }
