@@ -15,15 +15,16 @@ static NSString * const kReloadNotification = @"com.mk.runningdotindicator.reloa
 
 // ── 2026 玻璃风格常量 ──
 static const CGFloat kHeroHeight = 150.0f;
+static const CGFloat kHeroPad    = 24.0f;
 static const CGFloat kCardRadius = 16.0f;
 static const CGFloat kCardAlpha  = 0.62f; // 卡片半透明 → 透出毛玻璃背景
 
 // 头图模拟图标尺寸（更精致，与真实桌面图标比例一致）
 static const CGFloat kIconSize   = 52.0f;
 static const CGFloat kIconRadius = 12.0f;
-static const CGFloat kGlyphSize  = 20.0f;
-static const CGFloat kGlyphRadius = 5.0f;
-static const CGFloat kIconTopY   = 20.0f;
+static const CGFloat kGlyphSize  = 32.0f;
+static const CGFloat kGlyphRadius = 8.0f;
+static const CGFloat kIconTopY   = 34.0f;
 static const CGFloat kLabelAreaH = 14.0f; // 图标下方名称区域典型高度
 
 @interface MKRootListController ()
@@ -110,8 +111,8 @@ static UIColor *MKColorFromHex(NSString *hex) {
         [hero addSubview:content];
 
         // 模拟 App 图标（圆角方块，强调色填充；尺寸与真实图标一致）
-        // x 由 layoutHero 统一居中定位，这里先给占位
-        UIView *icon = [[UIView alloc] initWithFrame:CGRectMake(0, kIconTopY, kIconSize, kIconSize)];
+        // 图标固定在左侧，与 v1.6.18 一致
+        UIView *icon = [[UIView alloc] initWithFrame:CGRectMake(kHeroPad, kIconTopY, kIconSize, kIconSize)];
         icon.layer.cornerRadius = kIconRadius;
         icon.layer.masksToBounds = YES;
         [content addSubview:icon];
@@ -181,42 +182,18 @@ static UIColor *MKColorFromHex(NSString *hex) {
     self.previewIndicator.layer.cornerRadius = h / 2.0f;
 }
 
-// 头图内子视图排版：图标(左) + 指示器(图标下居中) + 标题/副标题(右)，整组水平居中
+// 头图内子视图排版：图标(左) + 指示器(图标下居中) + 标题/副标题(右)，与 v1.6.18 一致
 - (void)layoutHero {
     if (!self.heroView) return;
     CGFloat W = self.heroView.bounds.size.width;
     if (W < 1) W = (self.view.bounds.size.width > 0) ? self.view.bounds.size.width : 320.0f;
 
-    // 文字宽度（用于把整组在头图内居中）
-    CGFloat titleW = 0;
-    @try {
-        NSDictionary *attrs = @{NSFontAttributeName: self.previewTitle.font};
-        titleW = [self.previewTitle.text sizeWithAttributes:attrs].width;
-    } @catch (NSException *e) { titleW = 0; }
-    if (titleW < 1) titleW = 180.0f;          // 文本未就绪时给个估算
-    titleW = MIN(titleW, 220.0f);
-
-    CGFloat gap = 20.0f;
-    CGFloat blockW = kIconSize + gap + titleW;
-    CGFloat blockLeft = (W - blockW) / 2.0f;
-    if (blockLeft < 12.0f) blockLeft = 12.0f;   // 窄屏兜底，不贴边
-
-    // 图标（组左侧）
-    self.previewIcon.frame = CGRectMake(blockLeft, kIconTopY, kIconSize, kIconSize);
-
-    // 指示器：图标正下方名称区域，按图标中点居中
+    CGFloat leftW = kHeroPad + kIconSize + 20.0f; // 图标 + 标题左侧间距
+    CGRect t1 = CGRectMake(leftW, 44, W - leftW - kHeroPad, 22);
+    CGRect t2 = CGRectMake(leftW, 72, W - leftW - kHeroPad, 18);
+    self.previewTitle.frame   = t1;
+    self.previewCaption.frame = t2;
     [self updateIndicatorFrame];
-
-    // 标题 / 副标题：图标右侧，纵向与图标居中对齐
-    CGFloat textLeft = blockLeft + kIconSize + gap;
-    CGFloat textW = MIN(titleW, W - textLeft - 12.0f);
-    if (textW < 40.0f) textW = 40.0f;
-    CGFloat lineH = 22.0f, capH = 18.0f, capGap = 4.0f;
-    CGFloat textBlockH = lineH + capGap + capH;     // 标题 + 副标题总高
-    CGFloat textTop = kIconTopY + (kIconSize - textBlockH) / 2.0f;
-    if (textTop < 8.0f) textTop = 8.0f;
-    self.previewTitle.frame   = CGRectMake(textLeft, textTop, textW, lineH);
-    self.previewCaption.frame = CGRectMake(textLeft, textTop + lineH + capGap, textW, capH);
 }
 
 // 刷新头图：读取当前设置 → 重绘预览 + 强调色联动
