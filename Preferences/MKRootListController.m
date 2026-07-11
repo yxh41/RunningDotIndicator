@@ -304,7 +304,7 @@ static UIColor *MKColorFromHex(NSString *hex) {
     @try { if (self.heroView) [self layoutHero]; } @catch (NSException *e) {}
 }
 
-#pragma mark - 玻璃卡片(每组一行圆角半透明)
+#pragma mark - 玻璃卡片（同 section 多行共用一张卡片）
 
 - (void)tableView:(UITableView *)tableView
   willDisplayCell:(UITableViewCell *)cell
@@ -321,19 +321,57 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     @try {
         cell.backgroundColor = [UIColor clearColor];
 
-        // 玻璃卡片：半透明圆角 + 柔和阴影，去掉边框避免"线圈"感
+        // 同 section 里一共有几行数据（PSGroupCell 是 header/footer，不占 row）
+        NSInteger rows = [tableView numberOfRowsInSection:indexPath.section];
+        BOOL isFirst = (indexPath.row == 0);
+        BOOL isLast  = (indexPath.row == rows - 1);
+
+        // 玻璃卡片：半透明 + 柔和阴影
         UIView *bg = [[UIView alloc] init];
         if (@available(iOS 13.0, *)) {
             bg.backgroundColor = [[UIColor systemBackgroundColor] colorWithAlphaComponent:kCardAlpha];
         } else {
             bg.backgroundColor = [UIColor colorWithWhite:1.0f alpha:kCardAlpha];
         }
-        bg.layer.cornerRadius = kCardRadius;
         bg.layer.masksToBounds = NO;
         bg.layer.shadowColor   = [UIColor blackColor].CGColor;
         bg.layer.shadowOpacity = 0.05f;
         bg.layer.shadowOffset  = CGSizeMake(0, 2.0f);
         bg.layer.shadowRadius  = 8.0f;
+
+        // 按 section 内位置决定圆角：首行只圆上角，末行只圆下角，中间行不圆角。
+        // 单行 group 则四角都圆。
+        UIRectCorner corners = 0;
+        if (rows == 1 || isFirst) {
+            corners |= UIRectCornerTopLeft | UIRectCornerTopRight;
+        }
+        if (rows == 1 || isLast) {
+            corners |= UIRectCornerBottomLeft | UIRectCornerBottomRight;
+        }
+        if (corners == 0) corners = UIRectCornerAllCorners;
+
+        if (@available(iOS 11.0, *)) {
+            bg.layer.maskedCorners = (CACornerMask)corners;
+            bg.layer.cornerRadius = kCardRadius;
+        } else {
+            // iOS 11 以下退化：整组圆角，仍可用
+            bg.layer.cornerRadius = kCardRadius;
+        }
+
+        // 非末行加底部分隔线，让同 section 多行看起来像一张卡片内的多行
+        if (!isLast) {
+            UIView *sep = [[UIView alloc] init];
+            if (@available(iOS 13.0, *)) {
+                sep.backgroundColor = [[UIColor separatorColor] colorWithAlphaComponent:0.30f];
+            } else {
+                sep.backgroundColor = [UIColor colorWithWhite:0.0f alpha:0.08f];
+            }
+            // 初始按 44pt 标准 cell 高 + 320pt 宽，靠 autoresizing 适配真实尺寸
+            sep.frame = CGRectMake(16.0f, 43.5f, 288.0f, 0.5f);
+            sep.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
+            [bg addSubview:sep];
+        }
+
         cell.backgroundView = bg;
 
         // label 背景透明，文字才浮在玻璃上
