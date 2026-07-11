@@ -14,7 +14,7 @@ typedef NS_ENUM(NSInteger, MKShape) {
 
 typedef NS_ENUM(NSInteger, MKColorMode) {
     MKColorModeFixed    = 0,  // 固定颜色（用户配置的 #RRGGBB）
-    MKColorModeAutoIcon = 1   // 从图标取平均色（Lynx2 风格）
+    MKColorModeAutoIcon = 1   // 从图标取主色调(dominant color)（Lynx2 风格）
 };
 
 @interface MKConfig : NSObject

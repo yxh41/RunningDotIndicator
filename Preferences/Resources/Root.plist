@@ -10,7 +10,7 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>RunningDotIndicator 1.6.10</string>
+			<string>RunningDotIndicator 1.6.11</string>
 			<key>footerText</key>
 			<string>为运行中的 App 图标添加指示器。App 运行时自动替换图标下方的名称文字，退出后恢复原名称。</string>
 		</dict>
@@ -166,7 +166,7 @@
 			<key>label</key>
 			<string>颜色模式</string>
 			<key>footerText</key>
-			<string>固定颜色：使用下方选择的预设/自定义颜色。图标平均色：自动从 App 图标提取平均色作为指示器颜色。</string>
+			<string>固定颜色：使用下方选择的预设/自定义颜色。图标主色调：自动从 App 图标提取占比最高的主色作为指示器颜色。</string>
 		</dict>
 
 		<dict>
@@ -187,7 +187,7 @@
 			<key>validTitles</key>
 			<array>
 				<string>固定颜色</string>
-				<string>图标平均色</string>
+				<string>图标主色调</string>
 			</array>
 			<key>validValues</key>
 			<array>
