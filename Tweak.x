@@ -457,22 +457,22 @@ static UIColor *MKDominantColorFromImage(UIImage *image) {
     return [UIColor colorWithHue:finalHue saturation:finalSat brightness:finalBri alpha:1.0f];
 }
 
-// ─── 图标最大颜色提取 ─── v1.6.6 ───
-// 从 App 图标提取出现面积最大的颜色，用于 AutoIcon 的另一种策略。
-// 与主色(dominant)不同：dominant 按色相+饱和度加权，最大颜色按像素数量计数。
-// 优点：纯色块图标（如 TestFlight 红色背景）更准确。
-// 实现：
-//   • 24x24 采样
-//   • 每通道量化到 8 级（512 个桶），将相似颜色合并
-//   • 过滤透明、纯白、纯黑像素
-//   • 圆形中心加权，避免圆角/边缘伪影
-//   • 取计数最高的桶，返回桶内平均 RGB
+// ─── 图标最大颜色提取 ─── v1.6.8 重写 ───
+// 目标：返回图标中"占面积最大"的颜色（出现像素最多的颜色）。
+// 旧实现用 RGB 8 级分桶 + 中心加权 + 强饱和度增强，
+// 导致蓝图标被算成绿、且颜色被"改"成非真实占比颜色。
+// 新实现：
+//   • 转 HSB，按色相分 36 桶（每桶 10°），统计有彩色像素的数量
+//   • 排除纯白/纯黑/灰色（背景、描边、文字底不是"图标颜色"）
+//   • 不按中心加权 → 所有彩色像素等权，才是真正的"面积占比"
+//   • 不强行拉饱和度/亮度（只做最小可见性保护），保证返回的就是真实占比最大的颜色
+//   • 32×32 采样提升精度
 static UIColor *MKMostFrequentColorFromImage(UIImage *image) {
     if (!image) return nil;
     CGImageRef cgImg = image.CGImage;
     if (!cgImg) return nil;
 
-    const int SW = 24, SH = 24;
+    const int SW = 32, SH = 32;
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     unsigned char *pixels = (unsigned char *)malloc(SW * SH * 4);
     if (!pixels) {
@@ -491,18 +491,17 @@ static UIColor *MKMostFrequentColorFromImage(UIImage *image) {
     CGContextRelease(ctx);
     CGColorSpaceRelease(colorSpace);
 
-    // 每通道 8 级 → 512 个颜色桶
-    const int LEVELS = 8;
-    const int BUCKETS = LEVELS * LEVELS * LEVELS;
-    float counts[BUCKETS] = {0};
-    float rSum[BUCKETS] = {0};
-    float gSum[BUCKETS] = {0};
-    float bSum[BUCKETS] = {0};
+    // 按色相分 36 桶（每桶 10°），统计"有彩色"像素的数量
+    const int HUE_BUCKETS = 36;
+    double hueSum[HUE_BUCKETS] = {0};
+    double satSum[HUE_BUCKETS] = {0};
+    double briSum[HUE_BUCKETS] = {0};
+    double weightSum[HUE_BUCKETS] = {0};
+
+    // 兜底：记录所有"有彩色"像素的平均（极少数图标几乎无彩色时用）
+    double allR = 0, allG = 0, allB = 0, allW = 0;
 
     const CGFloat kMinAlpha = 0.3f;
-    const CGFloat kMinBri = 0.06f;   // 接近纯黑（阴影/边框）才跳过
-
-    const CGFloat kMaxDist = sqrtf((SW/2.0f)*(SW/2.0f) + (SH/2.0f)*(SH/2.0f));
 
     for (int y = 0; y < SH; y++) {
         for (int x = 0; x < SW; x++) {
@@ -511,93 +510,60 @@ static UIColor *MKMostFrequentColorFromImage(UIImage *image) {
             CGFloat g = pixels[i * 4 + 1] / 255.0f;
             CGFloat b = pixels[i * 4 + 2] / 255.0f;
             CGFloat a = pixels[i * 4 + 3] / 255.0f;
-
             if (a < kMinAlpha) continue;
 
-            // v1.6.7 修正：旧逻辑用 maxC > 0.96 直接跳过高亮像素，
-            // 会把蓝天(maxC≈1.0)、纯红(maxC=1.0)等高饱和亮色整个过滤掉，
-            // 导致天气等图标取成绿色等错误结果。
-            // 改为只排除"三通道都很高"的纯白（背景/云）和"三通道都很低"的纯黑（阴影）。
-            // 高饱和亮色（如蓝天 blue≈1.0、纯红 red≈1.0）保留，因为它们就是图标主色。
+            // 排除纯黑（阴影/边框）和纯白（背景/高光/云）
             CGFloat maxC = MAX(MAX(r, g), b);
             CGFloat minC = MIN(MIN(r, g), b);
-            if (maxC < kMinBri) continue;   // 纯黑/阴影
-            if (minC > 0.92f)  continue;   // 纯白/云朵/背景
+            if (maxC < 0.06f) continue;   // 纯黑
+            if (minC > 0.88f) continue;   // 纯白
 
-            // 圆形中心加权
-            CGFloat dx = x - (SW - 1) / 2.0f;
-            CGFloat dy = y - (SH - 1) / 2.0f;
-            CGFloat dist = sqrtf(dx*dx + dy*dy);
-            CGFloat normDist = dist / kMaxDist;
-            CGFloat centerWeight = 1.0f - normDist * 0.6f;
-            if (centerWeight < 0.35f) centerWeight = 0.35f;
+            UIColor *c = [UIColor colorWithRed:r green:g blue:b alpha:1.0f];
+            CGFloat h, s, br;
+            [c getHue:&h saturation:&s brightness:&br alpha:nil];
 
-            int rLvl = (int)(r * (LEVELS - 1) + 0.5f);
-            int gLvl = (int)(g * (LEVELS - 1) + 0.5f);
-            int bLvl = (int)(b * (LEVELS - 1) + 0.5f);
-            rLvl = MAX(0, MIN(LEVELS - 1, rLvl));
-            gLvl = MAX(0, MIN(LEVELS - 1, gLvl));
-            bLvl = MAX(0, MIN(LEVELS - 1, bLvl));
+            // 灰色（低饱和）不是"图标颜色"，给极小权重，几乎不参与占比统计
+            // 彩色像素给满权重 → 真正的"面积占比最大"由彩色像素决定
+            CGFloat w = (s < 0.15f) ? 0.03f : 1.0f;
 
-            int bucket = rLvl * LEVELS * LEVELS + gLvl * LEVELS + bLvl;
+            int bucket = (int)(h * HUE_BUCKETS) % HUE_BUCKETS;
+            hueSum[bucket]    += h * w;
+            satSum[bucket]    += s * w;
+            briSum[bucket]    += br * w;
+            weightSum[bucket]  += w;
 
-            counts[bucket] += centerWeight;
-            rSum[bucket] += r * centerWeight;
-            gSum[bucket] += g * centerWeight;
-            bSum[bucket] += b * centerWeight;
+            if (s >= 0.15f) { allR += r; allG += g; allB += b; allW += 1; }
         }
     }
 
     free(pixels);
 
+    // 取占比最大的色相桶
     int bestBucket = -1;
-    float bestCount = 0;
-    for (int i = 0; i < BUCKETS; i++) {
-        if (counts[i] > bestCount) {
-            bestCount = counts[i];
-            bestBucket = i;
-        }
+    double bestW = 0;
+    for (int i = 0; i < HUE_BUCKETS; i++) {
+        if (weightSum[i] > bestW) { bestW = weightSum[i]; bestBucket = i; }
     }
 
-    // 没找到有效彩色像素 → 返回 1x1 平均色
-    if (bestBucket < 0 || bestCount < 0.3f) {
-        CGColorSpaceRef cs2 = CGColorSpaceCreateDeviceRGB();
-        unsigned char px[4] = {0};
-        CGContextRef ctx2 = CGBitmapContextCreate(px, 1, 1, 8, 4, cs2,
-                                                  (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
-        if (ctx2) {
-            CGContextDrawImage(ctx2, CGRectMake(0, 0, 1, 1), cgImg);
-            CGFloat rr = px[0] / 255.0f, gg = px[1] / 255.0f, bb = px[2] / 255.0f;
-            CGContextRelease(ctx2);
-            CGColorSpaceRelease(cs2);
-            UIColor *raw = [UIColor colorWithRed:rr green:gg blue:bb alpha:1.0f];
-            CGFloat h, s, br;
-            [raw getHue:&h saturation:&s brightness:&br alpha:nil];
-            s = MIN(s * 1.4f, 1.0f);
-            return [UIColor colorWithHue:h saturation:s brightness:br alpha:1.0f];
-        }
-        CGColorSpaceRelease(cs2);
+    CGFloat h, s, br;
+    if (bestBucket >= 0 && bestW > 2.0f) {
+        h  = hueSum[bestBucket] / weightSum[bestBucket];
+        s  = satSum[bestBucket] / weightSum[bestBucket];
+        br = briSum[bestBucket] / weightSum[bestBucket];
+    } else if (allW > 0) {
+        // 极端：几乎没有彩色像素 → 返回平均色（保证有颜色）
+        CGFloat ar = allR / allW, ag = allG / allW, ab = allB / allW;
+        UIColor *c = [UIColor colorWithRed:ar green:ag blue:ab alpha:1.0f];
+        [c getHue:&h saturation:&s brightness:&br alpha:nil];
+    } else {
         return nil;
     }
 
-    CGFloat finalR = rSum[bestBucket] / counts[bestBucket];
-    CGFloat finalG = gSum[bestBucket] / counts[bestBucket];
-    CGFloat finalB = bSum[bestBucket] / counts[bestBucket];
-
-    UIColor *raw = [UIColor colorWithRed:finalR green:finalG blue:finalB alpha:1.0f];
-    CGFloat h, s, br;
-    [raw getHue:&h saturation:&s brightness:&br alpha:nil];
-
-    // 亮度调整保证可见
-    if (br < 0.25f) br = 0.25f + br * 0.6f;
-    else if (br > 0.88f) br = 0.88f - (1.0f - br) * 0.6f;
-
-    // 饱和度增强
-    s = MIN(s * 1.3f, 1.0f);
-    if (s < 0.45f) {
-        s = s * 1.5f + 0.15f;
-        if (s > 0.9f) s = 0.9f;
-    }
+    // 最小可见性保护：只保证不太暗/不太亮，绝不改动色相
+    if (br < 0.30f) br = 0.30f;
+    if (br > 0.95f) br = 0.95f;
+    // 轻微保证饱和度下限，避免取到发灰的彩色（仍是同一个色相）
+    if (s < 0.40f) s = 0.40f;
 
     return [UIColor colorWithHue:h saturation:s brightness:br alpha:1.0f];
 }
@@ -676,19 +642,32 @@ static UIImage *MKGetIconImage(SBIconView *iv) {
         }
 
         // 策略 4: 快照 SBIconView（最终兜底）
-        // v1.6.2: 改用 renderInContext 捕获图层内容（而非屏幕合成）
-        // v1.6.3: 先试 iconImageView 的 image，再回退到 snapshot
-        // v1.6.4: 固定 128x128 渲染尺寸，避免尺寸不一致导致色相偏差
+        // v1.6.8: 优先拿真实已加载的图标图，避免 renderInContext
+        //   捕获到"未加载/占位"状态（部分 App 图标 image 此时为 nil，
+        //   导致取到的是单色剪影 → 颜色失真，如蓝图标算出绿色）。
+        //   顺序：iconImageView(KVC) → 递归子视图找 UIImageView → renderInContext。
         UIImage *img = nil;
-        for (UIView *sv in iv.subviews) {
-            if ([sv isKindOfClass:[UIImageView class]]) {
-                UIImageView *iview = (UIImageView *)sv;
-                if (iview.image) {
-                    img = iview.image;
-                    RDLog(@"IconImage: from UIImageView subview → OK");
-                    break;
-                }
+        // 4a: 直接问 SBIconView 的 iconImageView（最可靠，返回已加载的真实图标图）
+        @try {
+            id iconIV = [iv valueForKey:@"iconImageView"];
+            if ([iconIV isKindOfClass:[UIImageView class]] && ((UIImageView *)iconIV).image) {
+                img = ((UIImageView *)iconIV).image;
+                RDLog(@"IconImage: iconImageView (KVC) → OK");
             }
+        } @catch (NSException *e) {}
+        // 4b: 递归遍历子视图找 UIImageView（含嵌套层级）
+        if (!img) {
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:(UIView *)iv];
+            while (stack.count > 0) {
+                UIView *cur = [stack lastObject];
+                [stack removeLastObject];
+                if ([cur isKindOfClass:[UIImageView class]]) {
+                    UIImageView *iview = (UIImageView *)cur;
+                    if (iview.image) { img = iview.image; break; }
+                }
+                for (UIView *child in cur.subviews) [stack addObject:child];
+            }
+            if (img) RDLog(@"IconImage: from UIImageView subview → OK");
         }
         if (!img) {
             // 固定 128x128 渲染，平衡质量与性能
@@ -766,19 +745,22 @@ static UIColor *MKCachedIconColorForBundleID(NSString *bid) {
 // 始终锚定到 SBIconView（self），使指示器随图标滚动/布局，翻页后不丢失。
 // 标签存在时：相对 SBIconView 复刻标签位置（替换名字）；否则估算图标下方居中。
 static CGRect MKIndicatorFrameForIcon(SBIconView *iv, UIView *label, CGFloat indW, CGFloat indH) {
-    CGRect b = ((UIView *)iv).bounds;
+    UIView *me = (UIView *)iv;
+    CGRect b = me.bounds;
     if (b.size.width < 1 || b.size.height < 1) return CGRectZero;
+
     if (label && label.superview) {
-        // label 与 self 同属一个父视图（页面容器），frame 都在页面坐标系
-        CGRect lf = label.frame;
-        CGRect sf = ((UIView *)iv).frame;
-        CGFloat rx = lf.origin.x - sf.origin.x;
-        CGFloat ry = lf.origin.y - sf.origin.y;
-        return CGRectMake(rx + (lf.size.width - indW) / 2.0f,
-                         ry + (lf.size.height - indH) / 2.0f,
+        // v1.6.8: 改用 convertRect:toView: 把 label 的矩形转换到
+        // SBIconView 坐标系，不依赖 label 与图标是否有相同父视图。
+        // 旧实现用 label.frame - iv.frame 相减，当两者处于不同坐标
+        // 系（iOS 上名字标签常位于独立容器）时相减结果错误 → 指示器错位。
+        CGRect labelRect = [label.superview convertRect:label.frame toView:me];
+        return CGRectMake(labelRect.origin.x + (labelRect.size.width - indW) / 2.0f,
+                         labelRect.origin.y + (labelRect.size.height - indH) / 2.0f,
                          indW, indH);
     }
     // 无标签（Dock / 系统 App 名字未在层级）：图标下方居中
+    // 图标图形基本填满 bounds，标签位于 bounds 下方约 4pt、高度约 14pt
     CGFloat estimatedLabelY = b.size.height + 4.0f;
     CGFloat estimatedLabelH = 14.0f;
     return CGRectMake((b.size.width - indW) / 2.0f,
@@ -2083,8 +2065,8 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.6.7 ctor: anchor indicator to SBIconView + fix icon max-color algorithm");
-    RDLog(@"======== v1.6.7 loading (anchor to SBIconView; fix max-color keeps bright saturated colors; no green fallback cache) ========");
+    NSLog(@"[RunningDotIndicator] v1.6.8 ctor: rewrite max-color (HSB area mode) + fix indicator position via convertRect + better icon capture");
+    RDLog(@"======== v1.6.8 loading (rewrite most-frequent color as HSB area mode; fix position via convertRect; better icon capture) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
