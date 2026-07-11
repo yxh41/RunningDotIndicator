@@ -19,6 +19,14 @@ static const CGFloat kHeroPad    = 24.0f;
 static const CGFloat kCardRadius = 16.0f;
 static const CGFloat kCardAlpha  = 0.62f; // 卡片半透明 → 透出毛玻璃背景
 
+// 头图模拟图标尺寸（更精致，与真实桌面图标比例一致）
+static const CGFloat kIconSize   = 52.0f;
+static const CGFloat kIconRadius = 12.0f;
+static const CGFloat kGlyphSize  = 20.0f;
+static const CGFloat kGlyphRadius = 5.0f;
+static const CGFloat kIconTopY   = 34.0f;
+static const CGFloat kLabelAreaH = 14.0f; // 图标下方名称区域典型高度
+
 @interface MKRootListController ()
 @property (nonatomic, strong) UIView   *heroView;        // 顶部玻璃头图
 @property (nonatomic, strong) UIView   *previewIcon;     // 头图里的模拟 App 图标
@@ -102,16 +110,17 @@ static UIColor *MKColorFromHex(NSString *hex) {
         content.backgroundColor = [UIColor clearColor];
         [hero addSubview:content];
 
-        // 模拟 App 图标(圆角方块，强调色填充)
-        UIView *icon = [[UIView alloc] initWithFrame:CGRectMake(kHeroPad, 30, 60, 60)];
-        icon.layer.cornerRadius = 15;
+        // 模拟 App 图标（圆角方块，强调色填充；尺寸与真实图标一致）
+        UIView *icon = [[UIView alloc] initWithFrame:CGRectMake(kHeroPad, kIconTopY, kIconSize, kIconSize)];
+        icon.layer.cornerRadius = kIconRadius;
         icon.layer.masksToBounds = YES;
         [content addSubview:icon];
 
-        // 图标内白色 glyph
-        UIView *glyph = [[UIView alloc] initWithFrame:CGRectMake(18, 18, 24, 24)];
+        // 图标内白色 glyph（比例适中，避免绿色外圈过粗）
+        CGFloat glyphInset = (kIconSize - kGlyphSize) / 2.0f;
+        UIView *glyph = [[UIView alloc] initWithFrame:CGRectMake(glyphInset, glyphInset, kGlyphSize, kGlyphSize)];
         glyph.backgroundColor = [UIColor whiteColor];
-        glyph.layer.cornerRadius = 6;
+        glyph.layer.cornerRadius = kGlyphRadius;
         glyph.layer.masksToBounds = YES;
         [icon addSubview:glyph];
 
@@ -154,17 +163,18 @@ static UIColor *MKColorFromHex(NSString *hex) {
     CGFloat bh  = [[self readValueForKey:@"barHeight" default:@4]  floatValue];
 
     CGFloat w, h;
-    if (shape == 1) {                 // 横条
-        w = MAX(bw * 0.8f, 14.0f);
-        h = MAX(bh * 1.5f, 4.0f);
-    } else {                           // 圆点
-        CGFloat side = MAX(dot * 1.6f, 7.0f);
-        w = side; h = side;
+    if (shape == 1) {                 // 横条：与真实桌面使用完全一致尺寸
+        w = bw;
+        h = bh;
+    } else {                           // 圆点：与真实桌面使用完全一致尺寸
+        w = dot;
+        h = dot;
     }
 
-    // 指示器放在图标正下方，像主屏那样替换图标名称
+    // 指示器放在图标名称区域，与主屏真实位置一致
+    CGFloat iconBottom = CGRectGetMaxY(self.previewIcon.frame);
+    CGFloat iy = iconBottom + 4.0f + (kLabelAreaH - h) / 2.0f;
     CGFloat ix = CGRectGetMidX(self.previewIcon.frame) - w / 2.0f;
-    CGFloat iy = CGRectGetMaxY(self.previewIcon.frame) + 12.0f;
     self.previewIndicator.frame = CGRectMake(ix, iy, w, h);
     self.previewIndicator.layer.cornerRadius = h / 2.0f;
 }
@@ -175,7 +185,7 @@ static UIColor *MKColorFromHex(NSString *hex) {
     CGFloat W = self.heroView.bounds.size.width;
     if (W < 1) W = (self.view.bounds.size.width > 0) ? self.view.bounds.size.width : 320.0f;
 
-    CGFloat leftW = kHeroPad + 60.0f + 20.0f; // 图标 + 标题左侧间距
+    CGFloat leftW = kHeroPad + kIconSize + 20.0f; // 图标 + 标题左侧间距
     CGRect t1 = CGRectMake(leftW, 44, W - leftW - kHeroPad, 22);
     CGRect t2 = CGRectMake(leftW, 72, W - leftW - kHeroPad, 18);
     self.previewTitle.frame   = t1;
