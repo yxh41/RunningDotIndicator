@@ -15,7 +15,6 @@ static NSString * const kReloadNotification = @"com.mk.runningdotindicator.reloa
 
 // ── 2026 玻璃风格常量 ──
 static const CGFloat kHeroHeight = 150.0f;
-static const CGFloat kHeroPad    = 24.0f;
 static const CGFloat kCardRadius = 16.0f;
 static const CGFloat kCardAlpha  = 0.62f; // 卡片半透明 → 透出毛玻璃背景
 
@@ -24,7 +23,7 @@ static const CGFloat kIconSize   = 52.0f;
 static const CGFloat kIconRadius = 12.0f;
 static const CGFloat kGlyphSize  = 20.0f;
 static const CGFloat kGlyphRadius = 5.0f;
-static const CGFloat kIconTopY   = 34.0f;
+static const CGFloat kIconTopY   = 20.0f;
 static const CGFloat kLabelAreaH = 14.0f; // 图标下方名称区域典型高度
 
 @interface MKRootListController ()
@@ -111,7 +110,8 @@ static UIColor *MKColorFromHex(NSString *hex) {
         [hero addSubview:content];
 
         // 模拟 App 图标（圆角方块，强调色填充；尺寸与真实图标一致）
-        UIView *icon = [[UIView alloc] initWithFrame:CGRectMake(kHeroPad, kIconTopY, kIconSize, kIconSize)];
+        // x 由 layoutHero 统一居中定位，这里先给占位
+        UIView *icon = [[UIView alloc] initWithFrame:CGRectMake(0, kIconTopY, kIconSize, kIconSize)];
         icon.layer.cornerRadius = kIconRadius;
         icon.layer.masksToBounds = YES;
         [content addSubview:icon];
@@ -124,16 +124,18 @@ static UIColor *MKColorFromHex(NSString *hex) {
         glyph.layer.masksToBounds = YES;
         [icon addSubview:glyph];
 
-        // 标题行
+        // 标题行（居中）
         UILabel *title = [[UILabel alloc] initWithFrame:CGRectZero];
         title.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+        title.textAlignment = NSTextAlignmentCenter;
         if (@available(iOS 13.0, *)) title.textColor = [UIColor labelColor];
         else title.textColor = [UIColor blackColor];
         [content addSubview:title];
 
-        // 副标题
+        // 副标题（居中）
         UILabel *cap = [[UILabel alloc] initWithFrame:CGRectZero];
         cap.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
+        cap.textAlignment = NSTextAlignmentCenter;
         if (@available(iOS 13.0, *)) cap.textColor = [UIColor secondaryLabelColor];
         else cap.textColor = [UIColor grayColor];
         [content addSubview:cap];
@@ -179,18 +181,25 @@ static UIColor *MKColorFromHex(NSString *hex) {
     self.previewIndicator.layer.cornerRadius = h / 2.0f;
 }
 
-// 头图内子视图按当前宽度排版
+// 头图内子视图按当前宽度排版（整体水平居中，纵向：图标 → 指示器 → 标题 → 副标题）
 - (void)layoutHero {
     if (!self.heroView) return;
     CGFloat W = self.heroView.bounds.size.width;
     if (W < 1) W = (self.view.bounds.size.width > 0) ? self.view.bounds.size.width : 320.0f;
 
-    CGFloat leftW = kHeroPad + kIconSize + 20.0f; // 图标 + 标题左侧间距
-    CGRect t1 = CGRectMake(leftW, 44, W - leftW - kHeroPad, 22);
-    CGRect t2 = CGRectMake(leftW, 72, W - leftW - kHeroPad, 18);
-    self.previewTitle.frame   = t1;
-    self.previewCaption.frame = t2;
+    CGFloat centerX = W / 2.0f;
+
+    // 图标水平居中
+    self.previewIcon.frame = CGRectMake(centerX - kIconSize / 2.0f, kIconTopY, kIconSize, kIconSize);
+
+    // 指示器放在图标名称区域，与主屏真实位置一致（已按图标中点居中）
     [self updateIndicatorFrame];
+
+    // 标题 / 副标题居中排在指示器下方
+    CGFloat textTop = CGRectGetMaxY(self.previewIcon.frame)
+                    + kLabelAreaH + 18.0f; // 名称区域 + 间距
+    self.previewTitle.frame   = CGRectMake(0, textTop, W, 22);
+    self.previewCaption.frame = CGRectMake(0, textTop + 24, W, 18);
 }
 
 // 刷新头图：读取当前设置 → 重绘预览 + 强调色联动
