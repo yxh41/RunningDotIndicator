@@ -219,26 +219,52 @@ static UIColor *MKColorFromHex(NSString *hex) {
     } @catch (NSException *e) {}
 }
 
+// 防御式取表视图：PSListController 在 iOS 各版本上暴露的属性名不同
+// （有的叫 table，有的叫 tableView），用 respondsToSelector + performSelector 兜底，
+// 避免“未声明选择器”导致的编译失败或运行崩溃
+- (UITableView *)mk_table {
+    @try {
+        if ([self respondsToSelector:@selector(table)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            id t = [self performSelector:@selector(table)];
+#pragma clang diagnostic pop
+            if ([t isKindOfClass:[UITableView class]]) return t;
+        }
+        if ([self respondsToSelector:@selector(tableView)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            id t = [self performSelector:@selector(tableView)];
+#pragma clang diagnostic pop
+            if ([t isKindOfClass:[UITableView class]]) return t;
+        }
+    } @catch (NSException *e) {}
+    return nil;
+}
+
 #pragma mark - 生命周期
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     @try {
-        // 表格背景透出毛玻璃
-        self.table.backgroundColor = [UIColor clearColor];
-        if (@available(iOS 13.0, *)) {
-            UIBlurEffect *b = [UIBlurEffect effectWithStyle:UIBlurEffectStyleRegular];
-            UIVisualEffectView *bg = [[UIVisualEffectView alloc] initWithEffect:b];
-            bg.userInteractionEnabled = NO;
-            self.table.backgroundView = bg;
+        UITableView *t = [self mk_table];
+        if (t) {
+            // 表格背景透出毛玻璃
+            t.backgroundColor = [UIColor clearColor];
+            if (@available(iOS 13.0, *)) {
+                UIBlurEffect *b = [UIBlurEffect effectWithStyle:UIBlurEffectStyleRegular];
+                UIVisualEffectView *bg = [[UIVisualEffectView alloc] initWithEffect:b];
+                bg.userInteractionEnabled = NO;
+                t.backgroundView = bg;
+            }
+            // 隐藏系统分隔线，改用悬浮玻璃卡片
+            t.separatorStyle = UITableViewCellSeparatorStyleNone;
+            t.separatorColor  = [UIColor clearColor];
         }
-        // 隐藏系统分隔线，改用悬浮玻璃卡片
-        self.table.separatorStyle = UITableViewCellSeparatorStyleNone;
-        self.table.separatorColor  = [UIColor clearColor];
 
         [self ensureHero];
-        if (self.heroView) {
-            self.table.tableHeaderView = self.heroView;
+        if (self.heroView && t) {
+            t.tableHeaderView = self.heroView;
             [self refreshHero];
         }
     } @catch (NSException *e) {}
@@ -249,7 +275,8 @@ static UIColor *MKColorFromHex(NSString *hex) {
     @try {
         if (self.heroView) {
             // reload 可能丢弃 tableHeaderView，这里重新挂接
-            self.table.tableHeaderView = self.heroView;
+            UITableView *t = [self mk_table];
+            if (t) t.tableHeaderView = self.heroView;
             [self refreshHero];
 
             if (!self.heroAnimated) {
