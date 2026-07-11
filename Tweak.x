@@ -446,6 +446,146 @@ static UIColor *MKDominantColorFromImage(UIImage *image) {
     return [UIColor colorWithHue:finalHue saturation:finalSat brightness:finalBri alpha:1.0f];
 }
 
+// ─── 图标最大颜色提取 ─── v1.6.6 ───
+// 从 App 图标提取出现面积最大的颜色，用于 AutoIcon 的另一种策略。
+// 与主色(dominant)不同：dominant 按色相+饱和度加权，最大颜色按像素数量计数。
+// 优点：纯色块图标（如 TestFlight 红色背景）更准确。
+// 实现：
+//   • 24x24 采样
+//   • 每通道量化到 8 级（512 个桶），将相似颜色合并
+//   • 过滤透明、纯白、纯黑像素
+//   • 圆形中心加权，避免圆角/边缘伪影
+//   • 取计数最高的桶，返回桶内平均 RGB
+static UIColor *MKMostFrequentColorFromImage(UIImage *image) {
+    if (!image) return nil;
+    CGImageRef cgImg = image.CGImage;
+    if (!cgImg) return nil;
+
+    const int SW = 24, SH = 24;
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    unsigned char *pixels = (unsigned char *)malloc(SW * SH * 4);
+    if (!pixels) {
+        CGColorSpaceRelease(colorSpace);
+        return nil;
+    }
+    CGContextRef ctx = CGBitmapContextCreate(pixels, SW, SH, 8, SW * 4, colorSpace,
+                                             (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    if (!ctx) {
+        free(pixels);
+        CGColorSpaceRelease(colorSpace);
+        return nil;
+    }
+
+    CGContextDrawImage(ctx, CGRectMake(0, 0, SW, SH), cgImg);
+    CGContextRelease(ctx);
+    CGColorSpaceRelease(colorSpace);
+
+    // 每通道 8 级 → 512 个颜色桶
+    const int LEVELS = 8;
+    const int BUCKETS = LEVELS * LEVELS * LEVELS;
+    float counts[BUCKETS] = {0};
+    float rSum[BUCKETS] = {0};
+    float gSum[BUCKETS] = {0};
+    float bSum[BUCKETS] = {0};
+
+    const CGFloat kMinAlpha = 0.3f;
+    const CGFloat kMinBri = 0.06f;
+    const CGFloat kMaxBri = 0.96f;
+
+    const CGFloat kMaxDist = sqrtf((SW/2.0f)*(SW/2.0f) + (SH/2.0f)*(SH/2.0f));
+
+    for (int y = 0; y < SH; y++) {
+        for (int x = 0; x < SW; x++) {
+            int i = y * SW + x;
+            CGFloat r = pixels[i * 4]     / 255.0f;
+            CGFloat g = pixels[i * 4 + 1] / 255.0f;
+            CGFloat b = pixels[i * 4 + 2] / 255.0f;
+            CGFloat a = pixels[i * 4 + 3] / 255.0f;
+
+            if (a < kMinAlpha) continue;
+
+            // 过滤接近纯白/纯黑的像素（背景、边框、阴影）
+            CGFloat maxC = MAX(MAX(r, g), b);
+            if (maxC > kMaxBri || maxC < kMinBri) continue;
+
+            // 圆形中心加权
+            CGFloat dx = x - (SW - 1) / 2.0f;
+            CGFloat dy = y - (SH - 1) / 2.0f;
+            CGFloat dist = sqrtf(dx*dx + dy*dy);
+            CGFloat normDist = dist / kMaxDist;
+            CGFloat centerWeight = 1.0f - normDist * 0.6f;
+            if (centerWeight < 0.35f) centerWeight = 0.35f;
+
+            int rLvl = (int)(r * (LEVELS - 1) + 0.5f);
+            int gLvl = (int)(g * (LEVELS - 1) + 0.5f);
+            int bLvl = (int)(b * (LEVELS - 1) + 0.5f);
+            rLvl = MAX(0, MIN(LEVELS - 1, rLvl));
+            gLvl = MAX(0, MIN(LEVELS - 1, gLvl));
+            bLvl = MAX(0, MIN(LEVELS - 1, bLvl));
+
+            int bucket = rLvl * LEVELS * LEVELS + gLvl * LEVELS + bLvl;
+
+            counts[bucket] += centerWeight;
+            rSum[bucket] += r * centerWeight;
+            gSum[bucket] += g * centerWeight;
+            bSum[bucket] += b * centerWeight;
+        }
+    }
+
+    free(pixels);
+
+    int bestBucket = -1;
+    float bestCount = 0;
+    for (int i = 0; i < BUCKETS; i++) {
+        if (counts[i] > bestCount) {
+            bestCount = counts[i];
+            bestBucket = i;
+        }
+    }
+
+    // 没找到有效彩色像素 → 返回 1x1 平均色
+    if (bestBucket < 0 || bestCount < 0.3f) {
+        CGColorSpaceRef cs2 = CGColorSpaceCreateDeviceRGB();
+        unsigned char px[4] = {0};
+        CGContextRef ctx2 = CGBitmapContextCreate(px, 1, 1, 8, 4, cs2,
+                                                  (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+        if (ctx2) {
+            CGContextDrawImage(ctx2, CGRectMake(0, 0, 1, 1), cgImg);
+            CGFloat rr = px[0] / 255.0f, gg = px[1] / 255.0f, bb = px[2] / 255.0f;
+            CGContextRelease(ctx2);
+            CGColorSpaceRelease(cs2);
+            UIColor *raw = [UIColor colorWithRed:rr green:gg blue:bb alpha:1.0f];
+            CGFloat h, s, br;
+            [raw getHue:&h saturation:&s brightness:&br alpha:nil];
+            s = MIN(s * 1.4f, 1.0f);
+            return [UIColor colorWithHue:h saturation:s brightness:br alpha:1.0f];
+        }
+        CGColorSpaceRelease(cs2);
+        return nil;
+    }
+
+    CGFloat finalR = rSum[bestBucket] / counts[bestBucket];
+    CGFloat finalG = gSum[bestBucket] / counts[bestBucket];
+    CGFloat finalB = bSum[bestBucket] / counts[bestBucket];
+
+    UIColor *raw = [UIColor colorWithRed:finalR green:finalG blue:finalB alpha:1.0f];
+    CGFloat h, s, br;
+    [raw getHue:&h saturation:&s brightness:&br alpha:nil];
+
+    // 亮度调整保证可见
+    if (br < 0.25f) br = 0.25f + br * 0.6f;
+    else if (br > 0.88f) br = 0.88f - (1.0f - br) * 0.6f;
+
+    // 饱和度增强
+    s = MIN(s * 1.3f, 1.0f);
+    if (s < 0.45f) {
+        s = s * 1.5f + 0.15f;
+        if (s > 0.9f) s = 0.9f;
+    }
+
+    return [UIColor colorWithHue:h saturation:s brightness:br alpha:1.0f];
+}
+
 // 尝试从 SBIconView/SBIcon 获取图标 UIImage
 // v1.6.2: 修复 performSelector:withObject: 传递 NSNumber* 给期望 CGFloat 参数的方法导致 ABI 不匹配
 static UIImage *MKGetIconImage(SBIconView *iv) {
@@ -552,7 +692,8 @@ static UIImage *MKGetIconImage(SBIconView *iv) {
     return nil;
 }
 
-// 获取指定 bundleID 的图标平均色（带缓存）
+// 获取指定 bundleID 的图标颜色（带缓存）
+// v1.6.6: 根据 colorMode 选择主色(dominant)或最大颜色(most frequent)
 static UIColor *MKCachedIconColorForBundleID(NSString *bid) {
     if (!sIconColorCache) sIconColorCache = [NSMutableDictionary dictionary];
     UIColor *cached = sIconColorCache[bid];
@@ -561,6 +702,7 @@ static UIColor *MKCachedIconColorForBundleID(NSString *bid) {
     // 需要找到对应的 SBIconView 才能获取图标
     // 从当前视图层级搜索
     UIColor *result = nil;
+    MKColorMode mode = [[MKConfig sharedConfig] colorMode];
     NSArray *windows = [UIApplication sharedApplication].windows;
     for (UIWindow *window in windows) {
         NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
@@ -572,7 +714,12 @@ static UIColor *MKCachedIconColorForBundleID(NSString *bid) {
                 NSString *ivBid = MKGetCachedBid(iv);
                 if (ivBid && [ivBid isEqualToString:bid]) {
                     UIImage *img = MKGetIconImage(iv);
-                    result = MKDominantColorFromImage(img);
+                    if (mode == MKColorModeMostFrequent) {
+                        result = MKMostFrequentColorFromImage(img);
+                        RDLog(@"IconMostFrequent: %@", bid);
+                    } else {
+                        result = MKDominantColorFromImage(img);
+                    }
                     if (result) break;  // 找到就停
                 }
             }
@@ -1549,6 +1696,8 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
                                     CFStringRef name, const void *object,
                                     CFDictionaryRef userInfo) {
     [[MKConfig sharedConfig] reload];
+    // v1.6.6: 颜色模式改变后需要重新取色，清空缓存
+    sIconColorCache = nil;
     MKRefreshAllIcons();
 }
 
@@ -1561,9 +1710,10 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
 - (void)didMoveToWindow {
     %orig;
     if (!self.window) {
-        // View 从窗口移除 → 清理指示器 + 恢复标签 + 清除缓存
-        UIView *indicator = MKGetIndicator(self);
-        if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
+        // View 从窗口移除 → 恢复标签 + 清除缓存
+        // v1.6.6: 不再主动移除指示器，避免桌面页面滑动后指示器消失再重建。
+        // 指示器会随父视图一起移出窗口；图标回到窗口时，MKUpdate 的 hostViewChanged
+        // 逻辑会检测到 superview 变化并直接重新挂接（animate=0，无闪烁）。
         UIView *label = MKGetCachedLabel(self);
         if (label) {
             label.hidden = NO;
