@@ -300,7 +300,7 @@ static UIColor *MKColorFromHex(NSString *hex) {
 // 旋转/尺寸变化时重排头图
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    if (self.heroView) [self layoutHero];
+    @try { if (self.heroView) [self layoutHero]; } @catch (NSException *e) {}
 }
 
 #pragma mark - 玻璃卡片(每组一行圆角半透明)
@@ -308,7 +308,15 @@ static UIColor *MKColorFromHex(NSString *hex) {
 - (void)tableView:(UITableView *)tableView
   willDisplayCell:(UITableViewCell *)cell
 forRowAtIndexPath:(NSIndexPath *)indexPath {
-    [super tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
+    // ⚠️ 关键修复 v1.6.15：iOS 16 的 PSListController 很可能【未实现】
+    //   tableView:willDisplayCell:forRowAtIndexPath:，无条件 [super ...] 会抛
+    //   unrecognized selector → 整个设置 App 闪退（进本页即崩，其他页正常）。
+    //   仅当父类确实实现该方法时才调 super；同时整段 @try 兜底，绝不外抛异常。
+    if ([[self superclass] instancesRespondToSelector:_cmd]) {
+        @try {
+            [super tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
+        } @catch (NSException *e) {}
+    }
     @try {
         cell.backgroundColor = [UIColor clearColor];
 
