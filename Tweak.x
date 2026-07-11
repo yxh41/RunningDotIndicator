@@ -1112,6 +1112,7 @@ static void MKUpdate(SBIconView *self) {
         // v1.5.3: 使用缓存的标签视图（避免每次都跑 MKFindLabelView 4 重策略）
         UIView *label = MKGetCachedLabel(self);
         UIView *indicator = MKGetIndicator(self);
+        BOOL hostViewChanged = NO;  // v1.6.5: 标记宿主视图变化（转场/文件夹重建）
 
         // 当前被用户打开在前台的 App，桌面上不再显示指示器（避免启动动画残留）
         if (!running || isForeground) {
@@ -1213,8 +1214,10 @@ static void MKUpdate(SBIconView *self) {
             }
         }
 
-        // 宿主视图变了 → 需要重新添加指示器
+        // 宿主视图变了 → 需要重新添加指示器（转场/文件夹场景）
+        // v1.6.5: 标记 hostViewChanged，重建时直接显示而非重新渐显，避免视觉闪烁
         if (indicator && indicator.superview != hostView) {
+            hostViewChanged = YES;
             [indicator removeFromSuperview];
             indicator = nil;
             MKSetIndicator(self, nil);
@@ -1234,7 +1237,9 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.7: 渐显动画 — 状态切换时指示器 alpha 0→cfg.opacity 200ms
             BOOL shouldAnimate = MKShouldAnimateIndicator(bundleID);
-            MKRemoveAnimateIndicator(bundleID);  // 消费标记（一次性）
+            MKRemoveAnimateIndicator(bundleID);
+            // v1.6.5: 宿主视图变化导致的重建（文件夹/转场）→ 直接显示，不重新渐显避免闪烁
+            if (hostViewChanged) shouldAnimate = NO;  // 消费标记（一次性）
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             RDLog(@"Indicator CREATE: %@ shape=%d animate=%d label=%@",
