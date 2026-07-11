@@ -275,47 +275,85 @@ static void MKRemoveFadingLabel(NSString *bid) {
     if (sFadingLabelBIDs) [sFadingLabelBIDs removeObject:bid];
 }
 
-// ─── 图标平均色采样 ─── v1.5.7 ───
-// 从 App 图标取平均色，用于 AutoIcon 颜色模式
-// 方法：尝试 SBIcon/SBIconView accessor 获取图标 UIImage → 渲染到 1x1 位图 → 取像素值
+// ─── 图标平均色采样 ─── v1.5.7 / v1.6.10 改进 ───
+// 从 App 图标取“加权平均色”，用于 AutoIcon 颜色模式
+// 方法：尝试 SBIcon/SBIconView accessor 获取图标 UIImage → 缩到 32x32 采样
+//       → 剔除透明/近白/近黑/近灰像素 → 对剩余按 饱和度×亮度 加权求平均
 // 加亮度/饱和度调整保证指示器在桌面背景上可见
+// v1.6.10 改进：加权平均色（不再是 1x1 直接均值）
+// 旧版把整张图标缩到 1x1 → 所有像素算术平均 → 多彩图标被平均成灰
+//   （日志里微信/短信都成了 0.3 0.3 0.3 就是这个原因）
+// 新版：缩到 32x32 采样，剔除 透明/近白/近黑/近灰(低饱和) 像素，
+//       对剩余像素按 饱和度×亮度 加权求平均 → 结果偏向图标品牌主色，更搭配
 static UIColor *MKAverageColorFromImage(UIImage *image) {
     if (!image) return nil;
     CGImageRef cgImg = image.CGImage;
     if (!cgImg) return nil;
 
+    const int S = 32; // 采样分辨率
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    unsigned char pixels[4] = {0};
-    CGContextRef ctx = CGBitmapContextCreate(pixels, 1, 1, 8, 4, colorSpace,
+    unsigned char *pixels = (unsigned char *)calloc((size_t)S * S, 4);
+    CGContextRef ctx = CGBitmapContextCreate(pixels, S, S, 8, S * 4, colorSpace,
                                              (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
     if (!ctx) {
+        free(pixels);
         CGColorSpaceRelease(colorSpace);
         return nil;
     }
 
-    // 渲染图标到 1x1 位图 → 所有像素被平均为单点
-    CGContextDrawImage(ctx, CGRectMake(0, 0, 1, 1), cgImg);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, S, S), cgImg);
 
-    CGFloat r = pixels[0] / 255.0f;
-    CGFloat g = pixels[1] / 255.0f;
-    CGFloat b = pixels[2] / 255.0f;
+    CGFloat sumR = 0, sumG = 0, sumB = 0, sumW = 0;          // 加权累计
+    CGFloat pSumR = 0, pSumG = 0, pSumB = 0, pCount = 0;    // 不透明像素普通均值(兜底)
 
+    for (int i = 0; i < S * S; i++) {
+        unsigned char *p = pixels + i * 4;
+        CGFloat a = p[3] / 255.0f;
+        if (a < 0.5f) continue; // 跳过透明（圆角/遮罩外）
+
+        // 去 premultiply 还原真实 RGB
+        CGFloat r = (p[0] / 255.0f) / a;
+        CGFloat g = (p[1] / 255.0f) / a;
+        CGFloat b = (p[2] / 255.0f) / a;
+
+        pSumR += r; pSumG += g; pSumB += b; pCount += 1.0f;
+
+        CGFloat hue, sat, br, al;
+        UIColor *c = [UIColor colorWithRed:r green:g blue:b alpha:1.0f];
+        [c getHue:&hue saturation:&sat brightness:&br alpha:&al];
+
+        // 剔除会把平均色“洗”成灰的像素 —— 这是旧版发灰的根因
+        if (br > 0.96f && sat < 0.12f) continue; // 近白（高亮低饱和，如白底）
+        if (br < 0.07f) continue;                 // 近黑（阴影/黑边）
+        if (sat < 0.10f) continue;                // 近灰（低饱和中性色）
+
+        // 权重：越鲜艳、越亮权重越高 → 偏向品牌主色
+        CGFloat w = sat * (0.4f + 0.6f * br);
+        sumR += r * w; sumG += g * w; sumB += b * w; sumW += w;
+    }
+
+    UIColor *raw = nil;
+    if (sumW > 0.001f) {
+        raw = [UIColor colorWithRed:(sumR / sumW) green:(sumG / sumW) blue:(sumB / sumW) alpha:1.0f];
+    } else if (pCount > 0) {
+        // 图标本身近似灰阶（品牌色极少）→ 退回不透明像素普通均值，保持“平均色”语义
+        raw = [UIColor colorWithRed:(pSumR / pCount) green:(pSumG / pCount) blue:(pSumB / pCount) alpha:1.0f];
+    }
+
+    free(pixels);
     CGContextRelease(ctx);
     CGColorSpaceRelease(colorSpace);
+    if (!raw) return nil;
 
-    // 转换到 HSB 调整亮度/饱和度保证可见性
-    UIColor *raw = [UIColor colorWithRed:r green:g blue:b alpha:1.0f];
+    // 可见性保护：保证指示器在浅/深色桌面背景上都看得清
     CGFloat hue, sat, brightness, alpha;
     [raw getHue:&hue saturation:&sat brightness:&brightness alpha:&alpha];
-
-    // 暗色提亮（亮度 < 0.3 → 提到 0.3+），亮色压暗（亮度 > 0.85 → 压到 0.85-）
-    if (brightness < 0.3f) {
-        brightness = 0.3f + brightness * 0.5f;
+    if (brightness < 0.30f) {
+        brightness = 0.30f + brightness * 0.5f;
     } else if (brightness > 0.85f) {
         brightness = 0.85f - (1.0f - brightness) * 0.5f;
     }
-    // 略增饱和度让指示器更鲜艳
-    sat = MIN(sat * 1.3f, 1.0f);
+    sat = MIN(sat * 1.25f, 1.0f);
 
     return [UIColor colorWithHue:hue saturation:sat brightness:brightness alpha:1.0f];
 }
@@ -1762,8 +1800,8 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
 %ctor {
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.6.9 ctor: based on 1.6.1 baseline + average-color gray fix + remove respring");
-    RDLog(@"======== v1.6.9 loading (reverted to 1.6.1 baseline; keep gray fix for average color; no respring button; Lynx2 wording dropped) ========");
+    NSLog(@"[RunningDotIndicator] v1.6.10 ctor: 1.6.1 baseline + weighted-average icon color + remove respring");
+    RDLog(@"======== v1.6.10 loading (1.6.1 baseline; weighted-average icon color; no respring button; Lynx2 wording dropped) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
