@@ -1114,44 +1114,28 @@ static void MKUpdate(SBIconView *self) {
         UIView *hostView;
         CGRect indicatorFrame;
 
+        // v1.6.32: 指示器直接挂到 self（SBIconView），而非 label.superview。
+        // 根因（诊断版 rd_log(56) 证实）：翻页/滚动时 SpringBoard 会重父化或重建 label 及其 superview，
+        // 之前挂在 label.superview 上会被一起带走 → 指示器被销毁重建（轻历 1 分钟内被 CREATE 22 次、几乎全 animate=0），
+        // 重建的瞬窗里图标没有指示器，于是「划到某屏时没点、划走再划回才有」。
+        // self 在翻页时只随 scroll 平移、不被重父化，挂 self 上指示器永不失联；frame 用 label 相对 self.bounds 折算。
+        hostView = self;
+        CGRect labelFrameInSelf;
         if (label && label.superview) {
-            // 标签找到 → 指示器放在标签位置（替换名字）
-            hostView = label.superview;
-            CGRect labelFrame = label.frame;
-            indicatorFrame = CGRectMake(
-                labelFrame.origin.x + (labelFrame.size.width - indicatorW) / 2.0f,
-                labelFrame.origin.y + (labelFrame.size.height - indicatorH) / 2.0f,
-                indicatorW,
-                indicatorH
-            );
+            // 标签存在且在层级中 → 折算到 self 坐标系
+            labelFrameInSelf = [label convertRect:label.bounds toView:self];
         } else {
-            // v1.5.9: 无标签 → 估算标签位置（图标下方居中）
-            // 对于 Dock 图标：确实没有标签，估算位置跟之前差不多
-            // 对于系统 App（AppStore/Preferences）：标签不在视图层级中，但指示器应出现在名字区域
-            UIView *host = self.superview;
-            if (host) {
-                hostView = host;
-                CGRect iconFrame = self.frame;
-                CGFloat estimatedLabelY = iconFrame.origin.y + iconFrame.size.height + 4.0f;
-                CGFloat estimatedLabelH = 14.0f;
-                indicatorFrame = CGRectMake(
-                    iconFrame.origin.x + (iconFrame.size.width - indicatorW) / 2.0f,
-                    estimatedLabelY + (estimatedLabelH - indicatorH) / 2.0f,
-                    indicatorW,
-                    indicatorH
-                );
-            } else {
-                hostView = self;
-                CGSize mySize = self.bounds.size;
-                if (mySize.width < 10 || mySize.height < 10) return;
-                indicatorFrame = CGRectMake(
-                    (mySize.width - indicatorW) / 2.0f,
-                    mySize.height - indicatorH - 4.0f,
-                    indicatorW,
-                    indicatorH
-                );
-            }
+            // 无标签（Dock / 系统 App）→ 估算图标下方区域（self.bounds 坐标系）
+            CGSize mySize = self.bounds.size;
+            if (mySize.width < 10 || mySize.height < 10) return;
+            labelFrameInSelf = CGRectMake(0, mySize.height + 4.0f, mySize.width, 14.0f);
         }
+        indicatorFrame = CGRectMake(
+            labelFrameInSelf.origin.x + (labelFrameInSelf.size.width - indicatorW) / 2.0f,
+            labelFrameInSelf.origin.y + (labelFrameInSelf.size.height - indicatorH) / 2.0f,
+            indicatorW,
+            indicatorH
+        );
 
         // 宿主视图变了 → 需要重新添加指示器
         if (indicator && indicator.superview != hostView) {
@@ -1603,36 +1587,12 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         return;
     }
 
-    // ── v1.6.31 DIAG：运行中后台 App 的指示器若挂错视图/不可见 → 记录，定位翻页消失根因 ──
-    // 仅当 bid 有效 && running && !foreground（即“应当有指示器却可能坏了”）时检查；出错也不影响正常流程。
-    {
-        UIView *ind = MKGetIndicator(self);
-        if (ind) {
-            // 预期 hostView（与 MKUpdate 同算法：label.superview → self.superview → self）
-            UIView *hostView = nil;
-            UIView *label = MKGetCachedLabel(self);
-            if (label && label.superview) hostView = label.superview;
-            else if (self.superview)      hostView = self.superview;
-            else                           hostView = self;
-            BOOL wrongHost = (ind.superview != hostView);
-            BOOL invisible  = (ind.alpha <= 0.01f || ind.hidden || ind.superview == nil);
-            if (wrongHost || invisible) {
-                RDLog(@"[DIAG orphan] bid=%@ running=YES fg=NO | ind.superview=%@ expectedHost=%@ | alpha=%.2f hidden=%d frame=%@ | label.superview=%@",
-                      bid,
-                      ind.superview ? NSStringFromClass([ind.superview class]) : @"(nil)",
-                      NSStringFromClass([hostView class]),
-                      (float)ind.alpha, ind.hidden,
-                      NSStringFromCGRect(ind.frame),
-                      (label && label.superview) ? NSStringFromClass([label.superview class]) : @"<no-label>");
-            }
-        }
-    }
 
     // v1.5.8: 标签正在渐隐 → 只重定位指示器，不操作标签（让动画自然播放）
     if (MKIsFadingLabel(bid)) {
         UIView *label = MKGetCachedLabel(self);
         if (indicator && label && label.superview) {
-            CGRect lf = label.frame;
+            CGRect lf = [label convertRect:label.bounds toView:self];
             CGFloat indW, indH;
             MKConfig *cfg = [MKConfig sharedConfig];
             if (cfg.shape == MKShapeDot) { indW = cfg.dotSize; indH = cfg.dotSize; }
@@ -1666,21 +1626,20 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         label.layer.opacity = 0.0f;
         label.opaque = NO;
         // 标签找到 → 指示器在标签中心
-        CGRect lf = label.frame;
+        CGRect lf = [label convertRect:label.bounds toView:self];
         indicator.frame = CGRectMake(
             lf.origin.x + (lf.size.width - indW) / 2.0f,
             lf.origin.y + (lf.size.height - indH) / 2.0f,
             indW, indH
         );
     } else if (self.superview) {
-        // v1.5.9: 无标签 → 估算标签位置（图标下方居中，替代图标底部边缘）
-        // 对于非 Dock 的系统 App（AppStore/Preferences 等），标签可能不在视图层级中
-        // 但指示器应该出现在名字标签应该出现的位置，而不是图标底部
-        CGRect icf = self.frame;
-        CGFloat estimatedLabelY = icf.origin.y + icf.size.height + 4.0f;  // 图标下方4pt间隙
+        // v1.5.9: 无标签 → 估算标签位置（图标下方居中）
+        // v1.6.32: 指示器现挂 self，用 self.bounds（图标自身坐标系）
+        CGRect icf = self.bounds;
+        CGFloat estimatedLabelY = icf.size.height + 4.0f;  // 图标下方4pt间隙
         CGFloat estimatedLabelH = 14.0f;  // iOS 标签典型高度
         indicator.frame = CGRectMake(
-            icf.origin.x + (icf.size.width - indW) / 2.0f,
+            (icf.size.width - indW) / 2.0f,
             estimatedLabelY + (estimatedLabelH - indH) / 2.0f,
             indW, indH
         );
@@ -1943,10 +1902,7 @@ static BOOL MKIsSupportedOS(void) {
     %init;
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
-    NSLog(@"[RunningDotIndicator] v1.6.31.diag1 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible; v1.6.31 running-set gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; DIAGNOSTIC BUILD: layoutSubviews logs [DIAG orphan] when a running-background app's indicator is on wrong hostView or invisible (to locate the page-swipe vanish root cause)");
-    RDLog(@"======== v1.6.31.diag1 DIAGNOSTIC loading (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups) ========");
-
-    if (MKIsDisabled()) {
+    NSLog(@"[RunningDotIndicator] v1.6.32 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible; v1.6.31 running-set gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; v1.6.32 indicator now attached to SBIconView directly (was label.superview, which SB reparents during page-swipe -> destroy/recreate churn, 22x/min for WDCalendar in rd_log(56); now stable across page swipes) {
         RDLog(@"DISABLED at load; exiting ctor.");
         return;
     }
