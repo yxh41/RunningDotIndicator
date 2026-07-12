@@ -1848,8 +1848,8 @@ static BOOL MKIsSupportedOS(void) {
 
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.6.24 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI (grouped cards, hero preview icon-left/text-right like 1.6.18) + settings list icon + Depends: ellekit + OS guard 16.3-16.5.1");
-    RDLog(@"======== v1.6.24 loading (1.6.1 baseline; dominant-color icon mode; fix: snapshot full-size for icon capture; no respring button; Lynx2 wording dropped; 2026 glass settings UI with grouped cards; hero preview icon-left/text-right like 1.6.18; settings list icon added; Depends changed mobilesubstrate -> ellekit; OS guard 16.3-16.5.1) ========");
+    NSLog(@"[RunningDotIndicator] v1.6.25 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI (grouped cards, hero preview icon-left/text-right like 1.6.18) + settings list icon + revert Depends: mobilesubstrate (ellekit made plugin its only real dep, broke injection chain on uninstall; v1.6.25 restores mobilesubstrate virtual-pkg dep) + OS guard 16.3-16.5.1");
+    RDLog(@"======== v1.6.25 loading (1.6.1 baseline; dominant-color icon mode; fix: snapshot full-size for icon capture; no respring button; Lynx2 wording dropped; 2026 glass settings UI with grouped cards; hero preview icon-left/text-right like 1.6.18; settings list icon added; Depends reverted ellekit -> mobilesubstrate to avoid breaking injection chain on uninstall; OS guard 16.3-16.5.1) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
