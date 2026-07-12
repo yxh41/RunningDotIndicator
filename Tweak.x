@@ -1,5 +1,8 @@
 //
-//  Tweak.x — RunningDotIndicator v1.6.27
+//  Tweak.x — RunningDotIndicator v1.6.28
+//  v1.6.28: 重加宽松 iOS 版本守卫（只挡 iOS 15 及更低，16.0+ 均挂钩）；
+//           修复「部分 App 指示器偶尔消失、桌面滑动才回来」——layoutSubviews 加孤儿自愈
+//           （指示器存在但 superview==nil 时立即 MKUpdate 重建，不等滚动触发）。
 //  v1.6.27: 移除 v1.6.24 加的 iOS 16.3-16.5.1 版本守卫（不再限制系统版本）
 //  v1.6.26: 性能优化（基于 16.4.1/roothide 真实运行日志分析）
 //    ✅ 文件夹/滚动刷新合并：删除冗余的 SBFolderController/SBIconListPageView hook，
@@ -1535,7 +1538,11 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
 
     // v1.5.3 性能优化：快速跳过不需要处理的图标
     UIView *indicator = MKGetIndicator(self);
-    if (!indicator) {
+    if (!indicator || (indicator && indicator.superview == nil)) {
+        // v1.6.28: 孤儿自愈 —— 指示器被 SpringBoard 在重布局时从宿主移除
+        // （SBIconView 对象仍在，关联对象仍指向这个 superview=nil 的不可见视图）。
+        // 若不处理，要等到下次滚动触发 MKUpdate 才发现 superview!=hostView 而重建
+        // （表现为「指示器偶尔消失，滑动一下又回来」）。这里在每次布局时立即重建。
         // 无指示器 → 只有运行中的后台 App 才需要创建
         NSString *bid = MKGetCachedBid(self);
         if (!bid || !MKIsAppRunning(bid) || MKIsForeground(bid)) return;
@@ -1854,14 +1861,30 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
 // 构造函数（只做最轻量工作）
 // ====================================================================
 
-// 注：v1.6.24 曾加 iOS 16.3-16.5.1 版本守卫（MKIsSupportedOS），
-// 在 v1.6.27 已移除 —— 不再限制系统版本，全 iOS 16.x 均挂钩。
+// 宽松系统版本守卫（v1.6.28 重加，仅挡老系统）：
+//   只挡 iOS 15 及更低（majorVersion < 16），避免 iOS 15/14 上因 16.x 私有 API 崩溃。
+//   上限开放（iOS 16.x / 16.6+ 均挂钩）。
+//   注：SBApplicationProcessState 等私有类为 iOS 16.3+ 引入；16.0–16.2 上挂钩不崩，
+//       但进程状态检测可能降级（hook 不触发），指示器可能不显示——属已知边界，不硬崩。
+static BOOL MKIsSupportedOS(void) {
+    NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
+    return (v.majorVersion >= 16);
+}
+
 %ctor {
+    NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
+    if (!MKIsSupportedOS()) {
+        NSLog(@"[RunningDotIndicator] ctor: iOS %ld.%ld unsupported (need iOS 16+), skip hooking.",
+              (long)v.majorVersion, (long)v.minorVersion);
+        RDLog(@"======== ctor: iOS < 16 (need 16+) unsupported, skip hooking ========");
+        return; // 不调用 %init → 不挂钩 → 老系统优雅失效
+    }
+
     %init;
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
-    NSLog(@"[RunningDotIndicator] v1.6.27 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); debug-log gate (rd_debug file) + icon-color miss one-shot retry; v1.6.27 removed iOS 16.3-16.5.1 OS guard (no version restriction now)");
-    RDLog(@"======== v1.6.27 loading (perf focus: folder/scroll refresh coalesced; indicator reused across off-screen; debug logging gated behind /var/mobile/Documents/rd_debug; icon-color miss self-heals next runloop; iOS version guard removed) ========");
+    NSLog(@"[RunningDotIndicator] v1.6.28 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); debug-log gate (rd_debug file) + icon-color miss one-shot retry; v1.6.28 re-add relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe')");
+    RDLog(@"======== v1.6.28 loading (perf focus: folder/scroll refresh coalesced; indicator reused across off-screen; debug logging gated behind /var/mobile/Documents/rd_debug; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal added) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
