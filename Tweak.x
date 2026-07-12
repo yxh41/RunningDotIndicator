@@ -149,11 +149,17 @@ static NSString *MKGetCachedBid(SBIconView *iv) {
     // v1.6.0: 过滤文件夹图标 — 精确匹配，不误杀文件夹内App
     // 旧版 containsString:@"Folder" 可能误杀类名含 Folder 的App图标
     // 只过滤 SBFolderIcon（文件夹本身的复合图标），不过滤文件夹内的App图标
-    NSString *iconCls = NSStringFromClass([icon class]);
-    Class folderIconClass = NSClassFromString(@"SBFolderIcon");
-    if ((folderIconClass && [icon isKindOfClass:folderIconClass]) ||
-        [iconCls isEqualToString:@"SBFolderIcon"] ||
-        [iconCls isEqualToString:@"SBIconFolderIcon"]) {
+    // v1.6.31: 常量类静态化 —— 避免每个图标每次 layoutSubviews 都跑
+    // NSStringFromClass + 2×NSClassFromString + 2×字符串比较（纯边角料、行为不变）
+    static Class sFolderIconClass = Nil;
+    static Class sIconFolderIconClass = Nil;
+    static dispatch_once_t sFolderClsOnce;
+    dispatch_once(&sFolderClsOnce, ^{
+        sFolderIconClass     = NSClassFromString(@"SBFolderIcon");
+        sIconFolderIconClass = NSClassFromString(@"SBIconFolderIcon");
+    });
+    if ((sFolderIconClass     && [icon isKindOfClass:sFolderIconClass]) ||
+        (sIconFolderIconClass && [icon isKindOfClass:sIconFolderIconClass])) {
         return nil;
     }
 
@@ -481,7 +487,7 @@ static UIColor *MKCachedIconColorForBundleID(NSString *bid) {
         while (stack.count > 0) {
             UIView *current = [stack lastObject];
             [stack removeLastObject];
-            if ([current isKindOfClass:NSClassFromString(@"SBIconView")]) {
+            if ([current isKindOfClass:MKSBIconViewClass()]) {
                 SBIconView *iv = (SBIconView *)current;
                 NSString *ivBid = MKGetCachedBid(iv);
                 if (ivBid && [ivBid isEqualToString:bid]) {
@@ -726,7 +732,8 @@ static void MKSyncFromSBAppCtrl() {
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
             NSString *bid = [app performSelector:NSSelectorFromString(@"bundleIdentifier")];
 #pragma clang diagnostic pop
-            if (bid.length && !MKIsBlacklisted(bid)) {
+            // v1.6.31: 只补"当前前台"的 App（避免把纯后台 App 加进集合）
+            if (bid.length && !MKIsBlacklisted(bid) && MKIsForeground(bid)) {
                 MKAddToRunningSet(bid);
                 count++;
             }
@@ -796,7 +803,8 @@ static void MKComputeRunningSetFromProc() {
             if (!isUserApp) continue;
 
             NSString *bid = MKBidFromPath(fullPath);
-            if (bid && !MKIsBlacklisted(bid)) {
+            // v1.6.31: 仅前台 App 才补进集合（纯后台进程忽略）
+            if (bid && !MKIsBlacklisted(bid) && MKIsForeground(bid)) {
                 MKAddToRunningSet(bid);
             }
         }
@@ -1213,6 +1221,16 @@ static void MKUpdate(SBIconView *self) {
 // v1.6.0: 刷新容器视图内所有 SBIconView（用于文件夹打开等场景）
 // ====================================================================
 
+// v1.6.31: SBIconView 类静态化（刷新遍历每节点原本都 NSClassFromString，提为一次性查找）
+static Class MKSBIconViewClass(void) {
+    static Class c = Nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        c = NSClassFromString(@"SBIconView");
+    });
+    return c;
+}
+
 static void MKRefreshSubviews(UIView *containerView) {
     MKSafe(^{
         if (!sInitDone || !containerView) return;
@@ -1221,7 +1239,7 @@ static void MKRefreshSubviews(UIView *containerView) {
         while (stack.count > 0) {
             UIView *v = [stack lastObject];
             [stack removeLastObject];
-            if ([v isKindOfClass:NSClassFromString(@"SBIconView")]) {
+            if ([v isKindOfClass:MKSBIconViewClass()]) {
                 MKUpdate((SBIconView *)v);
                 refreshed++;
             }
@@ -1246,7 +1264,7 @@ static void MKRefreshAllIcons() {
             while (stack.count > 0) {
                 UIView *current = [stack lastObject];
                 [stack removeLastObject];
-                if ([current isKindOfClass:NSClassFromString(@"SBIconView")]) {
+                if ([current isKindOfClass:MKSBIconViewClass()]) {
                     MKUpdate((SBIconView *)current);
                 }
                 for (UIView *child in current.subviews) {
@@ -1271,7 +1289,7 @@ static void MKRefreshIconForBundleID(NSString *bid) {
             while (stack.count > 0) {
                 UIView *current = [stack lastObject];
                 [stack removeLastObject];
-                if ([current isKindOfClass:NSClassFromString(@"SBIconView")]) {
+                if ([current isKindOfClass:MKSBIconViewClass()]) {
                     SBIconView *iv = (SBIconView *)current;
                     NSString *ivBid = MKGetCachedBid(iv);
                     if (ivBid && [ivBid isEqualToString:bid]) {
@@ -1303,7 +1321,7 @@ static void MKFadeOutLabelForBundleID(NSString *bid) {
             while (stack.count > 0) {
                 UIView *current = [stack lastObject];
                 [stack removeLastObject];
-                if ([current isKindOfClass:NSClassFromString(@"SBIconView")]) {
+                if ([current isKindOfClass:MKSBIconViewClass()]) {
                     SBIconView *iv = (SBIconView *)current;
                     NSString *ivBid = MKGetCachedBid(iv);
                     if (ivBid && [ivBid isEqualToString:bid]) {
@@ -1355,7 +1373,7 @@ static void MKRestoreLabelForBundleID(NSString *bid) {
             while (stack.count > 0) {
                 UIView *current = [stack lastObject];
                 [stack removeLastObject];
-                if ([current isKindOfClass:NSClassFromString(@"SBIconView")]) {
+                if ([current isKindOfClass:MKSBIconViewClass()]) {
                     SBIconView *iv = (SBIconView *)current;
                     NSString *ivBid = MKGetCachedBid(iv);
                     if (ivBid && [ivBid isEqualToString:bid]) {
@@ -1407,6 +1425,9 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
             MKRefreshIconForBundleID(bid);
         });
     } else if (running) {
+        // v1.6.31: 只在 App 确实在我们的 running set 中（用户打开/用过）才做标签/指示器逻辑。
+        // 纯后台被 iOS 拉起、从未前台过的 App 不在集合里 → 直接跳过，名字保持原样、不亮指示器。
+        if (!MKIsAppRunning(bid)) return;
         // ── App 返回后台 → v1.5.8: 标签渐隐 + 指示器渐显 ──
         // 标签不再瞬间消失：250ms 渐隐 alpha 1→0
         // 300ms 后创建指示器并 200ms 渐显 alpha 0→cfg.opacity
@@ -1766,9 +1787,12 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         // FBProcessState.taskState: 1=NotRunning/Dead → app exited
         // FBProcessState.isRunning: YES → app process exists
         BOOL isRunningNow = (isRunning || taskState == 2 || taskState == 3);
-        if (isRunningNow) {
+        // v1.6.31: 仅前台（用户打开/使用中）才进入 running set。
+        // 纯后台被 iOS 拉起（日历同步等）foreground=0 → 不进集合 → 不显示指示器。
+        // 注意：alive 但后台（用户退回后台的 App）走 else-if(!isRunningNow) 不命中 → 保留在集合（点保留）。
+        if (isRunningNow && isForeground) {
             MKAddToRunningSet(bid);
-        } else {
+        } else if (!isRunningNow) {
             MKRemoveFromRunningSet(bid);
             isRunningNow = NO;
         }
@@ -1807,9 +1831,12 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
               bid, isRunning, taskState, isForeground);
 
         BOOL isRunningNow = (isRunning || taskState == 2 || taskState == 3);
-        if (isRunningNow) {
+        // v1.6.31: 仅前台（用户打开/使用中）才进入 running set。
+        // 纯后台被 iOS 拉起（日历同步等）foreground=0 → 不进集合 → 不显示指示器。
+        // 注意：alive 但后台（用户退回后台的 App）走 else-if(!isRunningNow) 不命中 → 保留在集合（点保留）。
+        if (isRunningNow && isForeground) {
             MKAddToRunningSet(bid);
-        } else {
+        } else if (!isRunningNow) {
             MKRemoveFromRunningSet(bid);
             isRunningNow = NO;
         }
@@ -1844,9 +1871,10 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         MKSetForeground(bid, state == 2);
 
         BOOL isRunningNow = (state >= 1);
-        if (isRunningNow) {
+        // v1.6.31: 仅前台（state==2）才进入 running set；纯后台（state==1）不进。
+        if (isRunningNow && state == 2) {
             MKAddToRunningSet(bid);
-        } else {
+        } else if (!isRunningNow) {
             MKRemoveFromRunningSet(bid);
             isRunningNow = NO;
         }
@@ -1888,7 +1916,7 @@ static BOOL MKIsSupportedOS(void) {
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
     NSLog(@"[RunningDotIndicator] v1.6.30 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible");
-    RDLog(@"======== v1.6.30 loading (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.30 blacklisted apps skip state-change -> name never fades) ========");
+    RDLog(@"======== v1.6.31 loading (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
