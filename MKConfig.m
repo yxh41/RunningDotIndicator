@@ -96,6 +96,12 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
     return (o < 0.1f) ? 0.1f : (o > 1.0f ? 1.0f : o);
 }
 
+- (BOOL)debugLog {
+    // 与紧急开关 rd_disabled 同风格：存在 /var/mobile/Documents/rd_debug 即开启
+    // 默认 NO → 生产环境日志保持安静，需要排障时创建该文件即可恢复详细日志
+    return [[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/rd_debug"];
+}
+
 - (UIColor *)color {
     NSString *custom = _prefs[@"customColor"];
     if ([custom isKindOfClass:[NSString class]] && [custom length]) {

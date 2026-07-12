@@ -32,6 +32,7 @@ typedef NS_ENUM(NSInteger, MKColorMode) {
 @property (nonatomic, readonly) CGFloat    barWidth;       // 横条宽度(pt), 默认 24
 @property (nonatomic, readonly) CGFloat    barHeight;      // 横条高度(pt), 默认 4
 @property (nonatomic, readonly) CGFloat    opacity;        // 不透明度, 默认 1.0
+@property (nonatomic, readonly) BOOL       debugLog;       // 调试日志, 默认 NO；存在 /var/mobile/Documents/rd_debug 文件即开启
 
 // 把 #RRGGBB / #RGB 解析为 UIColor
 + (UIColor *)colorFromHex:(NSString *)hex;
