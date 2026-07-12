@@ -61,6 +61,9 @@
 // ─── RDLog 前向声明（避免 C99 "use before declaration" 错误）──
 static void RDLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
 
+// ─── MKSBIconViewClass 前向声明（定义见刷新辅助区，MKCachedIconColorForBundleID 先调用）──
+static Class MKSBIconViewClass(void);
+
 // libproc 函数声明（iOS 运行时存在，但 iPhoneOS SDK 不含此头文件）
 extern int proc_listallpids(void *buffer, int buffersize);
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
