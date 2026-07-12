@@ -1,5 +1,6 @@
 //
-//  Tweak.x — RunningDotIndicator v1.6.26
+//  Tweak.x — RunningDotIndicator v1.6.27
+//  v1.6.27: 移除 v1.6.24 加的 iOS 16.3-16.5.1 版本守卫（不再限制系统版本）
 //  v1.6.26: 性能优化（基于 16.4.1/roothide 真实运行日志分析）
 //    ✅ 文件夹/滚动刷新合并：删除冗余的 SBFolderController/SBIconListPageView hook，
 //       单次文件夹打开只排一次 300ms 合并刷新（0.4s 时间窗去重），消除同秒多次 FOLDER REFRESH
@@ -1853,26 +1854,14 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
 // 构造函数（只做最轻量工作）
 // ====================================================================
 
-// 支持的系统版本范围：iOS 16.3 ~ 16.5.1（与 Makefile 声明一致）
-// 低于 16.3（含 iOS 15）或高于 16.5.1 时优雅跳过：不调用 %init → 不挂钩 → 不崩溃
-static BOOL MKIsSupportedOS(void) {
-    NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
-    NSInteger code = v.majorVersion * 10000 + v.minorVersion * 100 + v.patchVersion;
-    return (code >= 16300 && code <= 16501); // 16.3.0 ~ 16.5.1
-}
-
+// 注：v1.6.24 曾加 iOS 16.3-16.5.1 版本守卫（MKIsSupportedOS），
+// 在 v1.6.27 已移除 —— 不再限制系统版本，全 iOS 16.x 均挂钩。
 %ctor {
-    if (!MKIsSupportedOS()) {
-        NSLog(@"[RunningDotIndicator] ctor: iOS version out of supported range (need 16.3-16.5.1), skip hooking.");
-        RDLog(@"======== ctor: unsupported iOS version (need 16.3-16.5.1), skip hooking ========");
-        return; // 不调用 %init → 不挂钩 → 在不受支持的系统上优雅失效
-    }
-
     %init;
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
-    NSLog(@"[RunningDotIndicator] v1.6.26 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + OS guard 16.3-16.5.1 + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); debug-log gate (rd_debug file) + icon-color miss one-shot retry");
-    RDLog(@"======== v1.6.26 loading (perf focus: folder/scroll refresh coalesced; indicator reused across off-screen; debug logging gated behind /var/mobile/Documents/rd_debug; icon-color miss self-heals next runloop) ========");
+    NSLog(@"[RunningDotIndicator] v1.6.27 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); debug-log gate (rd_debug file) + icon-color miss one-shot retry; v1.6.27 removed iOS 16.3-16.5.1 OS guard (no version restriction now)");
+    RDLog(@"======== v1.6.27 loading (perf focus: folder/scroll refresh coalesced; indicator reused across off-screen; debug logging gated behind /var/mobile/Documents/rd_debug; icon-color miss self-heals next runloop; iOS version guard removed) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
