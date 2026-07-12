@@ -1603,6 +1603,31 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         return;
     }
 
+    // ── v1.6.31 DIAG：运行中后台 App 的指示器若挂错视图/不可见 → 记录，定位翻页消失根因 ──
+    // 仅当 bid 有效 && running && !foreground（即“应当有指示器却可能坏了”）时检查；出错也不影响正常流程。
+    {
+        UIView *ind = MKGetIndicator(self);
+        if (ind) {
+            // 预期 hostView（与 MKUpdate 同算法：label.superview → self.superview → self）
+            UIView *hostView = nil;
+            UIView *label = MKGetCachedLabel(self);
+            if (label && label.superview) hostView = label.superview;
+            else if (self.superview)      hostView = self.superview;
+            else                           hostView = self;
+            BOOL wrongHost = (ind.superview != hostView);
+            BOOL invisible  = (ind.alpha <= 0.01f || ind.hidden || ind.superview == nil);
+            if (wrongHost || invisible) {
+                RDLog(@"[DIAG orphan] bid=%@ running=YES fg=NO | ind.superview=%@ expectedHost=%@ | alpha=%.2f hidden=%d frame=%@ | label.superview=%@",
+                      bid,
+                      ind.superview ? NSStringFromClass([ind.superview class]) : @"(nil)",
+                      NSStringFromClass([hostView class]),
+                      (float)ind.alpha, ind.hidden,
+                      NSStringFromCGRect(ind.frame),
+                      (label && label.superview) ? NSStringFromClass([label.superview class]) : @"<no-label>");
+            }
+        }
+    }
+
     // v1.5.8: 标签正在渐隐 → 只重定位指示器，不操作标签（让动画自然播放）
     if (MKIsFadingLabel(bid)) {
         UIView *label = MKGetCachedLabel(self);
@@ -1918,8 +1943,8 @@ static BOOL MKIsSupportedOS(void) {
     %init;
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
-    NSLog(@"[RunningDotIndicator] v1.6.30 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible");
-    RDLog(@"======== v1.6.31 loading (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups) ========");
+    NSLog(@"[RunningDotIndicator] v1.6.31.diag1 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible; v1.6.31 running-set gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; DIAGNOSTIC BUILD: layoutSubviews logs [DIAG orphan] when a running-background app's indicator is on wrong hostView or invisible (to locate the page-swipe vanish root cause)");
+    RDLog(@"======== v1.6.31.diag1 DIAGNOSTIC loading (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
