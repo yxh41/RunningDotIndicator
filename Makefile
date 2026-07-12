@@ -1,6 +1,6 @@
 # =============================================================================
 #  RunningDotIndicator - 在桌面 App 图标旁为运行中的 App 添加可自定义指示点
-#  适用于 iOS 15 ~ 16 (rootful / rootless / roothide, arm64 / arm64e)
+#  适用于 iOS 16.3 ~ 16.5.1 (rootless / roothide, arm64 / arm64e)
 #  构建环境: macOS / Linux + Theos + iPhoneOS16.x SDK
 # =============================================================================
 

@@ -1831,11 +1831,25 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
 // 构造函数（只做最轻量工作）
 // ====================================================================
 
+// 支持的系统版本范围：iOS 16.3 ~ 16.5.1（与 Makefile 声明一致）
+// 低于 16.3（含 iOS 15）或高于 16.5.1 时优雅跳过：不调用 %init → 不挂钩 → 不崩溃
+static BOOL MKIsSupportedOS(void) {
+    NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
+    NSInteger code = v.majorVersion * 10000 + v.minorVersion * 100 + v.patchVersion;
+    return (code >= 16300 && code <= 16501); // 16.3.0 ~ 16.5.1
+}
+
 %ctor {
+    if (!MKIsSupportedOS()) {
+        NSLog(@"[RunningDotIndicator] ctor: iOS version out of supported range (need 16.3-16.5.1), skip hooking.");
+        RDLog(@"======== ctor: unsupported iOS version (need 16.3-16.5.1), skip hooking ========");
+        return; // 不调用 %init → 不挂钩 → 在不受支持的系统上优雅失效
+    }
+
     %init;
 
-    NSLog(@"[RunningDotIndicator] v1.6.23 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI (grouped cards, hero preview icon-left/text-right like 1.6.18) + settings list icon + Depends: ellekit (fix Ellekit 'files corrupted' false-positive on uninstall)");
-    RDLog(@"======== v1.6.23 loading (1.6.1 baseline; dominant-color icon mode; fix: snapshot full-size for icon capture; no respring button; Lynx2 wording dropped; 2026 glass settings UI with grouped cards; hero preview icon-left/text-right like 1.6.18; settings list icon added; Depends changed mobilesubstrate -> ellekit to avoid Ellekit trigger false-positive on uninstall) ========");
+    NSLog(@"[RunningDotIndicator] v1.6.24 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI (grouped cards, hero preview icon-left/text-right like 1.6.18) + settings list icon + Depends: ellekit + OS guard 16.3-16.5.1");
+    RDLog(@"======== v1.6.24 loading (1.6.1 baseline; dominant-color icon mode; fix: snapshot full-size for icon capture; no respring button; Lynx2 wording dropped; 2026 glass settings UI with grouped cards; hero preview icon-left/text-right like 1.6.18; settings list icon added; Depends changed mobilesubstrate -> ellekit; OS guard 16.3-16.5.1) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
