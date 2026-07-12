@@ -10,7 +10,7 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>RunningDotIndicator 1.6.28</string>
+			<string>RunningDotIndicator 1.6.29</string>
 			<key>footerText</key>
 			<string>为运行中的 App 图标添加指示器。App 运行时自动替换图标下方的名称文字，退出后恢复原名称。支持系统：iOS 16.x（roothide / rootless）；iOS 15 及更低不挂钩。</string>
 		</dict>
@@ -311,6 +311,31 @@
 			<key>PostNotification</key>
 			<string>com.mk.runningdotindicator.reload</string>
 		</dict>
+
+	<!-- ===== 调试日志（临时开关，稳定后移除） ===== -->
+	<dict>
+		<key>cell</key>
+		<string>PSGroupCell</string>
+		<key>label</key>
+		<string>调试日志</string>
+		<key>footerText</key>
+		<string>开启后输出详细排障日志（替代手动创建 rd_debug 文件，改动即时生效）。临时开关，待插件稳定后将移除。</string>
+	</dict>
+
+	<dict>
+		<key>cell</key>
+		<string>PSSwitchCell</string>
+		<key>default</key>
+		<false/>
+		<key>defaults</key>
+		<string>com.mk.runningdotindicatorprefs</string>
+		<key>key</key>
+		<string>debugLog</string>
+		<key>label</key>
+		<string>启用详细日志</string>
+		<key>PostNotification</key>
+		<string>com.mk.runningdotindicator.reload</string>
+	</dict>
 
 	<!-- ===== 说明 ===== -->
 	<dict>

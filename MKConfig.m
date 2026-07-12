@@ -97,8 +97,10 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
 }
 
 - (BOOL)debugLog {
-    // 与紧急开关 rd_disabled 同风格：存在 /var/mobile/Documents/rd_debug 即开启
-    // 默认 NO → 生产环境日志保持安静，需要排障时创建该文件即可恢复详细日志
+    // v1.6.29: 设置页「调试日志」开关优先；回退到文件开关 /var/mobile/Documents/rd_debug（历史兼容）
+    // 二者 OR：任一为真即输出详细排障日志。文件开关为临时兼容手段，稳定后将随调试开关一起移除。
+    id v = _prefs[@"debugLog"];
+    if (v) return [v boolValue];
     return [[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/rd_debug"];
 }
 
