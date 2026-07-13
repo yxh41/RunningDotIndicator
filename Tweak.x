@@ -1069,6 +1069,21 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
 // 主更新函数 — v1.5.1：标签找到→指示器在标签位置，标签未找到→图标底部边缘（不遮挡）
 // ====================================================================
 
+// v1.6.41: 无标签时的「估算标签位置」——Dock 专用收紧。
+//   Dock 图标（SBDockIconListView 内）没有名称标签，旧兜底把指示器放在图标底 +8pt 左右，
+//   看着像悬空在 Dock 下方一截；改成紧贴图标底（≈ App 名称实际位置）。
+//   普通图标（名称标签偶发找不到时）沿用旧逻辑（+4pt 间隙、14pt 标签高）。
+static CGRect MKEstimateLabelFrame(SBIconView *iconView) {
+    UIView *sup = iconView.superview ? iconView.superview : (UIView *)iconView;
+    CGRect f = iconView.frame;
+    BOOL inDock = [NSStringFromClass([sup class]) containsString:@"Dock"];
+    CGFloat iconBottom = f.origin.y + f.size.height;
+    CGFloat gap    = inDock ? 4.0f : 4.0f;    // Dock 名称紧贴图标（与旧逻辑一致）
+    CGFloat labelH = inDock ? 12.0f : 14.0f;  // Dock 名称更矮，居中后整体更贴图标
+    CGFloat labelY = iconBottom + gap;
+    return CGRectMake(f.origin.x, labelY, f.size.width, labelH);
+}
+
 static void MKUpdate(SBIconView *self) {
     MKSafe(^{
         if (!sInitDone) return;
@@ -1148,9 +1163,7 @@ static void MKUpdate(SBIconView *self) {
         if (label && label.superview) {
             labelFrameInHost = label.frame;
         } else if (self.superview) {
-            CGRect icf = self.frame;
-            CGFloat ey = icf.origin.y + icf.size.height + 4.0f;
-            labelFrameInHost = CGRectMake(icf.origin.x, ey, icf.size.width, 14.0f);
+            labelFrameInHost = MKEstimateLabelFrame((SBIconView *)self);
         } else {
             CGSize s = self.bounds.size;
             if (s.width < 10 || s.height < 10) return;
@@ -1746,14 +1759,11 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
             indW, indH
         );
     } else if (self.superview) {
-        // v1.5.9 / v1.6.36: 无标签 → 估算标签位置（图标下方居中，与 1.6.31 一致）
-        //   指示器现挂 self.superview（图标列表），self.frame 在该坐标系内。
-        CGRect icf = self.frame;
-        CGFloat estimatedLabelY = icf.origin.y + icf.size.height + 4.0f;  // 图标下方4pt间隙
-        CGFloat estimatedLabelH = 14.0f;  // iOS 标签典型高度
+        // v1.6.41: 无标签 → 估算标签位置（Dock 紧贴图标底，≈ App 名称位置）
+        CGRect elf = MKEstimateLabelFrame((SBIconView *)self);
         indicator.frame = CGRectMake(
-            icf.origin.x + (icf.size.width - indW) / 2.0f,
-            estimatedLabelY + (estimatedLabelH - indH) / 2.0f,
+            elf.origin.x + (elf.size.width - indW) / 2.0f,
+            elf.origin.y + (elf.size.height - indH) / 2.0f,
             indW, indH
         );
     }
@@ -2015,7 +2025,7 @@ static BOOL MKIsSupportedOS(void) {
     %init;
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
-    NSLog(@"[RunningDotIndicator] v1.6.40 ctor: removed v1.6.37 debounce so recycle returns the real bid immediately (fixes 'indicator hops to other icons on page-swipe'); see comments below.");
+    NSLog(@"[RunningDotIndicator] v1.6.41 ctor: dock indicator now hugs the icon bottom (~app-name position); see comments below for full history.");
 
     // v1.6.37: 根除问题①(churn) + 问题②的瞬时部分。
     //   根因(rd_log(66) 确证)：iOS 的 SBIconView.icon 在布局/滚动/角标刷新等过渡期，会瞬时返回
