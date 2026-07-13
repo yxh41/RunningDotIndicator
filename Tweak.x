@@ -1,5 +1,5 @@
 //
-//  Tweak.x — RunningDotIndicator v1.6.28
+//  Tweak.x — RunningDotIndicator v1.6.50
 //  v1.6.28: 重加宽松 iOS 版本守卫（只挡 iOS 15 及更低，16.0+ 均挂钩）；
 //           修复「部分 App 指示器偶尔消失、桌面滑动才回来」——layoutSubviews 加孤儿自愈
 //           （指示器存在但 superview==nil 时立即 MKUpdate 重建，不等滚动触发）。
@@ -968,13 +968,53 @@ static int MKGetIntFromState(id stateObj, NSString *propName) {
 // 渲染辅助 — Lynx2 风格：替换 App 名字标签区域
 // ====================================================================
 
+// v1.6.50: 定位到真正的图标图片视图，无 label 时也能把指示器放在图标正下方。
+static UIView *MKFindIconImageView(SBIconView *iconView) {
+    @try {
+        NSArray *accessorNames = @[
+            @"iconImageView", @"imageView", @"_iconImageView",
+            @"_imageView"
+        ];
+        for (NSString *name in accessorNames) {
+            SEL sel = NSSelectorFromString(name);
+            if ([iconView respondsToSelector:sel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                id result = [iconView performSelector:sel];
+#pragma clang diagnostic pop
+                if (result && [result isKindOfClass:[UIView class]]) {
+                    return (UIView *)result;
+                }
+            }
+        }
+    } @catch (NSException *e) {}
+    NSMutableArray *stack = [NSMutableArray arrayWithArray:iconView.subviews];
+    while (stack.count > 0) {
+        UIView *v = [stack lastObject];
+        [stack removeLastObject];
+        NSString *cls = NSStringFromClass([v class]);
+        if ([cls containsString:@"IconImageView"] ||
+            [cls containsString:@"ImageView"] ||
+            [cls isEqualToString:@"UIImageView"]) {
+            return v;
+        }
+        [stack addObjectsFromArray:v.subviews];
+    }
+    return nil;
+}
+
+static CGRect MKIconImageFrameInSelf(SBIconView *iconView) {
+    UIView *img = MKFindIconImageView(iconView);
+    if (!img) return CGRectZero;
+    return [img convertRect:img.bounds toView:(UIView *)iconView];
+}
+
 // 找到 SBIconView 对应的名字标签视图 — v1.5.0 四重策略
 // v1.4.9 问题：iOS 16 SBIconListLabel 不在 SBIconView 内部，是其兄弟节点
 // 日志证实：NO LABEL — SBIconView subviews: [SBFTouchPassThroughView]
 static UIView *MKFindLabelView(SBIconView *iconView) {
     @try {
         // ── Strategy 1: SBIconView accessor 方法（iOS 16 运行时头文件）──
-        // SBIconView 有 labelView / listLabelView → SBIconListLabel
         NSArray *accessorNames = @[
             @"labelView", @"listLabelView", @"_listLabelView",
             @"_titleLabelView", @"titleLabel", @"_labelView",
@@ -989,29 +1029,40 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
                 id result = [iconView performSelector:sel];
 #pragma clang diagnostic pop
                 if (result && [result isKindOfClass:[UIView class]]) {
-                    return result;
+                    return (UIView *)result;
                 }
             }
         }
 
-        // ── Strategy 2: 父视图兄弟节点（iOS 16 核心！标签是 SBIconView 的兄弟）──
-        // SBIconView 和 SBIconListLabel 是同一个父容器的子视图
-        // v1.6.48: 改成「找离当前 icon 中心最近的标签」而不是「找分数最高的标签」。
-        //   旧逻辑只按类名分数 pick，如果父容器里有多个 label（多图标），会永远拿到第一个，
-        //   导致指示器被定位到别的 App 名称位置（即用户看到的「位置错了」）。
-        UIView *parent = iconView.superview;
-        if (parent) {
-            // v1.6.49: 标签与图标同列（x 对齐）、且纵向落在本槽范围内。
-            //   仅靠「最近中心」会在多图标共享内容视图时拿到别的图标的标签，
-            //   导致指示器被定到错误的名称位置（日志里 y=233 这种「飘到别的行」即此）。
+        // ── Strategy 2: 祖先视图兄弟节点搜索（iOS 16 核心）──
+        // v1.6.50: 名称标签在 iOS 16 中并不是 SBIconView 的 direct sibling，
+        //   而是在它外层 wrapper 的父容器（SBIconListView / SBDockIconListView 等）
+        //   中与它同列。之前只查 iconView.superview，当 superview 是只有一个子视图
+        //   的 wrapper 时永远找不到标签，导致普通 App 只能走 fallback 而看不到指示器。
+        //   现在从 superview 开始向上遍历 5 层，在每一层中找「与图标图片底部同列、
+        //   且纵向落在图标下方小范围」的标签。
+        CGRect imgFrame = MKIconImageFrameInSelf(iconView);
+        CGFloat colTol = (imgFrame.size.width > 0)
+            ? (imgFrame.size.width * 0.5f + 16.0f)
+            : 30.0f;
+        UIView *container = iconView.superview;
+        NSInteger depth = 0;
+        while (container && depth < 5) {
+            CGPoint iconBottomCenter = CGPointMake(
+                imgFrame.origin.x + imgFrame.size.width / 2.0f,
+                imgFrame.origin.y + imgFrame.size.height);
+            if (CGRectIsEmpty(imgFrame)) {
+                iconBottomCenter = CGPointMake(
+                    iconView.bounds.size.width / 2.0f,
+                    iconView.bounds.size.height / 2.0f);
+            }
+            iconBottomCenter = [iconView convertPoint:iconBottomCenter toView:container];
+
             UIView *bestMatch = nil;
-            CGFloat bestDx = CGFLOAT_MAX;
-            CGPoint iconCenter = iconView.center;
-            CGFloat colTol = iconView.bounds.size.width * 0.6f + 12.0f;
-            CGFloat slotTop = iconView.frame.origin.y - 8.0f;
-            CGFloat slotBot = iconView.frame.origin.y + iconView.frame.size.height + 8.0f;
-            for (UIView *sv in parent.subviews) {
-                if (sv == iconView) continue;  // 跳过自己
+            CGFloat bestDy = CGFLOAT_MAX;
+            NSInteger bestScore = 0;
+            for (UIView *sv in container.subviews) {
+                if (sv == iconView || sv == iconView.superview) continue;
                 NSString *cls = NSStringFromClass([sv class]);
                 NSInteger score = 0;
                 if ([cls isEqualToString:@"SBIconListLabel"])        score = 100;
@@ -1021,23 +1072,26 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
                 else if ([sv isKindOfClass:[UILabel class]])          score = 60;
                 else if ([cls containsString:@"LabelView"])           score = 50;
                 else if ([cls containsString:@"Label"])              score = 40;
-                if (score < 50) continue;  // 不是标签，跳过
-                // 同列（x 对齐）+ 纵向落在本槽范围内 → 这才是「本图标的标签」
-                CGFloat dx = sv.center.x - iconCenter.x;
+                if (score < 50) continue;
+                // 同列：标签中心 x 与图标图片底部中心 x 差距很小
+                CGFloat dx = sv.center.x - iconBottomCenter.x;
                 if (dx < 0) dx = -dx;
                 if (dx > colTol) continue;
-                if (sv.frame.origin.y < slotTop || sv.frame.origin.y > slotBot) continue;
-                if (dx < bestDx) {
-                    bestDx = dx;
+                // 纵向：标签应在图标图片底部稍下方，不能太偏上或太偏下
+                CGFloat dy = sv.center.y - iconBottomCenter.y;
+                if (dy < -10.0f || dy > 80.0f) continue;
+                if (score > bestScore || (score == bestScore && dy < bestDy)) {
+                    bestScore = score;
+                    bestDy = dy;
                     bestMatch = sv;
                 }
             }
-            if (bestMatch) {
-                return bestMatch;
-            }
+            if (bestMatch) return bestMatch;
+            container = container.superview;
+            depth++;
         }
 
-        // ── Strategy 3: 直接子视图搜索 ──
+        // ── Strategy 3: 直接子视图搜索（兼容标签在图标内部的情况）──
         for (UIView *sv in iconView.subviews) {
             NSString *cls = NSStringFromClass([sv class]);
             if ([sv isKindOfClass:[UILabel class]] ||
@@ -1048,7 +1102,6 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
         }
 
         // ── Strategy 4: 递归子视图搜索 ──
-        // v1.6.33: 增加 containsString:@"Label" 兜底，捕获 SBIconLabel 等无 View/List/Title 字样的标签类。
         NSMutableArray *stack = [NSMutableArray arrayWithArray:iconView.subviews];
         while (stack.count > 0) {
             UIView *v = [stack lastObject];
@@ -1068,7 +1121,7 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
 
         // ── 诊断：标签未找到 → dump iconView + 父视图层级 ──
         static int sNoLabelLogs = 0;
-        if (sNoLabelLogs < 60) {  // v1.6.34: 放宽上限，便于下次日志直接看到受影响 App 的视图层级（标签类名为何偶发查不到）
+        if (sNoLabelLogs < 60) {
             sNoLabelLogs++;
             NSMutableString *dump = [NSMutableString stringWithFormat:@"NO LABEL — %@ direct:[", NSStringFromClass([iconView class])];
             for (UIView *sv in iconView.subviews) {
@@ -1092,7 +1145,26 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
     return nil;
 }
 
+
 // ====================================================================
+// v1.6.50: 计算指示器中心在 self (SBIconView) 本地坐标系中的位置。
+//   有 label → 用 label 中心；无 label → 图标图片底部 + 间隙（避免落到图标内部）。
+static CGPoint MKIndicatorCenterInSelf(SBIconView *self, UIView *label, CGFloat indicatorW, CGFloat indicatorH) {
+    if (label && label.superview) {
+        return [(UIView *)self convertPoint:label.center fromView:label.superview];
+    }
+    CGRect imgFrame = MKIconImageFrameInSelf(self);
+    CGFloat y;
+    if (imgFrame.size.height > 0) {
+        y = imgFrame.origin.y + imgFrame.size.height + 4.0f + indicatorH / 2.0f;
+    } else {
+        CGSize s = self.bounds.size;
+        if (s.width < 10 || s.height < 10) return CGPointZero;
+        y = s.height - 12.0f;
+    }
+    return CGPointMake(self.bounds.size.width / 2.0f, y);
+}
+
 // 主更新函数 — v1.5.1：标签找到→指示器在标签位置，标签未找到→图标底部边缘（不遮挡）
 // ====================================================================
 
@@ -1126,6 +1198,7 @@ static void MKUpdate(SBIconView *self) {
         //   - Dock 图标各自持有自己的指示器子视图 → 不再堆积进 SBDockIconListView（y=73 重叠）；
         //   - 滚动/回收时指示器随 self 一起移动，无坐标换算错位、也不被误挂共享视图。
         UIView *hostView = (UIView *)self;
+        [hostView setClipsToBounds:NO]; // v1.6.50: 指示器可能位于图标 bounds 外（标签/Dock 下方），必须允许绘制出来
         UIView *cachedInd = MKGetIndicator(self);
         UIView *bidInd     = MKIndicatorForBid(bundleID);
         if (cachedInd && cachedInd != bidInd) {
@@ -1185,14 +1258,8 @@ static void MKUpdate(SBIconView *self) {
         // v1.6.49: 在 self.bounds 坐标系内定位（指示器是 self 的子视图）。
         //   有标签 → 把标签中心经 convertPoint:fromView: 精确折算进 self 本地坐标
         //   （名称相对图标的位置，与共享视图/滚动无关）；无标签（Dock 等）→ 落在 self 底部居中。
-        CGPoint indCenter;
-        if (label && label.superview) {
-            indCenter = [(UIView *)self convertPoint:label.center fromView:label.superview];
-        } else {
-            CGSize s = self.bounds.size;
-            if (s.width < 10 || s.height < 10) return;
-            indCenter = CGPointMake(s.width / 2.0f, s.height - 12.0f);
-        }
+        CGPoint indCenter = MKIndicatorCenterInSelf(self, label, indicatorW, indicatorH);
+        if (CGPointEqualToPoint(indCenter, CGPointZero)) return;
         CGRect indicatorFrame = CGRectMake(
             indCenter.x - indicatorW / 2.0f,
             indCenter.y - indicatorH / 2.0f,
@@ -1772,23 +1839,19 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     // v1.5.8: 标签正在渐隐 → 只重定位指示器，不操作标签（让动画自然播放）
     if (MKIsFadingLabel(bid)) {
         if (indicator) {
-            // v1.6.49: 渐隐期间只重定位，锚点落在 self.bounds（同 MKUpdate）。
+            // v1.6.50: 渐隐期间只重定位，锚点与 MKUpdate 一致。
             CGFloat indW, indH;
             MKConfig *cfg = [MKConfig sharedConfig];
             if (cfg.shape == MKShapeDot) { indW = cfg.dotSize; indH = cfg.dotSize; }
             else { indW = cfg.barWidth; indH = cfg.barHeight; }
-            CGPoint indCenter;
             UIView *label = MKGetCachedLabel(self);
-            if (label && label.superview) {
-                indCenter = [(UIView *)self convertPoint:label.center fromView:label.superview];
-            } else {
-                CGSize s = self.bounds.size;
-                indCenter = CGPointMake(s.width / 2.0f, s.height - 12.0f);
+            CGPoint indCenter = MKIndicatorCenterInSelf(self, label, indW, indH);
+            if (!CGPointEqualToPoint(indCenter, CGPointZero)) {
+                indicator.frame = CGRectMake(
+                    indCenter.x - indW / 2.0f,
+                    indCenter.y - indH / 2.0f,
+                    indW, indH);
             }
-            indicator.frame = CGRectMake(
-                indCenter.x - indW / 2.0f,
-                indCenter.y - indH / 2.0f,
-                indW, indH);
         }
         return;
     }
@@ -1806,8 +1869,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         indH = cfg.barHeight;
     }
 
-    // v1.6.49: 标签只用于「隐藏名称」，定位锚点落在 self.bounds（同 MKUpdate）。
-    //   有标签 → 标签中心折算进 self 本地坐标；无标签（Dock）→ self 底部居中。
+    // v1.6.50: 标签只用于「隐藏名称」，定位锚点与 MKUpdate 一致。
     UIView *label = MKGetCachedLabel(self);
     if (label) {
         // 重新强制隐藏标签（防止系统 layout 恢复）
@@ -1817,18 +1879,15 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         label.opaque = NO;
     }
     if (indicator) {
-        CGPoint indCenter;
-        if (label && label.superview) {
-            indCenter = [(UIView *)self convertPoint:label.center fromView:label.superview];
-        } else {
-            CGSize s = self.bounds.size;
-            indCenter = CGPointMake(s.width / 2.0f, s.height - 12.0f);
+        [(UIView *)self setClipsToBounds:NO]; // 允许指示器绘制到 self bounds 外
+        CGPoint indCenter = MKIndicatorCenterInSelf(self, label, indW, indH);
+        if (!CGPointEqualToPoint(indCenter, CGPointZero)) {
+            indicator.frame = CGRectMake(
+                indCenter.x - indW / 2.0f,
+                indCenter.y - indH / 2.0f,
+                indW, indH
+            );
         }
-        indicator.frame = CGRectMake(
-            indCenter.x - indW / 2.0f,
-            indCenter.y - indH / 2.0f,
-            indW, indH
-        );
     }
 }
 
@@ -2111,7 +2170,7 @@ static BOOL MKIsSupportedOS(void) {
     %init;
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
-    NSLog(@"[RunningDotIndicator] v1.6.49 ctor: indicator now attaches to the SBIconView itself (hostView=self) and positions in self.bounds via convertPoint:fromView: of the label center. Fixes both 'wrong dock pile-up in SBDockIconListView' and 'wrong y on pages (stale sibling label.frame)'. MKFindLabelView now requires same-column + within-slot-band to pick THIS icon's label. Recycle guard (MKSlotTransitioning,5 frames) + scroll-hide unchanged.");
+    NSLog(@"[RunningDotIndicator] v1.6.50 ctor: indicator stays attached to SBIconView (hostView=self). Label search now walks up the ancestor chain to find the real SBIconListLabel sibling, fixing the v1.6.49 'other apps no indicator' issue. When no label is found (Dock/transient), the indicator falls back to just below the icon image view instead of the bottom of self.bounds, fixing the 'dot inside icon' issue. clipsToBounds=NO on the icon view lets the indicator draw outside the icon bounds. Recycle guard + scroll-hide unchanged.");
 
     // v1.6.37: 根除问题①(churn) + 问题②的瞬时部分。
     //   根因(rd_log(66) 确证)：iOS 的 SBIconView.icon 在布局/滚动/角标刷新等过渡期，会瞬时返回
