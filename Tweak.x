@@ -113,13 +113,13 @@ static NSInteger const kDotTag  = 9999;
 
 // ─── 关联对象：SBIconView ↔ 指示器视图（跨层级追踪）──
 static char kMKIndicatorKey;
-static char kMKLabelKey;     // 缓存的名字标签视图
+static char kMKLabelKey;     // v1.6.48 起不再缓存标签（每次现找），保留声明
 static char kMKBidKey;       // 缓存的 bundleID
 static char kMKIconKey;      // 缓存的 icon 指针（检测视图回收复用）
-static char kMKPendBidKey;  // v1.6.37: "待定 bid"（去抖：疑似回收时先记一笔，确认连续 2 次才采用）
+static char kMKPendBidKey;  // v1.6.37/v1.6.46 用过，v1.6.48 起不再使用（保留声明防误用）
 static char kMKBidOfIndicatorKey; // v1.6.39: bundleID associated onto the indicator view (stale detection / logging)
 static char kMKTransitKey;  // v1.6.42: recycle-settle counter (NSNumber) for MKSlotTransitioning
-static char kMKBidStableCountKey; // v1.6.46: 稳定帧计数（newBid 需连续稳定出现这么多次才切换信任）
+static char kMKBidStableCountKey; // v1.6.46 稳定帧计数器，v1.6.48 起不再使用（保留声明防误用）
 
 // v1.6.39: own the indicator by bundleID, NOT by SBIconView instance.
 // Root cause: iOS recycles SBIconView instances (same object re-shows a different app
@@ -163,8 +163,7 @@ static void MKSetIndicator(SBIconView *iv, UIView *dot) {
 // changes we HIDE this slot's indicator and suppress show/create until the pointer is stable
 // for MK_TRANSIT_FRAMES consecutive layout passes; then MKUpdate re-attaches the correct
 // indicator (per-bid registry) to the settled slot. No churn, no hop.
-static const NSInteger MK_TRANSIT_FRAMES = 2;
-static const NSInteger MK_BID_STABLE_FRAMES = 3; // v1.6.46: newBid 需连续稳定出现这么多次才切换信任（克制 applicationBundleID 滞后）
+static const NSInteger MK_TRANSIT_FRAMES = 5;  // v1.6.48: 5 帧覆盖 applicationBundleID 滞后
 static BOOL MKSlotTransitioning(SBIconView *self) {
     id cur = [self icon];
     if (!cur) return NO;
@@ -176,6 +175,8 @@ static BOOL MKSlotTransitioning(SBIconView *self) {
         objc_setAssociatedObject(self, &kMKTransitKey, @(MK_TRANSIT_FRAMES), OBJC_ASSOCIATION_COPY_NONATOMIC);
         objc_setAssociatedObject(self, &kMKBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, &kMKLabelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, &kMKPendBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, &kMKBidStableCountKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
         objc_setAssociatedObject(self, &kMKIconKey, cur, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         return YES;
     }
@@ -221,78 +222,29 @@ static NSString *MKGetCachedBid(SBIconView *iv) {
         return nil;
     }
 
-    // v1.6.46: 取当前槽位应显示的 bid。
-    //   iOS 的 SBIconView 在回收/翻页过渡期会复用同一个 view 显示别的 App，
-    //   且 applicationBundleID 滞后几帧才更新 -> 直接信任会把旧 App 指示器粘到新槽（"翻页粘到别的图标"）。
-    //   见下方「稳定帧去抖」：newBid 与已信任 bid 不同、且连续稳定 K 次才切换信任，
-    //   过渡期 return nil 让 MKUpdate 跳过重挂。MKSlotTransitioning（icon 指针守卫）在
-    //   指针切换瞬间先隐藏，二者配合彻底消除粘错与翻回消失。
+    // v1.6.48: 取当前 icon 的 applicationBundleID 并信任它。
+    //   回收/翻页防粘不再靠「稳定帧去抖」——v1.6.46 的去抖导致翻页后若刷新次数不足，
+    //   计数器不够、指示器永久 hidden（即用户这次说的"翻回不会重新出现"）。
+    //   防粘改由 MKSlotTransitioning（icon 指针切换隐藏 5 帧）+ sScrolling 滚动隐藏负责。
     NSString *oldBid = objc_getAssociatedObject(iv, &kMKBidKey);
     NSString *newBid = nil;
     if ([icon respondsToSelector:@selector(applicationBundleID)]) {
         newBid = [icon applicationBundleID];
     }
-    // 更新缓存的 icon 指针（仅记录，供下一轮比较；此处绝不触发任何指示器清除）
+    // 更新缓存的 icon 指针（供 MKSlotTransitioning 比较回收）
     objc_setAssociatedObject(iv, &kMKIconKey, icon, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    // v1.6.46: 稳定帧去抖（根治"翻页粘到别的图标" + 回收 v1.6.44 / v1.6.45 两版回归）。
-    //   根因：applicationBundleID 在回收/翻页过渡期会**滞后**（旧 App 的 bid 多报几帧），
-    //   直接信任会把旧 App 指示器粘到已变成别的 App 的槽位（粘错）。
-    //   v1.6.44 的"5 帧 nil 窗口"依赖 MKGetCachedBid 被调用次数来 drain 计数器，
-    //   但翻页后该槽若不再被刷，计数器冻结→指示器永久 hidden（v1.6.44「翻回看不到」回归）；
-    //   v1.6.45 改"非滚动立即信任"又把粘错放回（v1.6.45 回归）。
-    //   新方案：newBid 与已信任 bid 不同、且**连续稳定出现 MK_BID_STABLE_FRAMES 次**才切换信任；
-    //   过渡期一律 return nil 让 MKUpdate 跳过重挂（不粘、不误显）。
-    //   计数器每次调用都推进，稳定后必在 K 次内收敛——不冻结、也不依赖滚动状态。
-    NSString *trusted = oldBid; // kMKBidKey：当前被信任的 bid
-    if (newBid && trusted && [newBid isEqualToString:trusted]) {
-        // 稳定：与已信任一致 -> 清待定、立即信任，无延迟。
-        objc_setAssociatedObject(iv, &kMKPendBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(iv, &kMKBidStableCountKey, @(0), OBJC_ASSOCIATION_COPY_NONATOMIC);
-        return trusted;
-    }
-    if (!newBid) {
-        // 有 icon 但取不到 bid（极少数边界）-> 清待定、信任置空、返回 nil。
-        objc_setAssociatedObject(iv, &kMKPendBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(iv, &kMKBidStableCountKey, @(0), OBJC_ASSOCIATION_COPY_NONATOMIC);
-        objc_setAssociatedObject(iv, &kMKBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        return nil;
-    }
-    // newBid 与 trusted 不同（或 trusted 为 nil）-> 进入稳定去抖：
-    //   连续 K 次看到同一个 newBid 才信任，否则 return nil（不挂、不粘）。
-    NSString *pend = objc_getAssociatedObject(iv, &kMKPendBidKey);
-    NSInteger stableCount = [objc_getAssociatedObject(iv, &kMKBidStableCountKey) integerValue];
-    if (!pend || ![pend isEqualToString:newBid]) {
-        // 候选变化 -> 重启计数
-        objc_setAssociatedObject(iv, &kMKPendBidKey, newBid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(iv, &kMKBidStableCountKey, @(1), OBJC_ASSOCIATION_COPY_NONATOMIC);
-        return nil;
-    }
-    stableCount += 1;
-    if (stableCount >= MK_BID_STABLE_FRAMES) {
-        // 连续稳定 K 次 -> 切换信任到 newBid
-        objc_setAssociatedObject(iv, &kMKBidKey, newBid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(iv, &kMKPendBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(iv, &kMKBidStableCountKey, @(0), OBJC_ASSOCIATION_COPY_NONATOMIC);
-        objc_setAssociatedObject(iv, &kMKLabelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // bid 变了，标签缓存失效
-        return newBid;
-    }
-    objc_setAssociatedObject(iv, &kMKBidStableCountKey, @(stableCount), OBJC_ASSOCIATION_COPY_NONATOMIC);
-    return nil;
+    NSString *bid = newBid ? newBid : oldBid;  // 临时取不到 bid 时回退旧缓存
+    if (bid) objc_setAssociatedObject(iv, &kMKBidKey, bid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return bid;
 }
 
 
-// 缓存名字标签视图（避免每次 layoutSubviews 都跑 MKFindLabelView 4 重策略）
+// v1.6.48: 标签不再缓存。SBIconView 回收复用会让缓存的标签指向别的槽位，
+//   导致指示器被定位到别的 App 名称位置。每次现找（Strategy 2 按 icon 中心最近匹配），
+//   保证拿的一定是当前这个 icon 的标签。
 static UIView *MKGetCachedLabel(SBIconView *iv) {
-    UIView *label = objc_getAssociatedObject(iv, &kMKLabelKey);
-    // v1.6.47: 收紧校验 —— 缓存的 label 必须仍活在「当前槽位的内容视图」里
-    //   （label.superview == iv.superview），否则可能是回收前上一个 App 遗留的兄弟标签，
-    //   会误隐藏/误用错槽的坐标。SBIconView 回收后旧 label 不一定被移除。
-    if (label && label.superview == iv.superview) return label;  // 仍然有效且属于本槽
-    // 缓存失效 → 重新查找
-    label = MKFindLabelView(iv);
-    if (label) objc_setAssociatedObject(iv, &kMKLabelKey, label, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    return label;
+    return MKFindLabelView(iv);
 }
 
 // ─── 状态去重：同一个 bundleID 的 (running, foreground) 没变就不刷新 ──
@@ -1044,13 +996,14 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
 
         // ── Strategy 2: 父视图兄弟节点（iOS 16 核心！标签是 SBIconView 的兄弟）──
         // SBIconView 和 SBIconListLabel 是同一个父容器的子视图
-        // v1.6.33: 移除 <=8 子视图限制，文件夹/Dock 等布局里父容器可能更大；
-        // 靠评分阈值（>=50）和 SBIconListLabel 精确匹配避免误把 badge/close button 当标签。
+        // v1.6.48: 改成「找离当前 icon 中心最近的标签」而不是「找分数最高的标签」。
+        //   旧逻辑只按类名分数 pick，如果父容器里有多个 label（多图标），会永远拿到第一个，
+        //   导致指示器被定位到别的 App 名称位置（即用户看到的「位置错了」）。
         UIView *parent = iconView.superview;
         if (parent) {
-            // 用评分机制避免误把 badge/close button 等当标签
             UIView *bestMatch = nil;
-            NSInteger bestScore = 0;
+            CGFloat bestDist = CGFLOAT_MAX;
+            CGPoint iconCenter = iconView.center;
             for (UIView *sv in parent.subviews) {
                 if (sv == iconView) continue;  // 跳过自己
                 NSString *cls = NSStringFromClass([sv class]);
@@ -1062,12 +1015,17 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
                 else if ([sv isKindOfClass:[UILabel class]])          score = 60;
                 else if ([cls containsString:@"LabelView"])           score = 50;
                 else if ([cls containsString:@"Label"])              score = 40;
-                if (score > bestScore) {
-                    bestScore = score;
+                if (score < 50) continue;  // 不是标签，跳过
+                // 在同类标签里，挑离当前 icon 中心最近的一个
+                CGFloat dx = sv.center.x - iconCenter.x;
+                CGFloat dy = sv.center.y - iconCenter.y;
+                CGFloat dist = sqrt(dx * dx + dy * dy);
+                if (dist < bestDist && dist < 200.0) {  // 200pt 阈值：避免跨页/跨文件夹误拿
+                    bestDist = dist;
                     bestMatch = sv;
                 }
             }
-            if (bestMatch && bestScore >= 50) {
+            if (bestMatch) {
                 return bestMatch;
             }
         }
@@ -1171,11 +1129,9 @@ static void MKUpdate(SBIconView *self) {
         // v1.6.39: grab both "indicator cached on this slot" and "indicator this bid SHOULD have".
         //   If they differ, the cache belongs to a previously-recycled bid -> detach from our slot, don't destroy.
         UIView *label = MKGetCachedLabel(self);
-        // v1.6.47: hostView 永远用 self.superview（图标所在滚动/列表内容视图），
-        //   不再用 label.superview —— 旧 label 在 SBIconView 回收后仍活在同一个内容视图里，
-        //   label.superview 虽仍等于 self.superview，但 label.frame 是上一个 App/槽位遗留下来的坐标，
-        //   用它给指示器定位会把点飘到错处（日志里 y=233 这种「图标中间」就是这么来的）。
-        //   定位统一改走 MKEstimateLabelFrame(self)（确定性地算 self.frame 底+gap），见下方。
+        // v1.6.48: hostView 用 self.superview（图标所在滚动/列表内容视图）。
+        //   标签在 iOS 16 是 SBIconView 的兄弟节点，label.superview == self.superview；
+        //   定位优先用 label.frame（精确对应名称位置），无标签时回退到 MKEstimateLabelFrame。
         UIView *hostView = self.superview ? self.superview : self;
         UIView *cachedInd = MKGetIndicator(self);
         UIView *bidInd     = MKIndicatorForBid(bundleID);
@@ -1186,14 +1142,8 @@ static void MKUpdate(SBIconView *self) {
         }
         UIView *indicator = (bidInd ? bidInd : cachedInd);
 
-        // v1.6.38: icon recycle / reuse transition guard -- kills the "mis-attributed flash".
-        //   During the transition we only HIDE whatever is in our slot, don't create/show, return;
-        //   (v1.6.39: once the bid settles, below re-parents correctly, never onto the wrong app.)
-        BOOL bidTransitioning = (objc_getAssociatedObject(self, &kMKPendBidKey) != nil);
-        if (bidTransitioning) {
-            if (indicator) indicator.hidden = YES;
-            return;
-        }
+        // v1.6.48: 不再使用 kMKPendBidKey 作为去抖守卫。回收/翻页防粘由
+        //   MKSlotTransitioning（icon 指针切换隐藏 5 帧）+ sScrolling 滚动隐藏负责。
 
         MKConfig *cfg = [MKConfig sharedConfig];
         if (MKIsDisabled() || !cfg || !cfg.enabled) {
@@ -1239,10 +1189,12 @@ static void MKUpdate(SBIconView *self) {
         if (cfg.shape == MKShapeDot) { indicatorW = cfg.dotSize; indicatorH = cfg.dotSize; }
         else { indicatorW = cfg.barWidth; indicatorH = cfg.barHeight; }
 
-        // v1.6.47: 定位锚点**永远**用 MKEstimateLabelFrame(self)（self.frame 底 + gap），
-        //   不再读 label.frame。label 只用于「隐藏名称」，不参与定位——避免回收后旧 label 坐标污染。
+        // v1.6.48: 定位优先用真实标签 frame（名称所在位置），找不到标签才回退估算。
+        //   MKGetCachedLabel 现在每次现找最近标签，不会再拿到回收前别的槽的标签。
         CGRect labelFrameInHost;
-        if (self.superview) {
+        if (label && label.superview) {
+            labelFrameInHost = label.frame;
+        } else if (self.superview) {
             labelFrameInHost = MKEstimateLabelFrame((SBIconView *)self);
         } else {
             CGSize s = self.bounds.size;
@@ -1825,9 +1777,9 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     // v1.5.8: 标签正在渐隐 → 只重定位指示器，不操作标签（让动画自然播放）
     if (MKIsFadingLabel(bid)) {
         if (indicator) {
-            // v1.6.47: 渐隐期间只重定位，锚点统一用 MKEstimateLabelFrame(self)（同 MKUpdate），
-            //   不再读 label.frame（回收后旧 label 坐标会把点定到错处）。
-            CGRect lf = MKEstimateLabelFrame((SBIconView *)self);
+            // v1.6.48: 渐隐期间定位回退到标签 frame（或估算），确保点仍在名称位置。
+            UIView *label = MKGetCachedLabel(self);
+            CGRect lf = (label && label.superview) ? label.frame : MKEstimateLabelFrame((SBIconView *)self);
             CGFloat indW, indH;
             MKConfig *cfg = [MKConfig sharedConfig];
             if (cfg.shape == MKShapeDot) { indW = cfg.dotSize; indH = cfg.dotSize; }
@@ -1853,8 +1805,9 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         indH = cfg.barHeight;
     }
 
-    // v1.6.47: 标签只用于「隐藏名称」，定位锚点统一用 MKEstimateLabelFrame(self)，
-    //   不再读 label.frame（回收后旧 label 坐标会把点定到错处）。
+    // v1.6.48: 标签只用于「隐藏名称」，定位锚点优先用 label.frame（精确名称位置），
+    //   无标签时回退 MKEstimateLabelFrame。MKGetCachedLabel 每次现找最近标签，
+    //   不会再拿到回收前别的槽的标签。
     UIView *label = MKGetCachedLabel(self);
     if (label) {
         // 重新强制隐藏标签（防止系统 layout 恢复）
@@ -1863,7 +1816,14 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         label.layer.opacity = 0.0f;
         label.opaque = NO;
     }
-    if (self.superview) {
+    if (label && label.superview) {
+        CGRect lf = label.frame;
+        indicator.frame = CGRectMake(
+            lf.origin.x + (lf.size.width - indW) / 2.0f,
+            lf.origin.y + (lf.size.height - indH) / 2.0f,
+            indW, indH
+        );
+    } else if (self.superview) {
         CGRect elf = MKEstimateLabelFrame((SBIconView *)self);
         indicator.frame = CGRectMake(
             elf.origin.x + (elf.size.width - indW) / 2.0f,
@@ -2152,7 +2112,7 @@ static BOOL MKIsSupportedOS(void) {
     %init;
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
-    NSLog(@"[RunningDotIndicator] v1.6.47 ctor: POSITIONING root-cause fixed — indicator anchor no longer reads the cached name-label's frame (stale label from a recycled slot parked the dot at the old app's y, e.g. y=233 mid-icon). Anchor is now always MKEstimateLabelFrame(self) = self.frame bottom+gap, deterministic per current slot; hostView is always self.superview; MKGetCachedLabel requires label.superview==iv.superview. Identity (stable-frame debounce) from v1.6.46 unchanged.");
+    NSLog(@"[RunningDotIndicator] v1.6.48 ctor: reverts v1.6.47 positioning — label anchor is back, but labels are no longer cached (closest-to-icon search prevents stale recycled-slot labels). Removes v1.6.46 stable-frame debounce (it froze after page-swipe if not enough refreshes); recycle guard extended to 5 frames (MKSlotTransitioning) + scroll-hide remains.");
 
     // v1.6.37: 根除问题①(churn) + 问题②的瞬时部分。
     //   根因(rd_log(66) 确证)：iOS 的 SBIconView.icon 在布局/滚动/角标刷新等过渡期，会瞬时返回
