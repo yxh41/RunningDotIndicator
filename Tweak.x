@@ -199,6 +199,8 @@ static void MKRefreshIconForBundleID(NSString *bid);
 // 前向声明（miss 重试的 dispatch 块内需要判断运行状态）
 static BOOL MKIsAppRunning(NSString *bundleID);
 static BOOL MKIsForeground(NSString *bid);
+// 前向声明（MKGetCachedBid 定义在 sScrolling 声明之前，需经此访问器读取）
+static BOOL MKIsScrolling(void);
 
 // 缓存 bundleID（避免每次 layoutSubviews 都调 applicationBundleID）
 // v1.5.4: 检测 icon 变化（SBIconView 回收复用）+ 过滤文件夹图标
@@ -229,26 +231,39 @@ static NSString *MKGetCachedBid(SBIconView *iv) {
     // 更新缓存的 icon 指针（仅记录，供下一轮比较；此处绝不触发任何指示器清除）
     objc_setAssociatedObject(iv, &kMKIconKey, icon, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    // v1.6.40 / v1.6.44: 去抖与 bid-settle。
+    // v1.6.40 / v1.6.44 / v1.6.45: 去抖与 bid-settle。
     //   v1.6.37 的"待定 bid 去抖"在回收瞬间仍返回旧 bid，导致 layoutSubviews 把旧 App
     //   指示器 reposition 到已变成别的 App 的槽位；v1.6.40 去掉它，直接采用真实新 bid。
-    //   但 v1.6.43 实测仍发现 applicationBundleID 滞后于视觉（回收槽仍报旧 bid 几帧），
-    //   因此 v1.6.44 引入 bid-settle：bid 变化后先返回 nil 若干帧，等连续稳定后再返回真实新 bid。
-    //   这样 MKUpdate 在 settle 期间直接跳过，不会把旧 App 指示器挂到错误槽位。
-    // v1.6.44: bid 变化后不能立即信任 —— applicationBundleID 在回收/翻页时可能滞后于视觉。
-    //   在 settle 期间返回 nil，让 MKUpdate 跳过（不显示/不创建/不重父化），避免把旧 App 指示器粘到错误槽位。
+    //   v1.6.44 引入 bid-settle：bid 变化后先返回 nil 若干帧，避免把旧 App 指示器粘到正回收的槽位。
+    //   v1.6.45 修正：bid-settle 的 nil 窗口**只在 sScrolling=YES（滚动中）时生效**——
+    //   滚动时 MKUpdate 本就在 sScrolling 守卫处提前 hide+return，所以 nil 窗口只是冗余保险；
+    //   但翻页停止后的统一刷新（sScrolling=NO）若命中该窗口，会 return nil 让 MKUpdate 提前 return，
+    //   而 settle 计数器只在 MKGetCachedBid 被调用时递减，翻停后若不再刷该槽就永远 drain 不掉，
+    //   指示器于是卡在 hidden（即 v1.6.44「翻回看不到指示器」回归）。故非滚动时一律立刻信任真实 bid。
     if (oldBid && newBid && ![oldBid isEqualToString:newBid]) {
         objc_setAssociatedObject(iv, &kMKLabelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(iv, &kMKBidTransitionCountKey, @(MK_BID_SETTLE_FRAMES), OBJC_ASSOCIATION_COPY_NONATOMIC);
         objc_setAssociatedObject(iv, &kMKBidKey, newBid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        return nil;
+        if (MKIsScrolling()) {
+            // 滚动中：applicationBundleID 可能滞后于视觉（回收槽瞬时报旧 bid），
+            // 先返回 nil 让 MKUpdate 跳过，避免把旧 App 指示器粘到正回收的槽位（v1.6.44 防粘）。
+            objc_setAssociatedObject(iv, &kMKBidTransitionCountKey, @(MK_BID_SETTLE_FRAMES), OBJC_ASSOCIATION_COPY_NONATOMIC);
+            return nil;
+        }
+        // 非滚动（翻页停止后的统一刷新 / 普通回收）：槽位已视觉稳定，直接信任真实新 bid，
+        // 不进入 nil 窗口 —— 否则 settle 计数器永远 drain 不掉，指示器翻回后卡在 hidden（v1.6.44 回归）。
+        objc_setAssociatedObject(iv, &kMKBidTransitionCountKey, @(0), OBJC_ASSOCIATION_COPY_NONATOMIC);
+        return newBid;
     }
 
     NSInteger settleCount = [objc_getAssociatedObject(iv, &kMKBidTransitionCountKey) integerValue];
     if (settleCount > 0) {
-        settleCount--;
-        objc_setAssociatedObject(iv, &kMKBidTransitionCountKey, @(settleCount), OBJC_ASSOCIATION_COPY_NONATOMIC);
-        return nil;
+        if (MKIsScrolling()) {
+            // 仅滚动中继续递减 nil 窗口；非滚动时 settle 计数器已无意义，立即清零并信任当前 bid。
+            settleCount--;
+            objc_setAssociatedObject(iv, &kMKBidTransitionCountKey, @(settleCount), OBJC_ASSOCIATION_COPY_NONATOMIC);
+            return nil;
+        }
+        objc_setAssociatedObject(iv, &kMKBidTransitionCountKey, @(0), OBJC_ASSOCIATION_COPY_NONATOMIC);
     }
 
     // v1.6.40: 去掉 v1.6.37 的"待定 bid 去抖"（已由 v1.6.44 bid-settle 取代）。
@@ -381,6 +396,10 @@ static BOOL  sScrollRefreshScheduled = NO;   // 滚动刷新是否已排程（12
 
 static BOOL sScrolling = NO;        // v1.6.43: 滚动进行中 -> 隐藏所有指示器（不显示/不创建），滚动停后由 MKRefreshSubviews 重显
 static dispatch_block_t sScrollStopBlock; // v1.6.43: 滚动心跳 -> 末次 scroll 事件后 200ms 清 sScrolling 并重刷（静态默认零初始化即 nil）
+
+// v1.6.45: 访问器 —— MKGetCachedBid 定义在 sScrolling 声明之前，借由此函数读取，
+//   避免「use of undeclared identifier」（-Werror 下编译失败）。
+static BOOL MKIsScrolling(void) { return sScrolling; }
 
 // ─── sPendingBIDs 辅助 ─── v1.5.6+ ───
 // 前台→后台时，立即隐藏标签但延迟300ms创建指示器
@@ -2148,7 +2167,7 @@ static BOOL MKIsSupportedOS(void) {
     %init;
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
-    NSLog(@"[RunningDotIndicator] v1.6.44 ctor: scroll + bid-settle guard kills 'indicator hops to wrong icon on scroll' (setContentOffset: hook + 5-frame bid settle); see comments below for full history.");
+    NSLog(@"[RunningDotIndicator] v1.6.45 ctor: bid-settle nil-window now gated to sScrolling only — fixes v1.6.44 regression where indicators stayed hidden after page-return (settle counter never drained); scroll-hide + per-bid registry + icon-pointer recycle guard unchanged. see comments below for full history.");
 
     // v1.6.37: 根除问题①(churn) + 问题②的瞬时部分。
     //   根因(rd_log(66) 确证)：iOS 的 SBIconView.icon 在布局/滚动/角标刷新等过渡期，会瞬时返回
