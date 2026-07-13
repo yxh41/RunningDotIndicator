@@ -117,6 +117,31 @@ static char kMKLabelKey;     // 缓存的名字标签视图
 static char kMKBidKey;       // 缓存的 bundleID
 static char kMKIconKey;      // 缓存的 icon 指针（检测视图回收复用）
 static char kMKPendBidKey;  // v1.6.37: "待定 bid"（去抖：疑似回收时先记一笔，确认连续 2 次才采用）
+static char kMKBidOfIndicatorKey; // v1.6.39: bundleID associated onto the indicator view (stale detection / logging)
+
+// v1.6.39: own the indicator by bundleID, NOT by SBIconView instance.
+// Root cause: iOS recycles SBIconView instances (same object re-shows a different app
+//   during scroll / page-swipe). The old model attached the indicator to the instance,
+//   so the dot rode the recycled instance onto another app's icon ("runs around").
+// New model: each running bid keeps ONE indicator view in sIndicatorByBid.
+//   Every MKUpdate/layoutSubviews just re-parents that one view onto whatever
+//   view currently shows the bid. When a view is recycled to another bid we only
+//   DETACH the old bid's indicator from that slot (keep it alive); it re-attaches
+//   when the correct view shows up -> no hopping, no rebuild.
+static NSMutableDictionary<NSString*, UIView*> *sIndicatorByBid = nil;
+
+static UIView *MKIndicatorForBid(NSString *bid) {
+    if (!bid || !sIndicatorByBid) return nil;
+    return sIndicatorByBid[bid];
+}
+// Only destroy on a REAL exit (bid removed from running set); scroll/recycle only detaches.
+static void MKDestroyIndicatorForBid(NSString *bid) {
+    if (!bid || !sIndicatorByBid) return;
+    UIView *ind = sIndicatorByBid[bid];
+    if (ind) [ind removeFromSuperview];
+    [sIndicatorByBid removeObjectForKey:bid];
+    // stale kMKIndicatorKey caches on views self-heal via the stale check in MKUpdate/layoutSubviews
+}
 
 static UIView *MKGetIndicator(SBIconView *iv) {
     return objc_getAssociatedObject(iv, &kMKIndicatorKey);
@@ -1059,232 +1084,131 @@ static void MKUpdate(SBIconView *self) {
         if (!sInitDone) return;
 
         sCallCount++;
-        if (MKIsDisabled()) {
-            UIView *indicator = MKGetIndicator(self);
-            if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
-            UIView *label = MKGetCachedLabel(self);
-            if (label) {
-                label.hidden = NO;
-                label.alpha = 1.0f;
-                label.layer.opacity = 1.0f;
-                label.opaque = YES;
-            }
+
+        NSString *bundleID = MKGetCachedBid(self);
+        if (!bundleID || bundleID.length == 0) return;
+
+        // v1.6.39: grab both "indicator cached on this slot" and "indicator this bid SHOULD have".
+        //   If they differ, the cache belongs to a previously-recycled bid -> detach from our slot, don't destroy.
+        UIView *label = MKGetCachedLabel(self);
+        UIView *hostView = label ? label.superview : (self.superview ? self.superview : self);
+        UIView *cachedInd = MKGetIndicator(self);
+        UIView *bidInd     = MKIndicatorForBid(bundleID);
+        if (cachedInd && cachedInd != bidInd) {
+            if (cachedInd.superview == hostView) [cachedInd removeFromSuperview];
+            MKSetIndicator(self, nil);
+            cachedInd = nil;
+        }
+        UIView *indicator = (bidInd ? bidInd : cachedInd);
+
+        // v1.6.38: icon recycle / reuse transition guard -- kills the "mis-attributed flash".
+        //   During the transition we only HIDE whatever is in our slot, don't create/show, return;
+        //   (v1.6.39: once the bid settles, below re-parents correctly, never onto the wrong app.)
+        BOOL bidTransitioning = (objc_getAssociatedObject(self, &kMKPendBidKey) != nil);
+        if (bidTransitioning) {
+            if (indicator) indicator.hidden = YES;
             return;
         }
 
         MKConfig *cfg = [MKConfig sharedConfig];
-        if (!cfg || !cfg.enabled) {
-            UIView *indicator = MKGetIndicator(self);
-            if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
-            UIView *label = MKGetCachedLabel(self);
-            if (label) {
-                label.hidden = NO;
-                label.alpha = 1.0f;
-                label.layer.opacity = 1.0f;
-                label.opaque = YES;
+        if (MKIsDisabled() || !cfg || !cfg.enabled) {
+            if (indicator) {
+                if (indicator.superview == hostView) [indicator removeFromSuperview];
+                MKSetIndicator(self, nil);
             }
+            if (label) { label.hidden = NO; label.alpha = 1.0f; label.layer.opacity = 1.0f; label.opaque = YES; }
             return;
         }
 
-        // v1.5.3: 使用缓存的 bundleID（避免每次都调 applicationBundleID）
-        NSString *bundleID = MKGetCachedBid(self);
-        if (!bundleID || bundleID.length == 0) return;
-
-        // v1.6.38: 图标回收/复用过渡态守卫 —— 消除"错位闪点"。
-        // 现象（用户肉眼+rd_log(68)）：滚动/切页时，某个没打开的 App 会**短暂闪一下**指示器。
-        // 根因：v1.6.37 的"去抖"在图标从 App A 被回收复用成 App B 的 1~2 帧里，
-        //   MKGetCachedBid 返回的是旧 bid（A，去抖保留），于是 MKUpdate 按 A 操作，
-        //   把 A 的圆点短暂挂到 B 的图标上 → 闪一下错位的圆点（B 是"没打开的 App"）。
-        // 处理：若 kMKPendBidKey 非空（去抖尚未确认、仍处在过渡态），
-        //   本帧只**隐藏**已有指示器、不创建/不显示，直接 return；
-        //   等下一次调用（去抖已确认、bid 已稳定为 B）再正常刷新。
-        //   这彻底消除错位闪点，且**只 hidden 不 removeFromSuperview** → 不会 reintroduce churn。
-        //   代价：过渡的 1 帧里（仅重度布局/快速滚动瞬间）指示器短暂隐藏，远比"错位闪一下别的 App"可接受。
-        BOOL bidTransitioning = (objc_getAssociatedObject(self, &kMKPendBidKey) != nil);
-        if (bidTransitioning) {
-            UIView *tInd = MKGetIndicator(self);
-            if (tInd) tInd.hidden = YES;   // 过渡期间隐藏，避免上一个 App 的圆点错位挂到当前图标
-            return;                         // 不创建/不显示，等下一次调用（去抖已确认）正常处理
-        }
-
-        BOOL running = MKIsAppRunning(bundleID);
+        BOOL running     = MKIsAppRunning(bundleID);
         BOOL isForeground = MKIsForeground(bundleID);
-        BOOL isPending = MKIsPending(bundleID);       // v1.5.6+: 等待300ms的App
-        BOOL isFading = MKIsFadingLabel(bundleID);    // v1.5.8: 标签正在渐隐中
+        BOOL isPending   = MKIsPending(bundleID);
+        BOOL isFading   = MKIsFadingLabel(bundleID);
 
-        // v1.5.3: 使用缓存的标签视图（避免每次都跑 MKFindLabelView 4 重策略）
-        UIView *label = MKGetCachedLabel(self);
-        if (label) {  // v1.6.35: 标签找到了 → 清重试计数，允许下次（如图标复用）再走完整流程
+        if (label) {
             if (!sLabelRetryCount) sLabelRetryCount = [NSMutableDictionary dictionary];
             [sLabelRetryCount removeObjectForKey:bundleID];
         }
-        UIView *indicator = MKGetIndicator(self);
 
-        // 当前被用户打开在前台的 App，桌面上不再显示指示器（避免启动动画残留）
-        // v1.6.33: 改为 hidden 而非 removeFromSuperview，避免回桌面/翻页时因状态异步反复销毁重建。
-        // App 退出 → 彻底移除；App 前台 → 隐藏；App 后台 → 显示。
-        if (!running) {
-            // ── App 不在运行 → 移除指示器，恢复名字 ──
-            if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
-            if (label) {
-                label.hidden = NO;
-                label.alpha = 1.0f;
-                label.layer.opacity = 1.0f;
-                label.opaque = YES;
+        // ---- current bid should NOT show in our slot -> just detach (real exit handled by MKDestroyIndicatorForBid) ----
+        if (!running || isForeground || isFading || isPending) {
+            if (indicator) {
+                if (!running) {
+                    if (indicator.superview == hostView) [indicator removeFromSuperview];
+                    MKSetIndicator(self, nil);
+                } else {
+                    indicator.hidden = YES; // foreground / fading / pending: keep attached, just hide; reappears when backgrounded
+                }
             }
-            MKRemovePending(bundleID);  // v1.5.6+: 清除 pending 状态
-            MKRemoveFadingLabel(bundleID); // v1.5.8: 清除渐隐状态
+            if (label) { label.hidden = NO; label.alpha = 1.0f; label.layer.opacity = 1.0f; label.opaque = YES; }
+            if (!running) { MKRemovePending(bundleID); MKRemoveFadingLabel(bundleID); }
             return;
         }
 
-        if (isForeground) {
-            // ── App 在前台 → 隐藏指示器（保留在视图层级），恢复名字 ──
-            if (indicator) { indicator.hidden = YES; }
-            if (label) {
-                label.hidden = NO;
-                label.alpha = 1.0f;
-                label.layer.opacity = 1.0f;
-                label.opaque = YES;
-            }
-            MKRemovePending(bundleID);  // 清除 pending 状态
-            MKRemoveFadingLabel(bundleID); // 清除渐隐状态
-            return;
-        }
-
-        // v1.5.8: 标签正在渐隐中 → 不干扰动画，不创建指示器
-        // 让 250ms 渐隐动画自然播放，300ms后才创建指示器
-        if (isFading) {
-            return;  // 不做任何操作，让渐隐动画继续
-        }
-
-        // v1.5.6+: pending 期间只隐藏标签，不创建指示器（等300ms回调）
-        // 标签渐隐已完成（alpha=0），但仍需保持隐藏状态防止系统恢复
-        if (isPending) {
-            if (label) {
-                label.hidden = YES;
-                label.alpha = 0.0f;
-                label.layer.opacity = 0.0f;
-                label.opaque = NO;
-            }
-            return;  // 不创建指示器，等300ms后 MKRefreshIconForBundleID 回调
-        }
-
+        // ---- running (background) -> show THIS bid's indicator, re-parented into our slot ----
         RDLogRunning(bundleID);
+        if (label) { label.hidden = YES; label.alpha = 0.0f; label.layer.opacity = 0.0f; label.opaque = NO; }
+        else { if (sDebugLog) RDLog(@"NO LABEL for running app: %@", bundleID); }
 
-        // ── App 正在运行 → 隐藏名字，显示指示器 ──
-        if (label) {
-            label.hidden = YES;
-            label.alpha = 0.0f;
-            label.layer.opacity = 0.0f;
-            label.opaque = NO;
-        } else {
-            // v1.5.5 诊断：App 在运行但找不到标签
-            if (sDebugLog) RDLog(@"NO LABEL for running app: %@", bundleID);
-        }
-
-        // 指示器尺寸
         CGFloat indicatorW, indicatorH;
-        if (cfg.shape == MKShapeDot) {
-            indicatorW = cfg.dotSize;
-            indicatorH = cfg.dotSize;
-        } else {
-            // Bar/Pill 形状
-            indicatorW = cfg.barWidth;
-            indicatorH = cfg.barHeight;
-        }
+        if (cfg.shape == MKShapeDot) { indicatorW = cfg.dotSize; indicatorH = cfg.dotSize; }
+        else { indicatorW = cfg.barWidth; indicatorH = cfg.barHeight; }
 
-        // ── 决定宿主视图和位置 ──
-        UIView *hostView;
-        CGRect indicatorFrame;
-
-        // v1.6.36: 还原 1.6.31 的正确定位 —— 宿主 = label.superview（图标列表视图，
-        //   图标与名称同处一个坐标系），位置 = label.frame（名称的真实位置）。
-        //   1.6.32 起误把宿主改成 self(SBIconView) 并用 convertRect:toView:self，
-        //   而 self 带 transform（按压/翻页缩放）→ 指示器作其子视图继承该 transform、
-        //   名称标签（兄弟节点）却不继承 → 指示器被带偏/带缩（用户反馈"位置不对"，且 1.6.31 之前正常）。
-        //   翻页/重父化稳定性：用"同一指示器重新 addSubview 挂回当前 label.superview"
-        //   替代销毁重建（即下方 indicator.superview != hostView 分支），与 1.6.34 对 self 验证过的 re-attach 思路一致。
-        hostView = label ? label.superview : (self.superview ? self.superview : self);
         CGRect labelFrameInHost;
         if (label && label.superview) {
-            // 标签存在且在层级中 → 直接用 label.frame（已位于 label.superview 坐标系）
             labelFrameInHost = label.frame;
+        } else if (self.superview) {
+            CGRect icf = self.frame;
+            CGFloat ey = icf.origin.y + icf.size.height + 4.0f;
+            labelFrameInHost = CGRectMake(icf.origin.x, ey, icf.size.width, 14.0f);
         } else {
-            // 无标签（Dock / 系统 App / 标签延迟未挂上）→ 估算"名称所在区域"（与 1.6.31 一致）
-            if (self.superview) {
-                CGRect iconFrame = self.frame;
-                CGFloat estimatedLabelY = iconFrame.origin.y + iconFrame.size.height + 4.0f;
-                CGFloat estimatedLabelH = 14.0f;
-                labelFrameInHost = CGRectMake(iconFrame.origin.x, estimatedLabelY, iconFrame.size.width, estimatedLabelH);
-            } else {
-                CGSize mySize = self.bounds.size;
-                if (mySize.width < 10 || mySize.height < 10) return;
-                labelFrameInHost = CGRectMake(0, mySize.height - 16.0f, mySize.width, 14.0f);
-            }
+            CGSize s = self.bounds.size;
+            if (s.width < 10 || s.height < 10) return;
+            labelFrameInHost = CGRectMake(0, s.height - 16.0f, s.width, 14.0f);
         }
-        indicatorFrame = CGRectMake(
+        CGRect indicatorFrame = CGRectMake(
             labelFrameInHost.origin.x + (labelFrameInHost.size.width - indicatorW) / 2.0f,
             labelFrameInHost.origin.y + (labelFrameInHost.size.height - indicatorH) / 2.0f,
-            indicatorW,
-            indicatorH
-        );
-
-        // v1.6.34 / v1.6.36: 宿主视图变了（SpringBoard 在转场/重布局/翻页时会临时重父化
-        //   label.superview —— 含我们挂在那里的指示器 —— 导致 indicator.superview 不再是当前 hostView）
-        //   → 直接把"同一个指示器"重新挂回 hostView（addSubview: 会先把它从旧父视图摘下再挂上），
-        //     复用同一视图，绝不再 removeFromSuperview + nil + 重新 alloc。
-        //   这正是 1.6.31 时代"翻页指示器消失"的根治法（旧代码是销毁重建）；
-        //   配合还原 1.6.31 的正确定位（宿主=label.superview, label.frame），位置与 1.6.31 一致且翻页不 churn。
-        //   注意：不置 nil、不 MKSetIndicator(self,nil)，关联对象仍指向同一个 indicator。
-        if (indicator && indicator.superview != hostView) {
-            [hostView addSubview:indicator];
-            indicator.hidden = NO;
-        }
+            indicatorW, indicatorH);
 
         if (!indicator) {
+            // v1.6.39: create ONCE per bid, store in sIndicatorByBid; afterwards only re-parent -> zero rebuild/churn.
+            if (!sIndicatorByBid) sIndicatorByBid = [NSMutableDictionary dictionary];
             indicator = [[MKIndicatorDotView alloc] initWithFrame:indicatorFrame];
             indicator.tag = kDotTag;
             [(MKIndicatorDotView *)indicator applyConfig];
-
-            // v1.6.11: AutoIcon 模式 — 从图标取主色调作为指示器颜色
             if (cfg.colorMode == MKColorModeAutoIcon) {
                 UIColor *iconColor = MKCachedIconColorForBundleID(bundleID);
                 [(MKIndicatorDotView *)indicator setIndicatorColor:iconColor];
-                [indicator setNeedsDisplay];  // 用新颜色重绘
+                [indicator setNeedsDisplay];
             }
-
-            // v1.5.7: 渐显动画 — 状态切换时指示器 alpha 0→cfg.opacity 200ms
             BOOL shouldAnimate = MKShouldAnimateIndicator(bundleID);
-            MKRemoveAnimateIndicator(bundleID);  // 消费标记（一次性）
-
-            // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
+            MKRemoveAnimateIndicator(bundleID);
             if (sDebugLog) RDLog(@"Indicator CREATE: %@ shape=%d animate=%d label=%@",
-                  bundleID, (int)cfg.shape, shouldAnimate,
-                  label ? @"YES" : @"NO(FALLBACK)");
-
+                  bundleID, (int)cfg.shape, shouldAnimate, label ? @"YES" : @"NO(FALLBACK)");
+            [sIndicatorByBid setObject:indicator forKey:bundleID];
+            objc_setAssociatedObject(indicator, &kMKBidOfIndicatorKey, bundleID, OBJC_ASSOCIATION_COPY_NONATOMIC);
+            MKSetIndicator(self, indicator);
             if (shouldAnimate) {
-                indicator.alpha = 0.0f;  // 从不可见开始
+                indicator.alpha = 0.0f;
                 [hostView addSubview:indicator];
-                MKSetIndicator(self, indicator);
                 CGFloat finalAlpha = cfg.opacity;
-                if (sDebugLog) RDLog(@"Indicator FADE-IN: %@ alpha 0→%.2f", bundleID, finalAlpha);
-                [UIView animateWithDuration:0.2 animations:^{
-                    indicator.alpha = finalAlpha;
-                }];
+                if (sDebugLog) RDLog(@"Indicator FADE-IN: %@ alpha 0->%.2f", bundleID, finalAlpha);
+                [UIView animateWithDuration:0.2 animations:^{ indicator.alpha = finalAlpha; }];
             } else {
                 [hostView addSubview:indicator];
-                MKSetIndicator(self, indicator);
             }
         } else {
-            // v1.5.9: 只重定位指示器，不调用 applyConfig
-            // applyConfig 会设置 self.alpha = cfg.opacity，打断渐显动画
-            // 指示器外观只在创建时和配置变更时设置，layoutSubviews 不需要
+            // v1.6.39: already exists (same single indicator for this bid) -> only re-parent + reposition, no rebuild, no re-animate.
+            if (indicator.superview != hostView) {
+                [hostView addSubview:indicator]; // auto-detaches from the old slot
+                if (sDebugLog) RDLog(@"Indicator REPARENT: %@ -> new slot", bundleID);
+            }
             indicator.frame = indicatorFrame;
             indicator.hidden = NO;
+            MKSetIndicator(self, indicator);
         }
 
-        // v1.6.11: AutoIcon 主色调 —— 创建时上色；后续 layout 取色成功(或从绿兜底修正)时自动重绘
-        // 配合 MKCachedIconColorForBundleID 不缓存失败：首次取不到→绿兜底，下次取到真实色→这里自动更新
         if (cfg.colorMode == MKColorModeAutoIcon && indicator) {
             UIColor *iconColor = MKCachedIconColorForBundleID(bundleID);
             MKIndicatorDotView *dot = (MKIndicatorDotView *)indicator;
@@ -1295,17 +1219,11 @@ static void MKUpdate(SBIconView *self) {
             }
         }
 
-        // v1.6.35: 若本次创建/定位时标签仍未找到（走了 fallback 位置），
-        //   多次递增延迟重试 MKUpdate，捕获 App 退到后台、图标完成布局后 1~2s 才挂上的标签视图，
-        //   命中后指示器重定位到名称中心（问题②：位置不对）。
-        //   用每-bid 重试计数（最多 4 次）替代 v1.6.34 的"单次永久屏蔽"，
-        //   否则 150ms 时标签还没出现 → 永久停在 fallback 位置。
         if (!label) {
             if (!sLabelRetryCount) sLabelRetryCount = [NSMutableDictionary dictionary];
             NSInteger tries = [sLabelRetryCount[bundleID] integerValue];
             if (tries < 4) {
                 sLabelRetryCount[bundleID] = @(tries + 1);
-                // 递增延迟：200 / 600 / 1200 / 2000 ms
                 NSArray *delays = @[@200, @600, @1200, @2000];
                 NSInteger d = [delays[MIN(tries, 3)] integerValue];
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_MSEC)),
@@ -1574,8 +1492,9 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
             }
         });
     } else {
-        // ── App 退出 → 立即移除指示器 + 恢复标签 ──
-        MKRemovePending(bid);     // 清除 pending 状态
+        // v1.6.39: App exited -> destroy the indicator for real (scroll/recycle only detaches)
+        MKDestroyIndicatorForBid(bid);
+        MKRemovePending(bid);     // clear pending state
         MKRemoveFadingLabel(bid); // v1.5.8: 清除渐隐状态
         dispatch_async(dispatch_get_main_queue(), ^{
             MKRefreshIconForBundleID(bid);
@@ -1741,6 +1660,19 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
 
     // v1.5.3 性能优化：快速跳过不需要处理的图标
     UIView *indicator = MKGetIndicator(self);
+    // v1.6.39: stale detection -- after an instance is recycled to another app, the cached
+    //   indicator may belong to a different bid. If so, detach it from our slot and clear the
+    //   cache; let the logic below re-evaluate for the current bid.
+    {
+        NSString *lsBid = MKGetCachedBid(self);
+        UIView *lsBidInd = (sIndicatorByBid ? sIndicatorByBid[lsBid] : nil);
+        if (indicator && indicator != lsBidInd) {
+            UIView *host = (self.superview ? self.superview : self);
+            if (indicator.superview == host) [indicator removeFromSuperview];
+            MKSetIndicator(self, nil);
+            indicator = nil;
+        }
+    }
     if (!indicator || (indicator && indicator.superview == nil)) {
         // v1.6.28: 孤儿自愈 —— 指示器被 SpringBoard 在重布局时从宿主移除
         // （SBIconView 对象仍在，关联对象仍指向这个 superview=nil 的不可见视图）。
@@ -2093,7 +2025,7 @@ static BOOL MKIsSupportedOS(void) {
     %init;
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
-    NSLog(@"[RunningDotIndicator] v1.6.38 ctor: cumulative fixes v1.6.31..v1.6.38 (see comments below for detail).");
+    NSLog(@"[RunningDotIndicator] v1.6.39 ctor: per-bid indicator registry (fixes 'indicator hops to wrong icon on scroll/recycle'); see comments below for detail.");
 
     // v1.6.37: 根除问题①(churn) + 问题②的瞬时部分。
     //   根因(rd_log(66) 确证)：iOS 的 SBIconView.icon 在布局/滚动/角标刷新等过渡期，会瞬时返回
