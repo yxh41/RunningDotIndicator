@@ -925,8 +925,10 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
 
         // ── Strategy 2: 父视图兄弟节点（iOS 16 核心！标签是 SBIconView 的兄弟）──
         // SBIconView 和 SBIconListLabel 是同一个父容器的子视图
+        // v1.6.33: 移除 <=8 子视图限制，文件夹/Dock 等布局里父容器可能更大；
+        // 靠评分阈值（>=50）和 SBIconListLabel 精确匹配避免误把 badge/close button 当标签。
         UIView *parent = iconView.superview;
-        if (parent && parent.subviews.count <= 8) {
+        if (parent) {
             // 用评分机制避免误把 badge/close button 等当标签
             UIView *bestMatch = nil;
             NSInteger bestScore = 0;
@@ -962,6 +964,7 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
         }
 
         // ── Strategy 4: 递归子视图搜索 ──
+        // v1.6.33: 增加 containsString:@"Label" 兜底，捕获 SBIconLabel 等无 View/List/Title 字样的标签类。
         NSMutableArray *stack = [NSMutableArray arrayWithArray:iconView.subviews];
         while (stack.count > 0) {
             UIView *v = [stack lastObject];
@@ -972,7 +975,8 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
                 [cls containsString:@"LabelView"] ||
                 [cls containsString:@"ListLabel"] ||
                 [cls containsString:@"TitleLabel"] ||
-                [cls containsString:@"TextLabel"]) {
+                [cls containsString:@"TextLabel"] ||
+                [cls containsString:@"Label"]) {
                 return v;
             }
             [stack addObjectsFromArray:v.subviews];
@@ -1054,8 +1058,10 @@ static void MKUpdate(SBIconView *self) {
         UIView *indicator = MKGetIndicator(self);
 
         // 当前被用户打开在前台的 App，桌面上不再显示指示器（避免启动动画残留）
-        if (!running || isForeground) {
-            // ── App 不在运行 / 在前台 → 移除指示器，恢复名字 ──
+        // v1.6.33: 改为 hidden 而非 removeFromSuperview，避免回桌面/翻页时因状态异步反复销毁重建。
+        // App 退出 → 彻底移除；App 前台 → 隐藏；App 后台 → 显示。
+        if (!running) {
+            // ── App 不在运行 → 移除指示器，恢复名字 ──
             if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
             if (label) {
                 label.hidden = NO;
@@ -1065,6 +1071,20 @@ static void MKUpdate(SBIconView *self) {
             }
             MKRemovePending(bundleID);  // v1.5.6+: 清除 pending 状态
             MKRemoveFadingLabel(bundleID); // v1.5.8: 清除渐隐状态
+            return;
+        }
+
+        if (isForeground) {
+            // ── App 在前台 → 隐藏指示器（保留在视图层级），恢复名字 ──
+            if (indicator) { indicator.hidden = YES; }
+            if (label) {
+                label.hidden = NO;
+                label.alpha = 1.0f;
+                label.layer.opacity = 1.0f;
+                label.opaque = YES;
+            }
+            MKRemovePending(bundleID);  // 清除 pending 状态
+            MKRemoveFadingLabel(bundleID); // 清除渐隐状态
             return;
         }
 
@@ -1463,6 +1483,73 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
 }
 
 // ====================================================================
+// v1.6.33: 自愈 —— 定期清除 stale running set 误报（对应问题③）
+// 现象：App 被系统杀（内存压力等）但退出通知/状态回调未送达本插件，
+//   running set 残留 → 桌面仍显示指示器，但点击 App 是冷启动（需重载）。
+// 这是 iOS 进程状态事件可能丢通知的机制限制，无法 100% 杜绝；
+// 此自愈作为缓解：周期性用 SBApplicationController.runningApplications 的
+//   实时 processState 交叉校验，把"集合里有、但系统已确认进程不在跑"的条目清掉。
+// ====================================================================
+static void MKScheduleSelfHeal(void);  // 前向声明（递归调度）
+
+static void MKSelfHealRunningSet(void) {
+    if (!sInitDone || MKIsDisabled()) return;
+    @try {
+        id appCtrl = [SBApplicationController sharedInstance];
+        if (!appCtrl) return;
+        SEL runningSel = NSSelectorFromString(@"runningApplications");
+        if (![appCtrl respondsToSelector:runningSel]) return;
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        NSArray *runningApps = [appCtrl performSelector:runningSel];
+#pragma clang diagnostic pop
+        if (!runningApps) return;
+
+        // 构建"当前确实活着"的 bundleID 集合（用 processState 权威校验，而非仅名单成员）
+        NSMutableSet *aliveBids = [NSMutableSet set];
+        Class sbAppCls = NSClassFromString(@"SBApplication");
+        for (id app in runningApps) {
+            if (![app isKindOfClass:sbAppCls]) continue;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            id ps = [app performSelector:NSSelectorFromString(@"processState")];
+            NSString *bid = [app performSelector:NSSelectorFromString(@"bundleIdentifier")];
+#pragma clang diagnostic pop
+            BOOL alive = YES;
+            if (ps) {
+                BOOL isRunning = MKGetBoolFromState(ps, @"isRunning");
+                int taskState = MKGetIntFromState(ps, @"taskState");
+                alive = (isRunning || taskState == 2 || taskState == 3);
+            }
+            if (bid.length && alive) [aliveBids addObject:bid];
+        }
+
+        // 交叉校验：集合里的条目若既不在 alive 集合、又非前台（前台一定活着）→ 视为 stale，清除
+        for (NSString *bid in [sRunningSet copy]) {
+            if ([aliveBids containsObject:bid]) continue;
+            if (MKIsForeground(bid)) continue;     // 前台 App 必然活着，不被误清
+            MKSetForeground(bid, NO);              // 同步清前台标记（防退出通知也丢时前台位残留）
+            MKRemoveFromRunningSet(bid);
+            if (sDebugLog) RDLog(@"SELF-HEAL: removed stale running entry %@", bid);
+            MKOnStateChange(bid, NO, NO);         // 刷新图标：移除残留指示器、恢复名字
+        }
+    } @catch (NSException *e) {
+        RDLog(@"SELF-HEAL EXCEPTION: %@", e.reason);
+    }
+}
+
+// v1.6.33: 每 25 秒递归调度一次自愈（不阻塞、轻量；仅对集合中少数 App 做交叉校验）
+static void MKScheduleSelfHeal(void) {
+    if (!sInitDone) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        MKSelfHealRunningSet();
+        MKScheduleSelfHeal();
+    });
+}
+
+// ====================================================================
 // 延迟初始化（15 秒后执行，不阻塞 SpringBoard 启动）
 // ====================================================================
 
@@ -1492,6 +1579,9 @@ static void MKDelayedInit() {
 
     // ─── 首次刷新所有图标 ──────
     MKRefreshAllIcons();
+
+    // v1.6.33: 启动 stale running set 自愈定时器（每 25 秒交叉校验，缓解问题③）
+    MKScheduleSelfHeal();
 }
 
 static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observer,
@@ -1902,7 +1992,7 @@ static BOOL MKIsSupportedOS(void) {
     %init;
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
-    NSLog(@"[RunningDotIndicator] v1.6.32 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible; v1.6.31 running-set gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; v1.6.32 indicator now attached to SBIconView directly (was label.superview, which SB reparents during page-swipe -> destroy/recreate churn, 22x/min for WDCalendar in rd_log(56); now stable across page swipes");
+    NSLog(@"[RunningDotIndicator] v1.6.33 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible; v1.6.31 running-set gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; v1.6.32 indicator now attached to SBIconView directly (was label.superview, which SB reparents during page-swipe -> destroy/recreate churn, 22x/min for WDCalendar in rd_log(56); now stable across page swipes); v1.6.33 reduce indicator churn on foreground (hidden instead of removeFromSuperview -> no re-create on page-swipe/return-to-home); MKFindLabelView widened (drop <=8 subview cap + add Label fallback) so Dock/folder indicators sit at the name position; 25s self-heal cross-checks SBApplicationController.runningApplications processState to clear stale running-set entries (mitigates 'indicator shown but app cold-launches' from missed exit notifications -- iOS limitation, false positives reduced only)");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
