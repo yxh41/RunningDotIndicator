@@ -285,7 +285,10 @@ static NSString *MKGetCachedBid(SBIconView *iv) {
 // 缓存名字标签视图（避免每次 layoutSubviews 都跑 MKFindLabelView 4 重策略）
 static UIView *MKGetCachedLabel(SBIconView *iv) {
     UIView *label = objc_getAssociatedObject(iv, &kMKLabelKey);
-    if (label && label.superview) return label;  // 仍然有效
+    // v1.6.47: 收紧校验 —— 缓存的 label 必须仍活在「当前槽位的内容视图」里
+    //   （label.superview == iv.superview），否则可能是回收前上一个 App 遗留的兄弟标签，
+    //   会误隐藏/误用错槽的坐标。SBIconView 回收后旧 label 不一定被移除。
+    if (label && label.superview == iv.superview) return label;  // 仍然有效且属于本槽
     // 缓存失效 → 重新查找
     label = MKFindLabelView(iv);
     if (label) objc_setAssociatedObject(iv, &kMKLabelKey, label, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1168,7 +1171,12 @@ static void MKUpdate(SBIconView *self) {
         // v1.6.39: grab both "indicator cached on this slot" and "indicator this bid SHOULD have".
         //   If they differ, the cache belongs to a previously-recycled bid -> detach from our slot, don't destroy.
         UIView *label = MKGetCachedLabel(self);
-        UIView *hostView = label ? label.superview : (self.superview ? self.superview : self);
+        // v1.6.47: hostView 永远用 self.superview（图标所在滚动/列表内容视图），
+        //   不再用 label.superview —— 旧 label 在 SBIconView 回收后仍活在同一个内容视图里，
+        //   label.superview 虽仍等于 self.superview，但 label.frame 是上一个 App/槽位遗留下来的坐标，
+        //   用它给指示器定位会把点飘到错处（日志里 y=233 这种「图标中间」就是这么来的）。
+        //   定位统一改走 MKEstimateLabelFrame(self)（确定性地算 self.frame 底+gap），见下方。
+        UIView *hostView = self.superview ? self.superview : self;
         UIView *cachedInd = MKGetIndicator(self);
         UIView *bidInd     = MKIndicatorForBid(bundleID);
         if (cachedInd && cachedInd != bidInd) {
@@ -1231,10 +1239,10 @@ static void MKUpdate(SBIconView *self) {
         if (cfg.shape == MKShapeDot) { indicatorW = cfg.dotSize; indicatorH = cfg.dotSize; }
         else { indicatorW = cfg.barWidth; indicatorH = cfg.barHeight; }
 
+        // v1.6.47: 定位锚点**永远**用 MKEstimateLabelFrame(self)（self.frame 底 + gap），
+        //   不再读 label.frame。label 只用于「隐藏名称」，不参与定位——避免回收后旧 label 坐标污染。
         CGRect labelFrameInHost;
-        if (label && label.superview) {
-            labelFrameInHost = label.frame;
-        } else if (self.superview) {
+        if (self.superview) {
             labelFrameInHost = MKEstimateLabelFrame((SBIconView *)self);
         } else {
             CGSize s = self.bounds.size;
@@ -1816,9 +1824,10 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
 
     // v1.5.8: 标签正在渐隐 → 只重定位指示器，不操作标签（让动画自然播放）
     if (MKIsFadingLabel(bid)) {
-        UIView *label = MKGetCachedLabel(self);
-        if (indicator && label && label.superview) {
-            CGRect lf = label.frame;  // v1.6.36: 还原 1.6.31 —— 指示器现挂 label.superview，label.frame 即其同坐标系位置
+        if (indicator) {
+            // v1.6.47: 渐隐期间只重定位，锚点统一用 MKEstimateLabelFrame(self)（同 MKUpdate），
+            //   不再读 label.frame（回收后旧 label 坐标会把点定到错处）。
+            CGRect lf = MKEstimateLabelFrame((SBIconView *)self);
             CGFloat indW, indH;
             MKConfig *cfg = [MKConfig sharedConfig];
             if (cfg.shape == MKShapeDot) { indW = cfg.dotSize; indH = cfg.dotSize; }
@@ -1844,22 +1853,17 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         indH = cfg.barHeight;
     }
 
+    // v1.6.47: 标签只用于「隐藏名称」，定位锚点统一用 MKEstimateLabelFrame(self)，
+    //   不再读 label.frame（回收后旧 label 坐标会把点定到错处）。
     UIView *label = MKGetCachedLabel(self);
-    if (label && label.superview) {
+    if (label) {
         // 重新强制隐藏标签（防止系统 layout 恢复）
         label.hidden = YES;
         label.alpha = 0.0f;
         label.layer.opacity = 0.0f;
         label.opaque = NO;
-        // 标签找到 → 指示器在标签中心
-        CGRect lf = label.frame;  // v1.6.36: 还原 1.6.31 —— 指示器现挂 label.superview，label.frame 即其同坐标系位置
-        indicator.frame = CGRectMake(
-            lf.origin.x + (lf.size.width - indW) / 2.0f,
-            lf.origin.y + (lf.size.height - indH) / 2.0f,
-            indW, indH
-        );
-    } else if (self.superview) {
-        // v1.6.41: 无标签 → 估算标签位置（Dock 紧贴图标底，≈ App 名称位置）
+    }
+    if (self.superview) {
         CGRect elf = MKEstimateLabelFrame((SBIconView *)self);
         indicator.frame = CGRectMake(
             elf.origin.x + (elf.size.width - indW) / 2.0f,
@@ -2148,7 +2152,7 @@ static BOOL MKIsSupportedOS(void) {
     %init;
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
-    NSLog(@"[RunningDotIndicator] v1.6.46 ctor: stable-frame debounce in MKGetCachedBid replaces the scrolling-gated bid-settle. New bid must be reported K consecutive times before trust; during the lag window MKUpdate is skipped (no hop, no mis-show). Kills both 'hops to wrong icon on scroll/recycle' and the v1.6.44/45 hide-or-hop regressions. see comments below for full history.");
+    NSLog(@"[RunningDotIndicator] v1.6.47 ctor: POSITIONING root-cause fixed — indicator anchor no longer reads the cached name-label's frame (stale label from a recycled slot parked the dot at the old app's y, e.g. y=233 mid-icon). Anchor is now always MKEstimateLabelFrame(self) = self.frame bottom+gap, deterministic per current slot; hostView is always self.superview; MKGetCachedLabel requires label.superview==iv.superview. Identity (stable-frame debounce) from v1.6.46 unchanged.");
 
     // v1.6.37: 根除问题①(churn) + 问题②的瞬时部分。
     //   根因(rd_log(66) 确证)：iOS 的 SBIconView.icon 在布局/滚动/角标刷新等过渡期，会瞬时返回
