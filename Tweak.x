@@ -118,6 +118,7 @@ static char kMKBidKey;       // 缓存的 bundleID
 static char kMKIconKey;      // 缓存的 icon 指针（检测视图回收复用）
 static char kMKPendBidKey;  // v1.6.37: "待定 bid"（去抖：疑似回收时先记一笔，确认连续 2 次才采用）
 static char kMKBidOfIndicatorKey; // v1.6.39: bundleID associated onto the indicator view (stale detection / logging)
+static char kMKTransitKey;  // v1.6.42: recycle-settle counter (NSNumber) for MKSlotTransitioning
 
 // v1.6.39: own the indicator by bundleID, NOT by SBIconView instance.
 // Root cause: iOS recycles SBIconView instances (same object re-shows a different app
@@ -149,6 +150,45 @@ static UIView *MKGetIndicator(SBIconView *iv) {
 static void MKSetIndicator(SBIconView *iv, UIView *dot) {
     objc_setAssociatedObject(iv, &kMKIndicatorKey, dot, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
+// v1.6.42: recycle/scroll transition guard (fixes "indicator hops to wrong icon on scroll").
+// Root cause: the indicator is a subview of the recyclable SBIconView slot. During scroll,
+// iOS reuses a slot's SBIconView instance to display a DIFFERENT app; because
+// [iv icon].applicationBundleID is unreliable during the swap (returns the OLD bid for the
+// frames where the slot already shows the new app), MKUpdate keeps gluing the old app's
+// indicator onto the slot now displaying a different app -> the dot "hops". The per-bid
+// registry (v1.6.39) fixed churn/persistence but NOT this visual ride-along.
+// Fix: detect the recycle via the ICON OBJECT POINTER. The visual content is derived from
+// the same object, so they change together -- unlike applicationBundleID. When the pointer
+// changes we HIDE this slot's indicator and suppress show/create until the pointer is stable
+// for MK_TRANSIT_FRAMES consecutive layout passes; then MKUpdate re-attaches the correct
+// indicator (per-bid registry) to the settled slot. No churn, no hop.
+static const NSInteger MK_TRANSIT_FRAMES = 2;
+static BOOL MKSlotTransitioning(SBIconView *self) {
+    id cur = [self icon];
+    if (!cur) return NO;
+    id last = objc_getAssociatedObject(self, &kMKIconKey);
+    if (last && last != cur) {
+        // icon object swapped this pass -> slot is being recycled to another app.
+        UIView *ind = MKGetIndicator(self);
+        if (ind) ind.hidden = YES;
+        objc_setAssociatedObject(self, &kMKTransitKey, @(MK_TRANSIT_FRAMES), OBJC_ASSOCIATION_COPY_NONATOMIC);
+        objc_setAssociatedObject(self, &kMKBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, &kMKLabelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, &kMKIconKey, cur, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return YES;
+    }
+    objc_setAssociatedObject(self, &kMKIconKey, cur, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NSInteger t = [objc_getAssociatedObject(self, &kMKTransitKey) integerValue];
+    if (t > 0) {
+        t -= 1;
+        objc_setAssociatedObject(self, &kMKTransitKey, @(t), OBJC_ASSOCIATION_COPY_NONATOMIC);
+        UIView *ind = MKGetIndicator(self);
+        if (ind) ind.hidden = YES;
+        return YES;
+    }
+    return NO;
+}
+
 
 // 前向声明（MKFindLabelView 定义在后面，但 MKGetCachedLabel 需要调用它）
 static UIView *MKFindLabelView(SBIconView *iconView);
@@ -1088,6 +1128,11 @@ static void MKUpdate(SBIconView *self) {
     MKSafe(^{
         if (!sInitDone) return;
 
+        // v1.6.42: while this slot is mid-recycle (icon object swapped during scroll),
+        // hide its indicator and skip show/create; the per-bid registry re-attaches
+        // the correct indicator once the slot settles on its new app.
+        if (MKSlotTransitioning(self)) return;
+
         sCallCount++;
 
         NSString *bundleID = MKGetCachedBid(self);
@@ -1661,6 +1706,9 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     %orig;
     if (!sInitDone) return;
 
+    // v1.6.42: same recycle guard as MKUpdate (see MKSlotTransitioning).
+    if (MKSlotTransitioning(self)) return;
+
     // v1.5.3 性能优化：快速跳过不需要处理的图标
     UIView *indicator = MKGetIndicator(self);
     // v1.6.39: stale detection -- after an instance is recycled to another app, the cached
@@ -2025,7 +2073,7 @@ static BOOL MKIsSupportedOS(void) {
     %init;
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
-    NSLog(@"[RunningDotIndicator] v1.6.41 ctor: dock indicator now hugs the icon bottom (~app-name position); see comments below for full history.");
+    NSLog(@"[RunningDotIndicator] v1.6.42 ctor: recycle/scroll transition guard kills 'indicator hops to wrong icon on scroll' (detects icon-object swap, not unreliable applicationBundleID); see comments below for full history.");
 
     // v1.6.37: 根除问题①(churn) + 问题②的瞬时部分。
     //   根因(rd_log(66) 确证)：iOS 的 SBIconView.icon 在布局/滚动/角标刷新等过渡期，会瞬时返回
