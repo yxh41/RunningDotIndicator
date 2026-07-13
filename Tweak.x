@@ -1164,37 +1164,44 @@ static void MKUpdate(SBIconView *self) {
         UIView *hostView;
         CGRect indicatorFrame;
 
-        // v1.6.32: 指示器直接挂到 self（SBIconView），而非 label.superview。
-        // 根因（诊断版 rd_log(56) 证实）：翻页/滚动时 SpringBoard 会重父化或重建 label 及其 superview，
-        // 之前挂在 label.superview 上会被一起带走 → 指示器被销毁重建（轻历 1 分钟内被 CREATE 22 次、几乎全 animate=0），
-        // 重建的瞬窗里图标没有指示器，于是「划到某屏时没点、划走再划回才有」。
-        // self 在翻页时只随 scroll 平移、不被重父化，挂 self 上指示器永不失联；frame 用 label 相对 self.bounds 折算。
-        hostView = self;
-        CGRect labelFrameInSelf;
+        // v1.6.36: 还原 1.6.31 的正确定位 —— 宿主 = label.superview（图标列表视图，
+        //   图标与名称同处一个坐标系），位置 = label.frame（名称的真实位置）。
+        //   1.6.32 起误把宿主改成 self(SBIconView) 并用 convertRect:toView:self，
+        //   而 self 带 transform（按压/翻页缩放）→ 指示器作其子视图继承该 transform、
+        //   名称标签（兄弟节点）却不继承 → 指示器被带偏/带缩（用户反馈"位置不对"，且 1.6.31 之前正常）。
+        //   翻页/重父化稳定性：用"同一指示器重新 addSubview 挂回当前 label.superview"
+        //   替代销毁重建（即下方 indicator.superview != hostView 分支），与 1.6.34 对 self 验证过的 re-attach 思路一致。
+        hostView = label ? label.superview : (self.superview ? self.superview : self);
+        CGRect labelFrameInHost;
         if (label && label.superview) {
-            // 标签存在且在层级中 → 折算到 self 坐标系
-            labelFrameInSelf = [label convertRect:label.bounds toView:self];
+            // 标签存在且在层级中 → 直接用 label.frame（已位于 label.superview 坐标系）
+            labelFrameInHost = label.frame;
         } else {
-            // 无标签（Dock / 系统 App / 标签延迟未挂上）→ 估算"名称所在底部区域"。
-            // v1.6.35: 改放到图标 bounds 的"底部 16px 名称带"中心（origin.y = height-16，
-            //   14px 指示器居中 → 垂直中心≈ height-9，即名称文字中心），更贴近真实名称位置；
-            //   旧逻辑用 height+4（bounds 外 4px）会把指示器放到名称下方、视觉上"不在名称位置"。
-            CGSize mySize = self.bounds.size;
-            if (mySize.width < 10 || mySize.height < 10) return;
-            labelFrameInSelf = CGRectMake(0, mySize.height - 16.0f, mySize.width, 14.0f);
+            // 无标签（Dock / 系统 App / 标签延迟未挂上）→ 估算"名称所在区域"（与 1.6.31 一致）
+            if (self.superview) {
+                CGRect iconFrame = self.frame;
+                CGFloat estimatedLabelY = iconFrame.origin.y + iconFrame.size.height + 4.0f;
+                CGFloat estimatedLabelH = 14.0f;
+                labelFrameInHost = CGRectMake(iconFrame.origin.x, estimatedLabelY, iconFrame.size.width, estimatedLabelH);
+            } else {
+                CGSize mySize = self.bounds.size;
+                if (mySize.width < 10 || mySize.height < 10) return;
+                labelFrameInHost = CGRectMake(0, mySize.height - 16.0f, mySize.width, 14.0f);
+            }
         }
         indicatorFrame = CGRectMake(
-            labelFrameInSelf.origin.x + (labelFrameInSelf.size.width - indicatorW) / 2.0f,
-            labelFrameInSelf.origin.y + (labelFrameInSelf.size.height - indicatorH) / 2.0f,
+            labelFrameInHost.origin.x + (labelFrameInHost.size.width - indicatorW) / 2.0f,
+            labelFrameInHost.origin.y + (labelFrameInHost.size.height - indicatorH) / 2.0f,
             indicatorW,
             indicatorH
         );
 
-        // v1.6.34: 宿主视图变了（SpringBoard 在转场/重布局时会临时把 SBIconView 的
-        //   子视图——含我们的指示器——移除，导致 indicator.superview 变 nil / 不再是 self）
+        // v1.6.34 / v1.6.36: 宿主视图变了（SpringBoard 在转场/重布局/翻页时会临时重父化
+        //   label.superview —— 含我们挂在那里的指示器 —— 导致 indicator.superview 不再是当前 hostView）
         //   → 直接把"同一个指示器"重新挂回 hostView（addSubview: 会先把它从旧父视图摘下再挂上），
         //     复用同一视图，绝不再 removeFromSuperview + nil + 重新 alloc。
-        //   否则每次重挂都触发一次 Indicator CREATE(animate=0)，就是日志里"指示器反复消失/重建"的抖动（问题①）。
+        //   这正是 1.6.31 时代"翻页指示器消失"的根治法（旧代码是销毁重建）；
+        //   配合还原 1.6.31 的正确定位（宿主=label.superview, label.frame），位置与 1.6.31 一致且翻页不 churn。
         //   注意：不置 nil、不 MKSetIndicator(self,nil)，关联对象仍指向同一个 indicator。
         if (indicator && indicator.superview != hostView) {
             [hostView addSubview:indicator];
@@ -1743,7 +1750,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     if (MKIsFadingLabel(bid)) {
         UIView *label = MKGetCachedLabel(self);
         if (indicator && label && label.superview) {
-            CGRect lf = [label convertRect:label.bounds toView:self];
+            CGRect lf = label.frame;  // v1.6.36: 还原 1.6.31 —— 指示器现挂 label.superview，label.frame 即其同坐标系位置
             CGFloat indW, indH;
             MKConfig *cfg = [MKConfig sharedConfig];
             if (cfg.shape == MKShapeDot) { indW = cfg.dotSize; indH = cfg.dotSize; }
@@ -1777,22 +1784,20 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         label.layer.opacity = 0.0f;
         label.opaque = NO;
         // 标签找到 → 指示器在标签中心
-        CGRect lf = [label convertRect:label.bounds toView:self];
+        CGRect lf = label.frame;  // v1.6.36: 还原 1.6.31 —— 指示器现挂 label.superview，label.frame 即其同坐标系位置
         indicator.frame = CGRectMake(
             lf.origin.x + (lf.size.width - indW) / 2.0f,
             lf.origin.y + (lf.size.height - indH) / 2.0f,
             indW, indH
         );
     } else if (self.superview) {
-        // v1.5.9: 无标签 → 估算标签位置（名称底部带居中）
-        // v1.6.32: 指示器现挂 self，用 self.bounds（图标自身坐标系）
-        // v1.6.35: 与 MKUpdate 的 FALLBACK 对齐 —— 放到 bounds 底部 16px 名称带中心，
-        //   而非"图标下方+4"（会落到名称之下，视觉上不在名称位置）。
-        CGRect icf = self.bounds;
-        CGFloat estimatedLabelY = icf.size.height - 16.0f;  // 底部 16px 名称带
+        // v1.5.9 / v1.6.36: 无标签 → 估算标签位置（图标下方居中，与 1.6.31 一致）
+        //   指示器现挂 self.superview（图标列表），self.frame 在该坐标系内。
+        CGRect icf = self.frame;
+        CGFloat estimatedLabelY = icf.origin.y + icf.size.height + 4.0f;  // 图标下方4pt间隙
         CGFloat estimatedLabelH = 14.0f;  // iOS 标签典型高度
         indicator.frame = CGRectMake(
-            (icf.size.width - indW) / 2.0f,
+            icf.origin.x + (icf.size.width - indW) / 2.0f,
             estimatedLabelY + (estimatedLabelH - indH) / 2.0f,
             indW, indH
         );
@@ -2055,7 +2060,7 @@ static BOOL MKIsSupportedOS(void) {
     %init;
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
-    NSLog(@"[RunningDotIndicator] v1.6.35 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible; v1.6.31 running-set gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; v1.6.32 indicator now attached to SBIconView directly (was label.superview, which SB reparents during page-swipe -> destroy/recreate churn, 22x/min for WDCalendar in rd_log(56); now stable across page swipes); v1.6.33 reduce indicator churn on foreground (hidden instead of removeFromSuperview -> no re-create on page-swipe/return-to-home); MKFindLabelView widened (drop <=8 subview cap + add Label fallback) so Dock/folder indicators sit at the name position; 25s self-heal cross-checks SBApplicationController.runningApplications processState to clear stale running-set entries (mitigates 'indicator shown but app cold-launches' from missed exit notifications -- iOS limitation, false positives reduced only); v1.6.34 fix residual indicator churn (problem 1): MKUpdate host-view-change path now re-attaches the SAME indicator to hostView via addSubview: instead of removeFromSuperview+nil+re-alloc (SpringBoard temporarily strips SBIconView subviews during transitions/layout -> orphan -> was recreating with animate=0 every layout -> flicker); fix wrong position (problem 2): when label is not yet found at create (timing: app just backgrounded / icon just scrolled in / folder open-close), schedule one 150ms MKUpdate retry to recompute frame from the now-laid-out label (sLabelRetryBids dedups, no infinite loop); NO LABEL detail dump cap raised 10->60 for easier view-hierarchy diagnosis); v1.6.35 fix root-cause of indicator churn (problem 1) + wrong position (problem 2): MKGetCachedBid icon-change detection now compares applicationBundleID instead of raw icon object pointer -- iOS SBIconView.icon can vend a different pointer for the SAME app during layout/reload, so the old cachedIcon!=icon check falsely fired every call -> removeFromSuperview + nil indicator -> re-CREATE churn (66/75 CREATEs were animate=0 in rd_log(62)); label-finding now retries up to 4x with increasing delay (200/600/1200/2000ms) instead of one 200ms shot, so labels that appear 1-2s after the app returns to home (Dock/normal) get caught and the indicator re-centers on the name; fallback position moved from 'below icon +4' into the icon's bottom 16px name-band so even unfound labels sit at the name location");
+    NSLog(@"[RunningDotIndicator] v1.6.36 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible; v1.6.31 running-set gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; v1.6.32 indicator now attached to SBIconView directly (was label.superview, which SB reparents during page-swipe -> destroy/recreate churn, 22x/min for WDCalendar in rd_log(56); now stable across page swipes); v1.6.33 reduce indicator churn on foreground (hidden instead of removeFromSuperview -> no re-create on page-swipe/return-to-home); MKFindLabelView widened (drop <=8 subview cap + add Label fallback) so Dock/folder indicators sit at the name position; 25s self-heal cross-checks SBApplicationController.runningApplications processState to clear stale running-set entries (mitigates 'indicator shown but app cold-launches' from missed exit notifications -- iOS limitation, false positives reduced only); v1.6.34 fix residual indicator churn (problem 1): MKUpdate host-view-change path now re-attaches the SAME indicator to hostView via addSubview: instead of removeFromSuperview+nil+re-alloc (SpringBoard temporarily strips SBIconView subviews during transitions/layout -> orphan -> was recreating with animate=0 every layout -> flicker); fix wrong position (problem 2): when label is not yet found at create (timing: app just backgrounded / icon just scrolled in / folder open-close), schedule one 150ms MKUpdate retry to recompute frame from the now-laid-out label (sLabelRetryBids dedups, no infinite loop); NO LABEL detail dump cap raised 10->60 for easier view-hierarchy diagnosis); v1.6.35 fix root-cause of indicator churn (problem 1) + wrong position (problem 2): MKGetCachedBid icon-change detection now compares applicationBundleID instead of raw icon object pointer -- iOS SBIconView.icon can vend a different pointer for the SAME app during layout/reload, so the old cachedIcon!=icon check falsely fired every call -> removeFromSuperview + nil indicator -> re-CREATE churn (66/75 CREATEs were animate=0 in rd_log(62)); label-finding now retries up to 4x with increasing delay (200/600/1200/2000ms) instead of one 200ms shot, so labels that appear 1-2s after the app returns to home (Dock/normal) get caught and the indicator re-centers on the name; fallback position moved from 'below icon +4' into the icon's bottom 16px name-band so even unfound labels sit at the name location); v1.6.36 fix indicator POSITION (problem 2, user reports it broke after 1.6.31): revert 1.6.32's host change -- indicator was re-homed from label.superview to self (SBIconView) and positioned via convertRect:toView:self; self carries a transform (icon press / page-swipe scale) so the indicator (its subview) inherited that transform while the name label (a sibling) did NOT -> indicator was shifted/scaled off the name. Restored 1.6.31's correct positioning: host = label.superview (icon-list view, same coord space as the name), position = label.frame (the name's real frame); the 3 layoutSubviews reposition sites reverted from convertRect/self.bounds to label.frame/self.frame. Page-swipe reparenting still handled by re-attaching the SAME indicator via addSubview: to the current label.superview (the 1.6.34 re-attach idea), so no destroy/recreate churn and position matches 1.6.31.");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
