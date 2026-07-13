@@ -119,6 +119,7 @@ static char kMKIconKey;      // 缓存的 icon 指针（检测视图回收复用
 static char kMKPendBidKey;  // v1.6.37: "待定 bid"（去抖：疑似回收时先记一笔，确认连续 2 次才采用）
 static char kMKBidOfIndicatorKey; // v1.6.39: bundleID associated onto the indicator view (stale detection / logging)
 static char kMKTransitKey;  // v1.6.42: recycle-settle counter (NSNumber) for MKSlotTransitioning
+static char kMKBidTransitionCountKey; // v1.6.44: bid 变化后稳定帧计数器（applicationBundleID 滞后于视觉）
 
 // v1.6.39: own the indicator by bundleID, NOT by SBIconView instance.
 // Root cause: iOS recycles SBIconView instances (same object re-shows a different app
@@ -163,6 +164,7 @@ static void MKSetIndicator(SBIconView *iv, UIView *dot) {
 // for MK_TRANSIT_FRAMES consecutive layout passes; then MKUpdate re-attaches the correct
 // indicator (per-bid registry) to the settled slot. No churn, no hop.
 static const NSInteger MK_TRANSIT_FRAMES = 2;
+static const NSInteger MK_BID_SETTLE_FRAMES = 5; // v1.6.44: bid 变化后需稳定这么多帧才信任（应用 id 滞后于视觉）
 static BOOL MKSlotTransitioning(SBIconView *self) {
     id cur = [self icon];
     if (!cur) return NO;
@@ -227,17 +229,31 @@ static NSString *MKGetCachedBid(SBIconView *iv) {
     // 更新缓存的 icon 指针（仅记录，供下一轮比较；此处绝不触发任何指示器清除）
     objc_setAssociatedObject(iv, &kMKIconKey, icon, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    // v1.6.40: 去掉 v1.6.37 的"待定 bid 去抖"，立即采用真实新 bid。
-    //   去抖的根问题是：回收瞬间仍返回旧 bid，使 layoutSubviews（无过渡守卫）
-    //   把旧 App 指示器 reposition 到已变成别的 App 的槽位 → "翻页粘到别的图标"。
-    //   现在指示器按 bundleID 持有（sIndicatorByBid），回收只 detach 不重建，
-    //   瞬时翻转代价仅是"正确图标上 1 帧 detach 再 re-parent"（无 churn、不粘错），
-    //   故不再需要去抖；立即返回真实新 bid，stale-detach 才能正确触发。
-    NSString *resolved = newBid ? newBid : oldBid;
+    // v1.6.40 / v1.6.44: 去抖与 bid-settle。
+    //   v1.6.37 的"待定 bid 去抖"在回收瞬间仍返回旧 bid，导致 layoutSubviews 把旧 App
+    //   指示器 reposition 到已变成别的 App 的槽位；v1.6.40 去掉它，直接采用真实新 bid。
+    //   但 v1.6.43 实测仍发现 applicationBundleID 滞后于视觉（回收槽仍报旧 bid 几帧），
+    //   因此 v1.6.44 引入 bid-settle：bid 变化后先返回 nil 若干帧，等连续稳定后再返回真实新 bid。
+    //   这样 MKUpdate 在 settle 期间直接跳过，不会把旧 App 指示器挂到错误槽位。
+    // v1.6.44: bid 变化后不能立即信任 —— applicationBundleID 在回收/翻页时可能滞后于视觉。
+    //   在 settle 期间返回 nil，让 MKUpdate 跳过（不显示/不创建/不重父化），避免把旧 App 指示器粘到错误槽位。
     if (oldBid && newBid && ![oldBid isEqualToString:newBid]) {
-        // 图标确实换成了别的 App → 旧 label 缓存失效，清掉（下次 MKGetCachedLabel 会重找）
         objc_setAssociatedObject(iv, &kMKLabelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(iv, &kMKBidTransitionCountKey, @(MK_BID_SETTLE_FRAMES), OBJC_ASSOCIATION_COPY_NONATOMIC);
+        objc_setAssociatedObject(iv, &kMKBidKey, newBid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return nil;
     }
+
+    NSInteger settleCount = [objc_getAssociatedObject(iv, &kMKBidTransitionCountKey) integerValue];
+    if (settleCount > 0) {
+        settleCount--;
+        objc_setAssociatedObject(iv, &kMKBidTransitionCountKey, @(settleCount), OBJC_ASSOCIATION_COPY_NONATOMIC);
+        return nil;
+    }
+
+    // v1.6.40: 去掉 v1.6.37 的"待定 bid 去抖"（已由 v1.6.44 bid-settle 取代）。
+    //   这里只处理 newBid 为 nil 时的 fallback。
+    NSString *resolved = newBid ? newBid : oldBid;
     objc_setAssociatedObject(iv, &kMKPendBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v1.6.40: 不再有待定状态
     objc_setAssociatedObject(iv, &kMKBidKey, resolved, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
@@ -1389,6 +1405,24 @@ static void MKRefreshIconForBundleID(NSString *bid) {
     });
 }
 
+// v1.6.44: 统一的滚动开始检测入口。SBIconScrollView 的 delegate 钩子不一定被 SpringBoard 调到，
+//   因此也 hook setContentOffset: 系列，确保任何滚动/动画偏移都能置 sScrolling=YES。
+//   300ms 心跳：末次偏移事件后 300ms 清 sScrolling 并刷新图标。
+static void MKSetScrollingFlag(UIView *scrollView) {
+    if (!sInitDone) return;
+    BOOL wasScrolling = sScrolling;
+    sScrolling = YES;
+    if (sDebugLog && !wasScrolling) RDLog(@"PAGE SCROLL: scrolling started");
+    if (sScrollStopBlock) dispatch_block_cancel(sScrollStopBlock);
+    sScrollStopBlock = dispatch_block_create(0, ^{
+        if (sDebugLog) RDLog(@"PAGE SCROLL: scrolling stopped (300ms idle)");
+        sScrolling = NO;
+        MKRefreshSubviews(scrollView);
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), sScrollStopBlock);
+}
+
 // ====================================================================
 // v1.5.8: 标签渐隐动画（前台→后台时，标签 alpha 1→0 的 250ms 渐隐）
 // 替代 v1.5.6 的瞬间隐藏，让过渡更自然
@@ -1926,28 +1960,28 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     }
 }
 
-// v1.6.43: 滚动期间隐藏指示器（根治翻页粘错）。
-//   SBIconScrollView 已有 scrollViewDidEndDecelerating: / scrollViewDidEndScrollingAnimation: 钩子，
-//   但缺「滚动开始」信号。这里用 willBeginDragging + didScroll 心跳置 sScrolling=YES，
-//   末次 scroll 事件 200ms 后清空并 MKRefreshSubviews 重刷（与现有 120ms 末次刷新互补）。
+// v1.6.44: 滚动期间隐藏指示器（根治翻页粘错）。
+//   v1.6.43 只 hook scrollView delegate 方法，但实测 SpringBoard paging 时这些 delegate
+//   方法未必被调到（指示器在滚动中仍被重父化）。这里同时 hook setContentOffset: 系列，
+//   任何内容偏移（拖动/减速/动画）都会置 sScrolling=YES，300ms 心跳后刷新。
 - (void)scrollViewWillBeginDragging:(id)scrollView {
     %orig;
-    if (sInitDone) sScrolling = YES;
+    MKSetScrollingFlag((UIView *)self);
 }
 
 - (void)scrollViewDidScroll:(id)scrollView {
     %orig;
-    if (sInitDone) {
-        sScrolling = YES;
-        if (sScrollStopBlock) dispatch_block_cancel(sScrollStopBlock);
-        UIView *me = (UIView *)self;
-        sScrollStopBlock = dispatch_block_create(0, ^{
-            sScrolling = NO;
-            MKRefreshSubviews(me);
-        });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(200 * NSEC_PER_MSEC)),
-                       dispatch_get_main_queue(), sScrollStopBlock);
-    }
+    MKSetScrollingFlag((UIView *)self);
+}
+
+- (void)setContentOffset:(CGPoint)offset {
+    %orig;
+    MKSetScrollingFlag((UIView *)self);
+}
+
+- (void)setContentOffset:(CGPoint)offset animated:(BOOL)animated {
+    %orig;
+    MKSetScrollingFlag((UIView *)self);
 }
 %end
 
@@ -2114,7 +2148,7 @@ static BOOL MKIsSupportedOS(void) {
     %init;
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
-    NSLog(@"[RunningDotIndicator] v1.6.43 ctor: scroll-hide kills 'indicator hops to wrong icon on scroll' (v1.6.42 recycle-guard kept; scroll-hide is the structural fix) (detects icon-object swap, not unreliable applicationBundleID); see comments below for full history.");
+    NSLog(@"[RunningDotIndicator] v1.6.44 ctor: scroll + bid-settle guard kills 'indicator hops to wrong icon on scroll' (setContentOffset: hook + 5-frame bid settle); see comments below for full history.");
 
     // v1.6.37: 根除问题①(churn) + 问题②的瞬时部分。
     //   根因(rd_log(66) 确证)：iOS 的 SBIconView.icon 在布局/滚动/角标刷新等过渡期，会瞬时返回
