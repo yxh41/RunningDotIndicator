@@ -165,7 +165,9 @@ static NSString *MKGetCachedBid(SBIconView *iv) {
     if (!icon) return nil;
 
 // 检测图标是否"真的"变了（SBIconView 回收复用：同一个 view 可能从 App A 变成文件夹）
-    // v1.6.37: 容忍布局/滚动/角标刷新的瞬时翻转 —— 只有"同一新 bid 连续 2 次调用都出现"才认定是真回收。
+    // v1.6.40: 已移除 v1.6.37 的"待定 bid 去抖" —— 去抖让回收瞬间仍返回旧 bid，
+    //   致 layoutSubviews（无过渡守卫）把旧 App 指示器 reposition 到已变成别的 App 的槽位（"翻页粘到别的图标"）。
+    //   现在指示器按 bundleID 持有、回收只 detach 不重建，瞬时翻转代价极小，故直接采用真实新 bid。
     //   根因：iOS 的 SBIconView.icon 在布局/滚动/角标刷新等过渡期，会**瞬时返回别的 App 的 icon 对象**
     //     （指针不同 + applicationBundleID 返回别的 bid）。旧逻辑（含 v1.6.35 的纯 bid 比较）把这种瞬时翻转
     //     误判成"duti 变成别的 App" → removeFromSuperview + MKSetIndicator(iv,nil)
@@ -185,30 +187,18 @@ static NSString *MKGetCachedBid(SBIconView *iv) {
     // 更新缓存的 icon 指针（仅记录，供下一轮比较；此处绝不触发任何指示器清除）
     objc_setAssociatedObject(iv, &kMKIconKey, icon, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    NSString *resolved = oldBid;  // 默认沿用旧 bid（容忍瞬时翻转）
-    if (oldBid && newBid && [oldBid isEqualToString:newBid]) {
-        resolved = oldBid;          // 同一 App，仅 icon 指针变了（iOS 常见）→ 保留
-    } else if (!newBid) {
-        resolved = oldBid;          // 新 icon 瞬时无 bid（过渡期）→ 保留旧
-    } else if (!oldBid) {
-        resolved = newBid;          // 之前无 bid（如文件夹/首次）→ 现在有了 → 采用
-    } else {
-        // oldBid 与 newBid 都存在且不同 → 疑似"图标被回收复用成别的 App"
-        NSString *pendBid = objc_getAssociatedObject(iv, &kMKPendBidKey);
-        if (pendBid && [pendBid isEqualToString:newBid]) {
-            resolved = newBid;       // 连续 2 次同新 bid → 确认是真回收，清标签缓存
-            objc_setAssociatedObject(iv, &kMKLabelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        } else {
-            resolved = oldBid;       // 首次见 newBid（可能瞬时翻转）→ 本轮保留旧
-        }
+    // v1.6.40: 去掉 v1.6.37 的"待定 bid 去抖"，立即采用真实新 bid。
+    //   去抖的根问题是：回收瞬间仍返回旧 bid，使 layoutSubviews（无过渡守卫）
+    //   把旧 App 指示器 reposition 到已变成别的 App 的槽位 → "翻页粘到别的图标"。
+    //   现在指示器按 bundleID 持有（sIndicatorByBid），回收只 detach 不重建，
+    //   瞬时翻转代价仅是"正确图标上 1 帧 detach 再 re-parent"（无 churn、不粘错），
+    //   故不再需要去抖；立即返回真实新 bid，stale-detach 才能正确触发。
+    NSString *resolved = newBid ? newBid : oldBid;
+    if (oldBid && newBid && ![oldBid isEqualToString:newBid]) {
+        // 图标确实换成了别的 App → 旧 label 缓存失效，清掉（下次 MKGetCachedLabel 会重找）
+        objc_setAssociatedObject(iv, &kMKLabelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    // 维护"待定 bid"：仅当本轮保留了旧 bid、却看到不同 newBid 时记为待定（供下次确认）；
-    //   稳定 / 已采用 / 无新 bid → 清掉待定
-    if (resolved == oldBid && newBid && ![newBid isEqualToString:oldBid]) {
-        objc_setAssociatedObject(iv, &kMKPendBidKey, newBid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    } else {
-        objc_setAssociatedObject(iv, &kMKPendBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
+    objc_setAssociatedObject(iv, &kMKPendBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v1.6.40: 不再有待定状态
     objc_setAssociatedObject(iv, &kMKBidKey, resolved, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     // v1.6.0: 过滤文件夹图标 — 精确匹配，不误杀文件夹内App
@@ -2025,7 +2015,7 @@ static BOOL MKIsSupportedOS(void) {
     %init;
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
-    NSLog(@"[RunningDotIndicator] v1.6.39 ctor: per-bid indicator registry (fixes 'indicator hops to wrong icon on scroll/recycle'); see comments below for detail.");
+    NSLog(@"[RunningDotIndicator] v1.6.40 ctor: removed v1.6.37 debounce so recycle returns the real bid immediately (fixes 'indicator hops to other icons on page-swipe'); see comments below.");
 
     // v1.6.37: 根除问题①(churn) + 问题②的瞬时部分。
     //   根因(rd_log(66) 确证)：iOS 的 SBIconView.icon 在布局/滚动/角标刷新等过渡期，会瞬时返回
