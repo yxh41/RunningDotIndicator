@@ -1165,6 +1165,7 @@ static void MKUpdate(SBIconView *self) {
             UIView *host = self.superview;
             if (host) {
                 hostView = host;
+                host.clipsToBounds = NO;  // v1.6.53: fallback 指示器画在 wrapper bounds 外，避免被裁剪
                 CGRect iconFrame = self.frame;
                 CGFloat estimatedLabelY = iconFrame.origin.y + iconFrame.size.height + 4.0f;
                 CGFloat estimatedLabelH = 14.0f;
@@ -1721,15 +1722,13 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         }
         sLastFolderOpenTS = now;
         if (sDebugLog) RDLog(@"FOLDER OPEN: SBFolderView appeared in window");
-        // v1.6.26: 合并刷新 —— 只排一次 300ms 后的整子树刷新。
-        // 旧逻辑：SBFolderView + SBFolderController + SBIconListPageView 三个 hook 各自刷新，
-        //   造成同秒多次 FOLDER REFRESH（先 26 图标后又 54 图标），整天累计 16,203 次图标快照。
-        // SBFolderView 的整子树下降遍历已覆盖内部所有页面图标，无需再单独 hook 子容器。
+        // v1.6.53: 立即刷新 —— 文件夹打开瞬间标签与指示器会重叠；
+        // 0.4s 去重已防止同一打开事件多次触发，这里再排一次异步刷新即可。
+        // 布局动画期间 layoutSubviews 会重新校正指示器位置，无需再额外 300ms 延迟。
         if (!sFolderRefreshScheduled) {
             sFolderRefreshScheduled = YES;
             __strong UIView *target = me;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
-                           dispatch_get_main_queue(), ^{
+            dispatch_async(dispatch_get_main_queue(), ^{
                 sFolderRefreshScheduled = NO;
                 MKRefreshSubviews(target);
             });
@@ -1965,7 +1964,7 @@ static BOOL MKIsSupportedOS(void) {
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
     NSLog(@"[RunningDotIndicator] v1.6.30 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible");
-    RDLog(@"======== v1.6.52 loading (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups) ========");
+    RDLog(@"======== v1.6.53 loading (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
