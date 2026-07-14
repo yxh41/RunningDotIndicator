@@ -1099,20 +1099,38 @@ static void MKUpdate(SBIconView *self) {
 
         // v1.5.3: 使用缓存的 bundleID（避免每次都调 applicationBundleID）
         NSString *bundleID = MKGetCachedBid(self);
-        // v1.6.56: 滚动中不阻塞"首次创建"——仅当指示器已存在时才跳过（保其随内容视图平移），
-        // 避免运行中 App 因首帧 MKUpdate 恰逢滚动窗口而被永久卡住、永不显示。
-        // 根因(rd_log(96))：25 个后台 App 首帧 MKUpdate 恰逢 sScrolling=YES（启动恢复翻页/持续翻页），
-        // 被旧 gate 直接 return，且其图标之后不再被 MKUpdate 访问 → 永远不建指示器。
+        // v1.6.57: 回退到"纯滚动跳过"——滚动中一律 return（已有指示器随内容视图平移、翻停后 MKRefreshAllIcons 统一补建缺失者）。
+        // 原因(rd_log(97))：v1.6.56 的"仅当指示器已存在才跳过"让首次创建在滚动中照常执行，而 sForegroundBIDs 在翻页/文件夹
+        // 动画期间会短暂误判后台 App 为前台(fg 闪烁)，导致 MKUpdate 反复"移除↔重建"制造 churn(指示器乱跑)。纯滚动跳过彻底规避。
         UIView *existingIndicator = MKGetIndicator(self);
-        if (sScrolling && existingIndicator) {
-            // 仅审计：已有指示器者滚动中跳过（保留骑乘），不该再出现"卡住不建"
+        if (sScrolling) {
+            // 仅审计：滚动中跳过（保留已有指示器随内容视图平移），翻停后 MKRefreshAllIcons 统一补建缺失者。
             if (sDebugLog) {
                 static NSMutableSet *sGateScroll; static dispatch_once_t sOnceS;
                 dispatch_once(&sOnceS, ^{ sGateScroll = [NSMutableSet new]; });
                 NSString *k = bundleID ? bundleID : NSStringFromClass([self class]);
                 if (![sGateScroll containsObject:k]) { [sGateScroll addObject:k]; RDLog(@"RDGATE %@ ret=scroll", k); }
             }
-            return;  // v1.6.52: 滚动中已有指示器则保留（随内容视图平移），不重定位/重建
+            return;  // v1.6.57: 回退到纯滚动跳过（修 Fix A 在滚动中反复创建导致的"乱跑"）；首次创建改由翻停后 MKRefreshAllIcons 统一补建（Fix B 已覆盖全页）
+        }
+        // v1.6.57: 跳过"已打开文件夹内部"的 App 图标 —— 文件夹内 App 不应显示桌面指示器
+        // （否则重新打开文件夹时名称与指示器重叠、且文件夹内 App 都有指示器，视觉错乱）。
+        // 检测 self 的视图层级是否处在某个 SBFolderView 子树内；文件夹【容器】图标本身不在其内部，不受影响。
+        {
+            UIView *anc = (UIView *)self;
+            BOOL inFolder = NO;
+            while (anc) {
+                NSString *cls = NSStringFromClass([anc class]);
+                if ([cls containsString:@"FolderView"] || [cls containsString:@"Folder"]) { inFolder = YES; break; }
+                anc = anc.superview;
+            }
+            if (inFolder) {
+                UIView *leftover = MKGetIndicator(self);
+                if (leftover) { [leftover removeFromSuperview]; MKSetIndicator(self, nil); }
+                UIView *lbl = MKGetCachedLabel(self);
+                if (lbl) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; }
+                return;
+            }
         }
         if (!bundleID || bundleID.length == 0) {
             if (sDebugLog) {
@@ -1267,7 +1285,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.56: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.57: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -2019,7 +2037,7 @@ static BOOL MKIsSupportedOS(void) {
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
     NSLog(@"[RunningDotIndicator] v1.6.30 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible");
-    RDLog(@"======== RDBUILD v1.6.56 (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped) ========");
+    RDLog(@"======== RDBUILD v1.6.57 (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
