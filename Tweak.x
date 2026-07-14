@@ -311,6 +311,10 @@ static void MKRepositionIndicator(NSString *bid, SBIconView *iv, MKConfig *cfg) 
 
 // v1.6.75: 前向声明（MKFolderChosenBid 依赖，定义在文件后部）
 static NSString *MKGetCachedBid(SBIconView *iv);
+// v1.6.76: MKIsAppRunning/MKIsForeground 定义在 ~1013/1029，文件夹收集函数(373)先于定义调用，
+// 须在此前置声明（否则 390 行首次调用被视为隐式(非 static)声明，与 435 行 static 前向声明冲突 → -Werror 失败）。
+static BOOL       MKIsAppRunning(NSString *bundleID);                        // App 是否运行中
+static BOOL       MKIsForeground(NSString *bid);                            // App 是否前台
 // v1.6.76: 文件夹【图标】功能前向声明
 static BOOL       MKIsFolderIcon(SBIconView *iv);                              // 检测文件夹图标
 static NSArray<NSString*> *MKContainedRunningBids(SBIconView *fiv);          // 取文件夹内后台运行 App
@@ -326,9 +330,12 @@ static NSInteger MKBadgeForBid(NSString *bid) {
     @try {
         Class cls = NSClassFromString(@"SBApplicationController");
         if (!cls) return 0;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
         id ctrl = [cls performSelector:NSSelectorFromString(@"sharedInstance")];
         if (!ctrl) return 0;
         id app = [ctrl performSelector:NSSelectorFromString(@"applicationWithBundleIdentifier:") withObject:bid];
+#pragma clang diagnostic pop
         if (!app) return 0;
         SEL sel = NSSelectorFromString(@"badgeNumber");
         if (![app respondsToSelector:sel]) return 0;
@@ -372,6 +379,8 @@ static NSString *MKFolderChosenBid(NSArray<NSString*> *bids, NSInteger mode, BOO
 // 全程 @try + performSelector + NSClassFromString 防御私有 API（避免 -Werror/崩溃）。
 static void MKCollectRunningFromFolder(id folder, NSMutableArray<NSString*> *out) {
     if (!folder || !out) return;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
     Class appCls = NSClassFromString(@"SBApplicationIcon");
     if (!appCls) appCls = NSClassFromString(@"SBLeafIcon");
     Class fCls = NSClassFromString(@"SBFolderIcon");
@@ -396,6 +405,7 @@ static void MKCollectRunningFromFolder(id folder, NSMutableArray<NSString*> *out
             MKCollectRunningFromFolder(sf, out);
         }
     }
+#pragma clang diagnostic pop
 }
 
 // v1.6.76: 取文件夹图标里「后台运行中」的 App 的 bid 数组（递归含嵌套文件夹）。
@@ -412,8 +422,11 @@ static NSArray<NSString*> *MKContainedRunningBids(SBIconView *fiv) {
         id icon = [fiv icon];
         if (!icon) return @[];
         id folder = nil;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
         if ([icon respondsToSelector:NSSelectorFromString(@"folder")])
             folder = [icon performSelector:NSSelectorFromString(@"folder")];
+#pragma clang diagnostic pop
         if (!folder) return @[];
         MKCollectRunningFromFolder(folder, out);
     } @catch (NSException *e) {
@@ -431,9 +444,6 @@ static NSArray<NSString*> *MKContainedRunningBids(SBIconView *fiv) {
 static UIView *MKFindLabelView(SBIconView *iconView);
 // 前向声明（取色 miss 重试时需要调用）
 static void MKRefreshIconForBundleID(NSString *bid);
-// 前向声明（miss 重试的 dispatch 块内需要判断运行状态）
-static BOOL MKIsAppRunning(NSString *bundleID);
-static BOOL MKIsForeground(NSString *bid);
 // 前向声明（滚动守卫刷新需要）
 static void MKRefreshSubviews(UIView *containerView);
 // 前向声明（翻停后刷新所有页面图标，定义在文件后部）
