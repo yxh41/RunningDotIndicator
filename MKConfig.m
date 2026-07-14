@@ -115,6 +115,18 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
     return [[self class] colorFromHex:hex];
 }
 
+// v1.6.75: 桌面文件夹指示器总开关，默认开（保留原行为：文件夹内显示）
+- (BOOL)folderIndicators {
+    id v = _prefs[@"folderIndicators"];
+    return v ? [v boolValue] : YES;
+}
+
+// v1.6.75: 文件夹内显示方式，默认 0=排序靠前
+- (NSInteger)folderIndicatorMode {
+    id v = _prefs[@"folderIndicatorMode"];
+    return v ? (NSInteger)[v integerValue] : 0;
+}
+
 + (UIColor *)colorFromHex:(NSString *)hex {
     if (![hex isKindOfClass:[NSString class]] || ![hex length]) {
         return [UIColor systemGreenColor];

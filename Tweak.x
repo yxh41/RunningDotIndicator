@@ -172,6 +172,12 @@ static BOOL  sLocked        = NO;  // v1.6.69: 设备是否处于锁屏态（解
 static NSTimeInterval sLockAt = 0;   // v1.6.70: 最近一次锁屏时刻；用于 MKUpdate 时间闸门自动复位（不依赖解锁通知）
 static BOOL  sDebugLog      = NO;  // v1.6.26: 调试日志开关；声明提前到此处，确保 MKLockStateCallback()(v1.6.69) 等在其定义前即可引用。
 static char kMKIndicatorContainerKey;    // 指示器记录的所属容器（仅供调试/稳健性）
+static char kMKFIconBidsKey;  // v1.6.76: 文件夹图标缓存的「内部后台运行中 App」bid 数组
+static char kMKFIconGenKey;    // v1.6.76: 该缓存的代际（sFolderContentGen 变化时失效）
+static NSUInteger sFolderContentGen = 0; // v1.6.76: 文件夹内容代际；App 运行态变化时 +1 使缓存失效
+
+// v1.6.75: 锁屏后兜底「解锁复原」定时器句柄（不依赖 iOS 解锁通知/布局事件）
+static dispatch_source_t sUnlockTimer = NULL;
 
 // v1.6.64: 以下 helpers 管理「按 bid 索引、挂在稳定 overlay 层」的指示器。
 static UIView *MKGetCachedLabel(SBIconView *iv); // 前向声明（定义于文件后部）
@@ -209,6 +215,15 @@ static BOOL MKIsIconInFolder(UIView *iv) {
     // 误判会让 Dock 后台 App 被当成文件夹内而不显指示器（1.6.65 已修好的 Dock 回退）。
     BOOL isHomeOrDock = [cls isEqualToString:@"SBIconScrollView"] || [cls hasPrefix:@"SBDock"];
     return (container && !isHomeOrDock);
+}
+// v1.6.76: 检测 self 是否为「文件夹图标」（桌面/Dock 上那个，未打开）。
+// 用于区分「文件夹图标」与「文件夹内部 App 图标」——后者走正常主功能。
+static BOOL MKIsFolderIcon(SBIconView *iv) {
+    if (!iv) return NO;
+    id icon = [iv icon];
+    if (!icon) return NO;
+    NSString *cls = NSStringFromClass([icon class]);
+    return [cls isEqualToString:@"SBFolderIcon"] || [cls isEqualToString:@"SBIconFolderIcon"];
 }
 static UIView *MKOverlayForContainer(UIView *container) {
     if (!container) return nil;
@@ -294,6 +309,121 @@ static void MKRepositionIndicator(NSString *bid, SBIconView *iv, MKConfig *cfg) 
     if (!CGRectIsEmpty(f)) { ind.frame = f; ind.hidden = NO; }
 }
 
+// v1.6.75: 前向声明（MKFolderChosenBid 依赖，定义在文件后部）
+static NSString *MKGetCachedBid(SBIconView *iv);
+// v1.6.76: 文件夹【图标】功能前向声明
+static BOOL       MKIsFolderIcon(SBIconView *iv);                              // 检测文件夹图标
+static NSArray<NSString*> *MKContainedRunningBids(SBIconView *fiv);          // 取文件夹内后台运行 App
+static NSString *MKFolderChosenBid(NSArray<NSString*> *bids, NSInteger mode, BOOL fixedColor); // 选代表 App
+static void      MKRefreshFolderIcons(void);                              // 刷新所有文件夹图标
+static void      MKUpdateFolderIconsUnder(UIView *view, Class ivCls);        // 递归找文件夹图标
+
+// v1.6.75: 读取 App 角标数（消息数量近似）。
+// 用 NSInvocation 调 -[SBApplication badgeNumber]，避免 performSelector: 让 ARC 把
+// 标量返回值当 id 去 retain/release 导致崩溃。取不到（类名/方法不存在）兜底 0。
+static NSInteger MKBadgeForBid(NSString *bid) {
+    if (!bid.length) return 0;
+    @try {
+        Class cls = NSClassFromString(@"SBApplicationController");
+        if (!cls) return 0;
+        id ctrl = [cls performSelector:NSSelectorFromString(@"sharedInstance")];
+        if (!ctrl) return 0;
+        id app = [ctrl performSelector:NSSelectorFromString(@"applicationWithBundleIdentifier:") withObject:bid];
+        if (!app) return 0;
+        SEL sel = NSSelectorFromString(@"badgeNumber");
+        if (![app respondsToSelector:sel]) return 0;
+        NSMethodSignature *sig = [app methodSignatureForSelector:sel];
+        if (!sig) return 0;
+        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+        [inv setTarget:app];
+        [inv setSelector:sel];
+        [inv invoke];
+        NSInteger n = 0;
+        [inv getReturnValue:&n];
+        return n > 0 ? n : 0;
+    } @catch (NSException *e) {}
+    return 0;
+}
+
+// v1.6.76: 文件夹【图标】（桌面/Dock 上、未打开）显示 1 个圆点。
+// 里面 ≥1 个后台运行 App 时，圆点颜色按 folderIndicatorMode 取「代表 App」主色（auto 模式）；
+// 固定色模式圆点用全局固定色、两种策略灰掉无意义。
+// 形状/尺寸走全局 cfg（与里面 App 的圆点自动同步）。
+// 入参 bids = 文件夹内后台运行 App 的 bid 数组（已按文件夹顺序）；
+//   mode 0 = 数组序最前（≈视觉排序靠前），mode 1 = 角标最多；fixedColor 退化为 mode 0。
+// 返回被选中的代表 bid；无运行 App 返回 nil。
+static NSString *MKFolderChosenBid(NSArray<NSString*> *bids, NSInteger mode, BOOL fixedColor) {
+    if (!bids || bids.count == 0) return nil;
+    if (bids.count == 1) return bids.firstObject;
+    NSInteger pick = fixedColor ? 0 : mode; // 固定颜色退化为「排序靠前」
+    if (pick == 1) {
+        NSString *best = bids.firstObject;
+        NSInteger bestB = MKBadgeForBid(best);
+        for (NSString *b in bids) {
+            NSInteger n = MKBadgeForBid(b);
+            if (n > bestB) { best = b; bestB = n; }
+        }
+        return best;
+    }
+    return bids.firstObject; // 排序靠前 = 数组第一个
+}
+
+// v1.6.76: 递归收集文件夹（含嵌套）内「后台运行中」App 的 bid（写入 out）。
+// 全程 @try + performSelector + NSClassFromString 防御私有 API（避免 -Werror/崩溃）。
+static void MKCollectRunningFromFolder(id folder, NSMutableArray<NSString*> *out) {
+    if (!folder || !out) return;
+    Class appCls = NSClassFromString(@"SBApplicationIcon");
+    if (!appCls) appCls = NSClassFromString(@"SBLeafIcon");
+    Class fCls = NSClassFromString(@"SBFolderIcon");
+    if (!fCls) fCls = NSClassFromString(@"SBIconFolderIcon");
+    NSArray *icons = nil;
+    if ([folder respondsToSelector:NSSelectorFromString(@"allIcons")])
+        icons = [folder performSelector:NSSelectorFromString(@"allIcons")];
+    else if ([folder respondsToSelector:NSSelectorFromString(@"displayedIcons")])
+        icons = [folder performSelector:NSSelectorFromString(@"displayedIcons")];
+    if (!icons) return;
+    for (id sub in icons) {
+        if (appCls && [sub isKindOfClass:appCls]) {
+            NSString *b = nil;
+            if ([sub respondsToSelector:NSSelectorFromString(@"applicationBundleIdentifier")])
+                b = [sub performSelector:NSSelectorFromString(@"applicationBundleIdentifier")];
+            if ([b isKindOfClass:[NSString class]] && b.length && MKIsAppRunning(b) && !MKIsForeground(b))
+                [out addObject:b];
+        } else if (fCls && [sub isKindOfClass:fCls]) {
+            id sf = nil; // 嵌套文件夹：递归
+            if ([sub respondsToSelector:NSSelectorFromString(@"folder")])
+                sf = [sub performSelector:NSSelectorFromString(@"folder")];
+            MKCollectRunningFromFolder(sf, out);
+        }
+    }
+}
+
+// v1.6.76: 取文件夹图标里「后台运行中」的 App 的 bid 数组（递归含嵌套文件夹）。
+// 用关联对象 + 代际(sFolderContentGen) 做缓存：App 运行态变化时代际 +1，缓存自动失效。
+static NSArray<NSString*> *MKContainedRunningBids(SBIconView *fiv) {
+    if (!fiv) return @[];
+    NSArray *cached = objc_getAssociatedObject(fiv, &kMKFIconBidsKey);
+    NSNumber *cachedGen = objc_getAssociatedObject(fiv, &kMKFIconGenKey);
+    if (cached && cachedGen && [cachedGen unsignedIntegerValue] == sFolderContentGen) {
+        return cached;
+    }
+    NSMutableArray *out = [NSMutableArray array];
+    @try {
+        id icon = [fiv icon];
+        if (!icon) return @[];
+        id folder = nil;
+        if ([icon respondsToSelector:NSSelectorFromString(@"folder")])
+            folder = [icon performSelector:NSSelectorFromString(@"folder")];
+        if (!folder) return @[];
+        MKCollectRunningFromFolder(folder, out);
+    } @catch (NSException *e) {
+        return out; // 部分结果兜底
+    }
+    objc_setAssociatedObject(fiv, &kMKFIconBidsKey, out, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(fiv, &kMKFIconGenKey, @(sFolderContentGen), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return out;
+}
+
 // v1.6.64: 原 MKIndicatorFrameInSelf（窗口坐标系）已由 MKIndicatorFrameInOverlay（overlay 坐标系，
 // 额外吃掉 transform/滚动偏移）取代；此处不再需要，删除旧定义以免 -Werror 报 unused。
 
@@ -309,6 +439,31 @@ static void MKRefreshSubviews(UIView *containerView);
 // 前向声明（翻停后刷新所有页面图标，定义在文件后部）
 static void MKRefreshAllIcons(void);
 // v1.6.69: 锁屏/解锁通知回调 —— 锁屏隐藏所有指示器，解锁动画结束后再复位，避免解锁动画透出指示器圆点。
+// v1.6.75: 锁屏后排一个 ~1.0s 兜底定时器，解锁后可靠复原所有指示器。
+// 本设备 UIApplicationDidBecomeActive / lockstate 解锁通知未必派发，仅靠 MKUpdate 时间闸门
+// 又依赖"解锁后有布局事件"；定时器不依赖任何通知/布局，锁屏满 1.0s 即复原。
+// 1.0s > 解锁动画(~0.5s)，故不会在动画途中闪现；仍锁屏时复原发生在锁屏遮罩之下，
+// 解锁后干净呈现，无透出。每次锁屏都重建并取消上一轮，避免重锁时旧定时器误触发。
+static void MKScheduleUnlock(void) {
+    if (sUnlockTimer) { dispatch_source_cancel(sUnlockTimer); sUnlockTimer = NULL; }
+    sUnlockTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    if (!sUnlockTimer) return;
+    dispatch_source_set_timer(sUnlockTimer,
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+        DISPATCH_TIME_FOREVER, 0);
+    dispatch_source_set_event_handler(sUnlockTimer, ^{
+        if (sUnlockTimer) { dispatch_source_cancel(sUnlockTimer); sUnlockTimer = NULL; }
+        if (!sLocked) return;
+        NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+        if (now - sLockAt < 0.7) return;  // 又有更新的锁屏，等下一轮
+        sLocked = NO;
+        MKSetAllIndicatorsHidden(NO);  // v1.6.75: 复原所有 overlay（之前只重建不 unhide，主屏/Dock 指示器解锁后永久不显）
+        MKRefreshAllIcons();
+        if (sDebugLog) RDLog(@"UNLOCK(timer): restored all indicators");
+    });
+    dispatch_resume(sUnlockTimer);
+}
+
 static void MKLockStateCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     @try {
         NSString *n   = (__bridge NSString *)name;
@@ -317,6 +472,15 @@ static void MKLockStateCallback(CFNotificationCenterRef center, void *observer, 
         if ([n isEqualToString:@"com.apple.springboard.lockcomplete"]) {
             lockNow = YES;
         } else if ([n isEqualToString:@"com.apple.springboard.lockstate"]) {
+            // v1.6.75: lockstate 对象 "0" 即解锁 —— 若本设备派发，立即精确复原（无延迟/无闪现）
+            if ([obj isEqualToString:@"0"]) {
+                if (sUnlockTimer) { dispatch_source_cancel(sUnlockTimer); sUnlockTimer = NULL; }
+                sLocked = NO;
+                MKSetAllIndicatorsHidden(NO);
+                MKRefreshAllIcons();
+                if (sDebugLog) RDLog(@"UNLOCK(lockstate): restored all indicators");
+                return;
+            }
             lockNow = [obj isEqualToString:@"1"];
         }
         // v1.6.70: 只在"锁屏"时隐藏所有指示器并记录锁屏时刻。
@@ -328,9 +492,10 @@ static void MKLockStateCallback(CFNotificationCenterRef center, void *observer, 
             sLocked = YES;
             sLockAt = [NSDate date].timeIntervalSince1970;
             MKSetAllIndicatorsHidden(YES);
+            MKScheduleUnlock();  // v1.6.75: 排兜底复原定时器
             if (sDebugLog) RDLog(@"LOCK: hid all indicators");
         }
-        // 解锁不再在此处理：交由 MKUpdate 时间闸门自动复位（见 sLocked 守卫）。
+        // 解锁不再在此处理：交由 MKUpdate 时间闸门 + 兜底定时器自动复位（见 sLocked 守卫）。
     } @catch (NSException *e) {
         RDLog(@"LOCK observer exception: %@", e.reason);
     }
@@ -1282,10 +1447,11 @@ static void MKUpdate(SBIconView *self) {
             NSTimeInterval now = [NSDate date].timeIntervalSince1970;
             if (now - sLockAt > 0.7) {
                 sLocked = NO;  // 解锁动画已结束，正常显示
-                // v1.6.74: 解锁用「全量重建」替代单纯 unhide overlay ——
-                // 锁屏期间部分指示器可能因视图层级变动而孤儿化（superview 失效），
-                // 单纯 MKSetAllIndicatorsHidden(NO) 救不回，必须按运行集合在当前正确
-                // overlay 上重建。下一帧异步全量刷新，确保解锁后完整显现、无需滑动。
+                // v1.6.75: 复原所有 overlay（关键回归修复）——v1.6.74 只重建/重定位
+                // 指示器却从不把 overlay 重新 hidden=NO，导致主屏/Dock 指示器解锁后
+                // 永远不显示。这里先 unhide，再全量重建兜底孤儿化。
+                if (sUnlockTimer) { dispatch_source_cancel(sUnlockTimer); sUnlockTimer = NULL; }
+                MKSetAllIndicatorsHidden(NO);
                 dispatch_async(dispatch_get_main_queue(), ^{
                     MKRefreshAllIcons();
                 });
@@ -1328,6 +1494,79 @@ static void MKUpdate(SBIconView *self) {
         // → 被文件夹盖住不可见，与文件夹图标实例争抢 → "重开空位置 / 有些 App 没反应"。
         // 文件夹图标实例才是该 bid 在文件夹期间的权威所有者，故主屏/Dock 实例在
         // sFolderOpen 时完全跳过指示器管理；FOLDER CLOSE 刷新会复位主屏。
+
+        // v1.6.76: 文件夹【图标】（桌面/Dock 上、未打开）显示 1 个圆点。
+        // 里面 ≥1 个后台运行 App 时显示；颜色按 folderIndicatorMode 取「代表 App」主色（auto 模式），
+        // 固定色模式圆点用全局固定色；形状/尺寸走全局 cfg（与里面 App 的圆点同步）。
+        // 必须在 sFolderOpen 门控之前处理：文件夹图标本身不在文件夹内、其 own bid 不是 App，
+        // 若放到门控之后，打开别的文件夹时会被早退跳过、圆点不刷新。
+        if (MKIsFolderIcon((SBIconView *)self)) {
+            NSString *fBid = MKGetCachedBid((SBIconView *)self);
+            if (!fBid.length) return;
+            NSArray<NSString*> *contained = MKContainedRunningBids((SBIconView *)self);
+            if (contained.count == 0) {
+                UIView *lbl = MKGetCachedLabel(self);
+                if (lbl) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; }
+                UIView *fi = MKFindIndicator(fBid);
+                if (fi) MKRemoveIndicatorForBid(fBid);
+                return;
+            }
+            MKConfig *fCfg = [MKConfig sharedConfig];
+            if (!fCfg || !fCfg.folderIndicators) {
+                UIView *lbl = MKGetCachedLabel(self);
+                if (lbl) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; }
+                UIView *fi = MKFindIndicator(fBid);
+                if (fi) MKRemoveIndicatorForBid(fBid);
+                return;
+            }
+            // 有运行 App → 显示 1 个圆点（按策略取代表 App 主色）
+            BOOL fixedColor = (fCfg.colorMode == MKColorModeFixed);
+            NSString *rep = MKFolderChosenBid(contained, fCfg.folderIndicatorMode, fixedColor);
+            UIView *label = MKGetCachedLabel(self);
+            if (label) { label.hidden = YES; label.alpha = 0.0f; label.layer.opacity = 0.0f; label.opaque = NO; }
+            UIView *container = MKContainerForIconView((UIView *)self);
+            UIView *overlay = MKOverlayForContainer(container);
+            if (!overlay) {
+                dispatch_async(dispatch_get_main_queue(), ^{ MKUpdate(self); });
+                return;
+            }
+            CGRect indicatorFrame = MKIndicatorFrameInOverlay((SBIconView *)self, overlay, fCfg);
+            UIView *indicator = MKFindIndicator(fBid);
+            if (!indicator) {
+                indicator = [[MKIndicatorDotView alloc] initWithFrame:indicatorFrame];
+                indicator.tag = kDotTag;
+                objc_setAssociatedObject(indicator, &kMKIndicatorBidKey, fBid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                [(MKIndicatorDotView *)indicator applyConfig];
+                if (!fixedColor && rep.length) {
+                    UIColor *c = MKCachedIconColorForBundleID(rep);
+                    if (c) [(MKIndicatorDotView *)indicator setIndicatorColor:c];
+                }
+                [overlay addSubview:indicator];
+                if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
+                [sBidToIndicator setObject:indicator forKey:fBid];
+                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.76: %@ rep=%@ mode=%ld fixed=%d", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor);
+            } else {
+                if (indicator.superview != overlay) {
+                    [indicator removeFromSuperview];
+                    [overlay addSubview:indicator];
+                }
+                if (!fixedColor && rep.length) {
+                    UIColor *c = MKCachedIconColorForBundleID(rep);
+                    MKIndicatorDotView *dot = (MKIndicatorDotView *)indicator;
+                    UIColor *cur = dot.indicatorColor;
+                    if (!cur || !CGColorEqualToColor(cur.CGColor, c.CGColor)) {
+                        [dot setIndicatorColor:c];
+                        [indicator setNeedsDisplay];
+                    }
+                }
+                if (!CGRectIsEmpty(indicatorFrame)) {
+                    indicator.frame = indicatorFrame;
+                    indicator.hidden = NO;
+                }
+            }
+            return;
+        }
+
         if (sFolderOpen && !MKIsIconInFolder((UIView *)self)) {
             return;
         }
@@ -1418,6 +1657,10 @@ static void MKUpdate(SBIconView *self) {
             RDLog(@"RDUPD %@ fg=%d scroll=%d pend=%d fade=%d bid=%@",
                   NSStringFromClass([self class]), isForeground, sScrolling, isPending, isFading, bundleID);
         }
+
+        // v1.6.76: 文件夹「内部」运行的 App 现在走下方常规主功能路径各自显示圆点
+        // （用户要求「保留里面各自显」）。文件夹【图标】本身挂圆点的逻辑在上方 MKIsFolderIcon 分支。
+
 
         // v1.5.3: 使用缓存的标签视图（避免每次都跑 MKFindLabelView 4 重策略）
         UIView *label = MKGetCachedLabel(self);
@@ -1514,7 +1757,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.74: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.76: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -1790,6 +2033,10 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
     // 避免「名字被渐隐淡出、却没有指示器顶上」的空档（之前观察到的问题）。
     if (MKIsBlacklisted(bid)) return;
 
+    // v1.6.76: 文件夹内容代际 +1（里面 App 运行态变了），并刷新所有文件夹图标
+    sFolderContentGen++;
+    if (sInitDone) dispatch_async(dispatch_get_main_queue(), ^{ MKRefreshFolderIcons(); });
+
     // v1.6.69: 文件夹打开期间，跳过一切 label 渐隐/指示器逻辑。
     // 否则文件夹内 App 发生 fg→bg 状态切换（打开文件夹瞬间前台 App 退后台）会触发
     // 后台分支的 250ms 渐隐，把文件夹内 App 名称淡出、稍后又被 sFolderOpen 守卫拉回可见
@@ -1894,6 +2141,7 @@ static void MKDelayedInit() {
 
     // ─── 首次刷新所有图标 ──────
     MKRefreshAllIcons();
+    MKRefreshFolderIcons();
 }
 
 static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observer,
@@ -1902,6 +2150,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     [[MKConfig sharedConfig] reload];
     MKUpdateDebugFlag(); // v1.6.26: 设置变更后刷新调试开关
     MKRefreshAllIcons();
+    MKRefreshFolderIcons();
 }
 
 // ====================================================================
@@ -2012,6 +2261,13 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
             return;
         }
 
+    // v1.6.76: 文件夹【内部】App 各自显自己的圆点（用户要求「保留里面各自显」，主功能不变）。
+    // 直接交给 MKUpdate 决断（创建 + 重父/重定位），不在这里做稳态重定位以免绕过 MKUpdate 的创建逻辑。
+    if (MKIsIconInFolder((UIView *)self) && running && !isForeground) {
+        MKUpdate(self);
+        return;
+    }
+
     // 有 overlay 指示器 → 校验是否还应存在
     if (!running || isForeground) {
         MKUpdate(self);  // 移除（App 退出/前台/文件夹）
@@ -2082,6 +2338,11 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
                 sFolderRefreshScheduled = NO;
                 MKRefreshSubviews(target);
             });
+            // v1.6.75: 开文件夹动画期间图标可能稍晚入树，补一轮延迟刷新兜底
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{
+                if (sInitDone) { MKRefreshSubviews(target); MKRefreshFolderIcons(); }
+            });
         }
     } else if (!me.window) {
         sFolderOpen = NO;
@@ -2100,6 +2361,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
                 UIView *home = MKFindDescendantView(w, @"SBIconScrollView");
                 if (home) { MKRefreshSubviews(home); break; }
             }
+            MKRefreshFolderIcons();
         });
     }
 }
@@ -2315,6 +2577,33 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
 static BOOL MKIsSupportedOS(void) {
     NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
     return (v.majorVersion >= 16);
+}
+
+// v1.6.76: 刷新所有文件夹图标（桌面/Dock）。
+// 遍历主屏 SBIconScrollView 与 Dock（SBDockIconListView/SBDockView）子视图，
+// 对文件夹图标类实例调 MKUpdate，使里面 App 运行态变化时文件夹图标的圆点及时刷新。
+static void MKUpdateFolderIconsUnder(UIView *view, Class ivCls) {
+    for (UIView *v in view.subviews) {
+        if ([v isKindOfClass:ivCls] && MKIsFolderIcon((SBIconView *)v)) {
+            MKUpdate((SBIconView *)v);
+        } else {
+            MKUpdateFolderIconsUnder(v, ivCls);
+        }
+    }
+}
+static void MKRefreshFolderIcons(void) {
+    if (!sInitDone) return;
+    MKSafe(^{
+        Class ivCls = MKSBIconViewClass();
+        NSArray *wins = [UIApplication sharedApplication].windows;
+        for (UIWindow *w in wins) {
+            UIView *home = MKFindDescendantView(w, @"SBIconScrollView");
+            if (home) MKUpdateFolderIconsUnder(home, ivCls);
+            UIView *dock = MKFindDescendantView(w, @"SBDockIconListView");
+            if (!dock) dock = MKFindDescendantView(w, @"SBDockView");
+            if (dock) MKUpdateFolderIconsUnder(dock, ivCls);
+        }
+    });
 }
 
 %ctor {
