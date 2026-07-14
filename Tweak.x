@@ -1489,7 +1489,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.71: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.72: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -1997,6 +1997,22 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         label.layer.opacity = 0.0f;
         label.opaque = NO;
     }
+    // v1.6.72: 重父到当前容器 overlay（修复"预运行 App 打开其文件夹后指示器不搬到文件夹 overlay"）。
+    // 原先稳态路径只 MKRepositionIndicator（在当前容器坐标系内重定位），从不重父，
+    // 完全依赖异步 MKUpdate 的 already-exists 分支去搬运；当"主屏在跑的 App 打开
+    // 它所在的文件夹"时，指示器若仍挂在主屏 overlay 上，文件夹盖住主屏 → 不可见。
+    // 这里若发现指示器不在当前 overlay 上，立即重父（与 MKUpdate already-exists 分支一致），
+    // 不再靠异步调用，消除竞态。稳态（主屏在跑 App 没开文件夹）时
+    // indicator.superview == overlay，下面 if 不触发，无额外开销/churn。
+    UIView *container = MKContainerForIconView((UIView *)self);
+    UIView *overlay = MKOverlayForContainer(container);
+    if (overlay && indicator.superview != overlay) {
+        [indicator removeFromSuperview];
+        [overlay addSubview:indicator];
+        [overlay bringSubviewToFront:indicator];
+        if (sDebugLog) RDLog(@"IND-REPARENT-LS bid=%@ to=%@",
+              bid, NSStringFromClass([overlay class]));
+    }
     MKRepositionIndicator(bid, self, cfg);
 }
 
@@ -2308,6 +2324,26 @@ static BOOL MKIsSupportedOS(void) {
         NULL, MKLockStateCallback,
         CFSTR("com.apple.springboard.lockstate"),
         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+
+    // ─── 解锁可靠复位（v1.6.72）──────────
+    // v1.6.70 把"解锁后复位"全押在 MKUpdate 时间闸门上，但该闸门依赖
+    // "解锁后第一次 layoutSubviews 调用 MKUpdate"才翻闸；若解锁后静置不触发布局，
+    // sLocked 卡 YES、overlay 永久 hidden → 指示器消失、得滑动才回来（用户一直反馈的现象）。
+    // 改用 UIApplicationDidBecomeActiveNotification：解锁/回到前台时 SpringBoard 必然变 active、
+    // 必定触发（不依赖任何布局），立即全局恢复所有指示器。该通知在解锁动画结束后才派发，
+    // 故无"动画透出"风险。原 MKUpdate 时间闸门保留为后备（极少数此通知不派发时仍可由布局翻闸）。
+    // 注意：普通"切 App 回前台"也会派发此通知，但彼时 sLocked 已为 NO（非锁屏态），
+    // 下方 `if (!sLocked) return;` 直接跳过，不误触。
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:[NSOperationQueue mainQueue]
+        usingBlock:^(NSNotification *note){
+            @try {
+                if (!sLocked) return;   // 非锁屏态（如普通切 App 回前台），不动
+                sLocked = NO;
+                MKSetAllIndicatorsHidden(NO);  // 全局恢复所有 overlay → 指示器瞬间显现
+                if (sDebugLog) RDLog(@"UNLOCK(active): revealed indicators");
+            } @catch (NSException *e) {}
+        }];
 
     // ─── 生命周期通知（只保留 exit，iOS 16 上只有 exit 有效）──────────
     if (!sLifecycleObservers) sLifecycleObservers = [NSMutableArray array];
