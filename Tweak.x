@@ -168,6 +168,7 @@ static NSMapTable *sContainerToOverlay; // 滚动容器(UIScrollView) -> overlay
 // 仅当为 YES 时才允许把图标判定为"在文件夹内"，消除主屏图标被误判。
 // 声明提前到此处，确保 MKIsIconInFolder()(v1.6.67) 等辅助函数在其定义前即可引用，满足 -Werror 先声明后使用。
 static BOOL  sFolderOpen     = NO;
+static BOOL  sLocked        = NO;  // v1.6.69: 设备是否处于锁屏态（解锁动画期间保持 YES，避免指示器透出）
 static char kMKIndicatorContainerKey;    // 指示器记录的所属容器（仅供调试/稳健性）
 
 // v1.6.64: 以下 helpers 管理「按 bid 索引、挂在稳定 overlay 层」的指示器。
@@ -253,6 +254,12 @@ static void MKRemoveAllIndicators(void) {
     for (UIView *ind in all) { if (ind) [ind removeFromSuperview]; }
     [sBidToIndicator removeAllObjects];
 }
+// v1.6.69: 锁屏时一次性隐藏/恢复所有指示器（不销毁，解锁后刷新即可复位）。
+static void MKSetAllIndicatorsHidden(BOOL hidden) {
+    if (!sBidToIndicator) return;
+    NSArray *all = [[sBidToIndicator objectEnumerator].allObjects copy];
+    for (UIView *ind in all) { if (ind) ind.hidden = hidden; }
+}
 // v1.6.67: 计算某 bid 的指示器在 overlay 坐标系中的 frame（transform/滚动偏移安全）。
 // 使用传入的图标视图 iv，而不是去 sBidToIconView 注册表里取——注册表里存的是"最后一次
 // 调用 MKUpdate 的图标实例"，在多页桌面中如果当前 layout 的是另一页的图标，会拿错位置
@@ -297,6 +304,37 @@ static BOOL MKIsForeground(NSString *bid);
 static void MKRefreshSubviews(UIView *containerView);
 // 前向声明（翻停后刷新所有页面图标，定义在文件后部）
 static void MKRefreshAllIcons(void);
+// v1.6.69: 锁屏/解锁通知回调 —— 锁屏隐藏所有指示器，解锁动画结束后再复位，避免解锁动画透出指示器圆点。
+static void MKLockStateCallback(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    @try {
+        NSString *n   = (__bridge NSString *)name;
+        NSString *obj = (__bridge NSString *)object;
+        BOOL lockNow = NO;
+        if ([n isEqualToString:@"com.apple.springboard.lockcomplete"]) {
+            lockNow = YES;
+        } else if ([n isEqualToString:@"com.apple.springboard.lockstate"]) {
+            lockNow = [obj isEqualToString:@"1"];
+        }
+        sLocked = lockNow;
+        if (lockNow) {
+            MKSetAllIndicatorsHidden(YES);
+            if (sDebugLog) RDLog(@"LOCK: hid all indicators");
+        } else {
+            // 解锁：先保持隐藏，等解锁动画结束（~600ms）后再复位，
+            // 否则动画期间指示器会透出。600ms 内若又被锁，则跳过复位。
+            MKSetAllIndicatorsHidden(YES);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 600 * NSEC_PER_SEC),
+                           dispatch_get_main_queue(), ^{
+                if (sLocked) return;            // 600ms 内又被锁了，不揭示
+                sLocked = NO;
+                MKRefreshAllIcons();
+                if (sDebugLog) RDLog(@"UNLOCK: revealed indicators");
+            });
+        }
+    } @catch (NSException *e) {
+        RDLog(@"LOCK observer exception: %@", e.reason);
+    }
+}
 // 前向声明（setContentOffset: 钩子调用，定义在 sInitDone 之后）
 static void MKMarkScrolling(UIView *scrollView);
 // 前向声明（v1.6.31: SBIconView 类静态化，定义在文件后部，但前部遍历循环已调用）
@@ -1237,6 +1275,14 @@ static void MKUpdate(SBIconView *self) {
     MKSafe(^{
         if (!sInitDone) return;
 
+        // v1.6.69: 锁屏/解锁动画期间不显示指示器（避免解锁动画透出指示器圆点）。
+        // 解锁动画结束后再由 MKLockStateCallback 的 600ms 延时复位。
+        if (sLocked) {
+            UIView *ind = MKFindIndicator(MKGetCachedBid(self));
+            if (ind) ind.hidden = YES;
+            return;
+        }
+
         sCallCount++;
         if (MKIsDisabled()) {
             MKRemoveAllIndicators();
@@ -1442,7 +1488,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.68: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.69: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -1703,6 +1749,18 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
     // 不走任何名称渐隐 / 指示器逻辑 —— 反正不显示指示器，名字就保持原样，
     // 避免「名字被渐隐淡出、却没有指示器顶上」的空档（之前观察到的问题）。
     if (MKIsBlacklisted(bid)) return;
+
+    // v1.6.69: 文件夹打开期间，跳过一切 label 渐隐/指示器逻辑。
+    // 否则文件夹内 App 发生 fg→bg 状态切换（打开文件夹瞬间前台 App 退后台）会触发
+    // 后台分支的 250ms 渐隐，把文件夹内 App 名称淡出、稍后又被 sFolderOpen 守卫拉回可见
+    // → 肉眼"名称闪一下"。簿记（running set / foreground）已由 SBApplication hook 在调用前完成，
+    // 这里只管视觉副作用；文件夹关闭时 FOLDER CLOSE 刷新会按正确状态复位。
+    // 注意：仍调用 MKStateDidChange 保持去重表新鲜，避免关闭后某次状态切换
+    // 被误判为"未变"而漏显指示器（否则 sLastState 在文件夹期间会变陈旧）。
+    if (sFolderOpen) {
+        MKStateDidChange(bid, running, foreground);
+        return;
+    }
 
     // 状态去重：同一 bundleID 的 (running, foreground) 没变就跳过
     // 这能消除 _noteProcess + _setInternalProcessState 重复触发的问题
@@ -2237,6 +2295,19 @@ static BOOL MKIsSupportedOS(void) {
         CFNotificationCenterGetDarwinNotifyCenter(),
         NULL, MKPrefsChangedCallback,
         CFSTR("com.mk.runningdotindicator.reload"),
+        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+
+    // ─── 锁屏/解锁通知（v1.6.69）──────────
+    // 锁屏时隐藏所有指示器；解锁动画结束（~600ms）后再复位，避免解锁动画透出指示器圆点。
+    CFNotificationCenterAddObserver(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        NULL, MKLockStateCallback,
+        CFSTR("com.apple.springboard.lockcomplete"),
+        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    CFNotificationCenterAddObserver(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        NULL, MKLockStateCallback,
+        CFSTR("com.apple.springboard.lockstate"),
         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
     // ─── 生命周期通知（只保留 exit，iOS 16 上只有 exit 有效）──────────
