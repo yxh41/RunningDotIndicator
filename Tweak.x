@@ -1,5 +1,15 @@
 //
-//  Tweak.x — RunningDotIndicator v1.6.65
+//  Tweak.x — RunningDotIndicator v1.6.66
+//  v1.6.66: 修复文件夹场景三处回归（基于 rd_log(24) 真机日志定位）——
+//           · 重叠/文件夹内误建指示器：inFolder 检测从「祖先链爬 SBFolderView」
+//             改为「sFolderOpen 时按容器类型判定」(主屏 SBIconScrollView / Dock SBDock* 之外即文件夹)。
+//             旧逻辑在 iOS16 下因 SBFloatyFolderScrollView 祖先未必含 SBFolderView、
+//             且打开动画早期图标临时挂 UIView 而漏判，导致文件夹内 App 被错误建桌面指示器。
+//           · 文件夹内 App 名称消失：inFolder 分支不再 MKRemoveIndicatorForBid
+//             （同一 bid 在主屏与文件夹是两个图标实例、共享 sBidToIndicator 唯一对象，
+//              误删会丢失主屏指示器），改为只恢复名字。
+//           · 关闭文件夹名称闪现：FOLDER CLOSE 时下一 runloop 立即刷新主屏 SBIconScrollView，
+//             避免运行 App 名称在文件夹缩回后才被藏回而闪一下。
 //  v1.6.64: 结构性修复「指示器乱飞 / 滚出屏幕消失」——指示器从被回收的 SBIconView 子视图
 //           解耦到稳定的 overlay 层（挂在图标滚动容器上，按 bundleID 索引）。
 //           · 图标滚出屏幕/被回收 → 指示器不再随 view 消失或漂到别的 App（彻底解决乱飞）。
@@ -176,6 +186,17 @@ static UIView *MKOverlayForContainer(UIView *container) {
     }
     return ov;
 }
+// v1.6.66: 递归查找某类的首个后代视图（关闭文件夹时定位主屏滚动容器 SBIconScrollView）
+static UIView *MKFindDescendantView(UIView *root, NSString *clsName) {
+    if (!root || !clsName) return nil;
+    for (UIView *sub in root.subviews) {
+        if ([NSStringFromClass([sub class]) isEqualToString:clsName]) return sub;
+        UIView *found = MKFindDescendantView(sub, clsName);
+        if (found) return found;
+    }
+    return nil;
+}
+
 static UIView *MKFindIndicator(NSString *bid) {
     if (!bid || !sBidToIndicator) return nil;
     return [sBidToIndicator objectForKey:bid];
@@ -1253,29 +1274,32 @@ static void MKUpdate(SBIconView *self) {
         // （否则重新打开文件夹时名称与指示器重叠、且文件夹内 App 都有指示器，视觉错乱）。
         // 检测 self 的视图层级是否处在某个 SBFolderView 子树内；文件夹【容器】图标本身不在其内部，不受影响。
         {
-            // v1.6.61: 收窄文件夹检测 —— 旧逻辑用 containsString:@"Folder" 沿祖先链匹配，
-            // 会误命中主屏图标视图某层祖先类名（iOS16 主屏列表类含 "Folder" 字样），
-            // 导致【主屏上所有后台 App】都被误判成"在文件夹内"→提前 return、恢复名字、不建指示器
-            // （日志铁证：MKU-bg 打了、但无 RDUPD/Indicator CREATE，且多发生在文件夹开合时间窗内）。
-            // 修正：仅当"确有文件夹打开"(sFolderOpen) 且祖先是真正的文件夹容器 SBFolderView/SBFolderController 时才算 inFolder。
-            // 主屏图标永远不挂在 SBFolderView 之下，误判归零；文件夹内部图标仍正确跳过。
-            UIView *anc = (UIView *)self;
+            // v1.6.66: 重写文件夹内检测 —— 旧逻辑沿祖先链爬 SBFolderView/SBFolderController，
+            // 但 iOS16 文件夹内图标实际挂在 SBFloatyFolderScrollView（UIScrollView 子类）下，
+            // 其祖先链未必含那两个类名；且打开动画早期图标临时挂在 UIView 下、层级未组装，
+            // 都会漏判 → 文件夹内 App 被错误创建桌面指示器、名字被隐藏
+            // （日志铁证：IND-OVERLAY bid=taobao container=SBFloatyFolderScrollView）。
+            // 同一 bid 在主屏与文件夹里是两个独立图标实例、却共享 sBidToIndicator 里唯一一个指示器对象，
+            // 旧逻辑 MKRemoveIndicatorForBid 还会误删主屏那个，导致主屏后台 App 丢失指示。
+            // 修正：sFolderOpen 时按"当前容器类型"判定——主屏(SBIconScrollView)/Dock(SBDock*)
+            // 之外即视为文件夹内容器(SBFloatyFolderScrollView 等)，不再依赖祖先链爬类名。
             BOOL inFolder = NO;
-            NSString *matchedCls = nil;
             if (sFolderOpen) {
-                while (anc) {
-                    NSString *cls = NSStringFromClass([anc class]);
-                    if ([cls isEqualToString:@"SBFolderView"] ||
-                        [cls isEqualToString:@"SBFolderController"]) {
-                        inFolder = YES; matchedCls = cls; break;
-                    }
-                    anc = anc.superview;
-                }
+                UIView *container = MKContainerForIconView((UIView *)self);
+                NSString *cls = container ? NSStringFromClass([container class]) : @"";
+                // 主屏(SBIconScrollView) / Dock(SBDock*) 之外的容器即文件夹内容器(SBFloatyFolderScrollView 等)。
+                // 不依赖 isKindOfClass:UIScrollView —— Dock 的 SBDockIconListView 未必是 scrollView 子类，
+                // 误判会让 Dock 后台 App 被当成文件夹内而不显指示器（1.6.65 已修好的 Dock 回退）。
+                BOOL isHomeOrDock = [cls isEqualToString:@"SBIconScrollView"] || [cls hasPrefix:@"SBDock"];
+                if (container && !isHomeOrDock) inFolder = YES;
             }
             if (inFolder) {
-                if (sDebugLog) RDLog(@"RET-folder bid=%@ cls=%@", bundleID, matchedCls);
-                UIView *leftover = MKFindIndicator(bundleID);
-                if (leftover) MKRemoveIndicatorForBid(bundleID);
+                if (sDebugLog) RDLog(@"RET-folder bid=%@ container=%@", bundleID,
+                      NSStringFromClass([MKContainerForIconView((UIView *)self) class]));
+                // v1.6.66: 只恢复名字，**不**动 sBidToIndicator —— 主屏与文件夹内是同一 bid 的两个
+                // 图标实例、共享唯一指示器对象（主屏那个）。若这里 MKRemoveIndicatorForBid 会误删
+                // 主屏指示器，导致主屏后台 App 丢失指示。文件夹浮层覆盖主屏期间，主屏指示器
+                // 自然不可见，符合设计意图（文件夹内不显示桌面指示器）。
                 UIView *lbl = MKGetCachedLabel(self);
                 if (lbl) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; }
                 return;
@@ -1387,7 +1411,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.65: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.66: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -1880,6 +1904,16 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     } else if (!me.window) {
         sFolderOpen = NO;
         if (sDebugLog) RDLog(@"FOLDER CLOSE: SBFolderView removed from window");
+        // v1.6.66: 关闭文件夹立即刷新主屏 —— 主屏图标重新可见后系统默认恢复 label 可见，
+        // 若不立即重刷，运行 App 的名字会在文件夹缩回动画后才被我们藏回去，肉眼看到"闪一下"。
+        // 下一 runloop 刷一次即可（关闭是低频操作，开销可忽略）。
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSArray *wins = [UIApplication sharedApplication].windows;
+            for (UIWindow *w in wins) {
+                UIView *home = MKFindDescendantView(w, @"SBIconScrollView");
+                if (home) { MKRefreshSubviews(home); break; }
+            }
+        });
     }
 }
 
