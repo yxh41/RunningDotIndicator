@@ -169,6 +169,7 @@ static NSMapTable *sContainerToOverlay; // 滚动容器(UIScrollView) -> overlay
 // 声明提前到此处，确保 MKIsIconInFolder()(v1.6.67) 等辅助函数在其定义前即可引用，满足 -Werror 先声明后使用。
 static BOOL  sFolderOpen     = NO;
 static BOOL  sLocked        = NO;  // v1.6.69: 设备是否处于锁屏态（解锁动画期间保持 YES，避免指示器透出）
+static NSTimeInterval sLockAt = 0;   // v1.6.70: 最近一次锁屏时刻；用于 MKUpdate 时间闸门自动复位（不依赖解锁通知）
 static BOOL  sDebugLog      = NO;  // v1.6.26: 调试日志开关；声明提前到此处，确保 MKLockStateCallback()(v1.6.69) 等在其定义前即可引用。
 static char kMKIndicatorContainerKey;    // 指示器记录的所属容器（仅供调试/稳健性）
 
@@ -316,22 +317,18 @@ static void MKLockStateCallback(CFNotificationCenterRef center, void *observer, 
         } else if ([n isEqualToString:@"com.apple.springboard.lockstate"]) {
             lockNow = [obj isEqualToString:@"1"];
         }
-        sLocked = lockNow;
+        // v1.6.70: 只在"锁屏"时隐藏所有指示器并记录锁屏时刻。
+        // 解锁后的"复位显示"不再依赖 lockstate 解锁通知（某些 roothide/16.x 环境
+        // 该通知不送达或对象语义不符，导致解锁后指示器长时间空白、需滑动才出现）。
+        // 改为由 MKUpdate 的"时间闸门"自动复位：sLocked=YES 后超过 0.7s
+        // （解锁动画 ~0.5s 已结束）的下一次布局即正常显示，无需特定解锁通知。
         if (lockNow) {
+            sLocked = YES;
+            sLockAt = [NSDate date].timeIntervalSince1970;
             MKSetAllIndicatorsHidden(YES);
             if (sDebugLog) RDLog(@"LOCK: hid all indicators");
-        } else {
-            // 解锁：先保持隐藏，等解锁动画结束（~600ms）后再复位，
-            // 否则动画期间指示器会透出。600ms 内若又被锁，则跳过复位。
-            MKSetAllIndicatorsHidden(YES);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 600 * NSEC_PER_SEC),
-                           dispatch_get_main_queue(), ^{
-                if (sLocked) return;            // 600ms 内又被锁了，不揭示
-                sLocked = NO;
-                MKRefreshAllIcons();
-                if (sDebugLog) RDLog(@"UNLOCK: revealed indicators");
-            });
         }
+        // 解锁不再在此处理：交由 MKUpdate 时间闸门自动复位（见 sLocked 守卫）。
     } @catch (NSException *e) {
         RDLog(@"LOCK observer exception: %@", e.reason);
     }
@@ -1276,12 +1273,18 @@ static void MKUpdate(SBIconView *self) {
     MKSafe(^{
         if (!sInitDone) return;
 
-        // v1.6.69: 锁屏/解锁动画期间不显示指示器（避免解锁动画透出指示器圆点）。
-        // 解锁动画结束后再由 MKLockStateCallback 的 600ms 延时复位。
+        // v1.6.70: 锁屏/解锁处理改为"时间闸门"——锁屏时 sLocked=YES 并记录 sLockAt；
+        // 解锁动画(~0.5s)结束(>0.7s)后，下一次布局自动复位 sLocked=NO 并正常显示指示器。
+        // 不再依赖 lockstate 解锁通知（某些环境不送达/对象语义不符），根治"解锁后空白长/需滑动才出现"。
         if (sLocked) {
-            UIView *ind = MKFindIndicator(MKGetCachedBid(self));
-            if (ind) ind.hidden = YES;
-            return;
+            NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+            if (now - sLockAt > 0.7) {
+                sLocked = NO;  // 解锁动画已结束，正常显示
+            } else {
+                UIView *ind = MKFindIndicator(MKGetCachedBid(self));
+                if (ind) ind.hidden = YES;
+                return;
+            }
         }
 
         sCallCount++;
@@ -1332,13 +1335,10 @@ static void MKUpdate(SBIconView *self) {
         if (sDebugLog && running && !isForeground) {
             RDLog(@"MKU-bg bid=%@ scroll=%d hasInd=%d", bundleID, sScrolling, (int)!!existingIndicator);
         }
-        // v1.6.68: 文件夹打开期间，不隐藏任何 label、不创建/移除指示器（理由同 layoutSubviews）。
-        // 优先于 sScrolling 与 inFolder 检测：只要文件夹开着，统一"显示名称、直接返回"。
-        if (sFolderOpen) {
-            UIView *lbl = MKGetCachedLabel(self);
-            if (lbl) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; }
-            return;
-        }
+        // v1.6.70: 移除"文件夹打开期间一律显示名称并 return"的压制。
+        // 现在文件夹内运行中 App 也要显示指示器（与主屏一致）：名称隐藏、指示器
+        // 建在文件夹自己的 overlay 上（MKOverlayForContainer 按当前容器懒建）。
+        // 非运行中 App 自然落到下方 !running 分支恢复名称。
         if (sScrolling) {
             if (sDebugLog) {
                 static NSMutableSet *sGateScroll; static dispatch_once_t sOnceS;
@@ -1372,15 +1372,12 @@ static void MKUpdate(SBIconView *self) {
             // 修正：sFolderOpen 时按"当前容器类型"判定——主屏(SBIconScrollView)/Dock(SBDock*)
             // 之外即视为文件夹内容器(SBFloatyFolderScrollView 等)，不再依赖祖先链爬类名。
             if (MKIsIconInFolder((UIView *)self)) {
+                // v1.6.70: 不再"只显示名称并 return"——文件夹内运行中 App 现在也要显示指示器
+                // （与主屏一致：名称隐藏、指示器显示在文件夹 overlay）。非运行中 App 自然落到下方
+                // !running 分支恢复名称。同一 bid 的主屏/文件夹指示器由 MKOverlayForContainer
+                // 自动重父到当前容器，关闭文件夹时 FOLDER CLOSE 刷新会把它重父回主屏 overlay，无重复/无丢失。
                 if (sDebugLog) RDLog(@"RET-folder bid=%@ container=%@", bundleID,
                       NSStringFromClass([MKContainerForIconView((UIView *)self) class]));
-                // v1.6.66: 只恢复名字，**不**动 sBidToIndicator —— 主屏与文件夹内是同一 bid 的两个
-                // 图标实例、共享唯一指示器对象（主屏那个）。若这里 MKRemoveIndicatorForBid 会误删
-                // 主屏指示器，导致主屏后台 App 丢失指示。文件夹浮层覆盖主屏期间，主屏指示器
-                // 自然不可见，符合设计意图（文件夹内不显示桌面指示器）。
-                UIView *lbl = MKGetCachedLabel(self);
-                if (lbl) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; }
-                return;
             }
         }
         if (!bundleID || bundleID.length == 0) {
@@ -1489,7 +1486,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.69: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.70: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -1911,37 +1908,18 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     %orig;
     if (!sInitDone) return;
 
-    // v1.6.68: 文件夹打开期间，任何图标的 label 一律保持可见、不创建/重定位指示器。
-    // 否则文件夹打开动画的某一帧（图标临时挂在裸 UIView 下、层级未组装）会被误判成
-    // 主屏运行中 App，隐藏 label 又走"有指示器"分支，造成"文件夹内名称闪一下"。
-    // 文件夹浮层覆盖主屏，主屏图标即便 label 暂显也不可见；关闭时 FOLDER CLOSE 刷新会复位。
-    if (sFolderOpen) {
-        UIView *label = MKGetCachedLabel(self);
-        if (label && label.superview) {
-            label.hidden = NO;
-            label.alpha = 1.0f;
-            label.layer.opacity = 1.0f;
-            label.opaque = YES;
-        }
-        return;
-    }
+    // v1.6.70: 移除"文件夹打开期间一律显示名称并 return"的压制。
+    // 现在文件夹内运行中 App 也要显示指示器（与主屏一致），故交下方
+    // MKIsIconInFolder / 常规 running 分支处理（运行中→藏名+指示器；非运行→恢复名称）。
 
     NSString *bid = MKGetCachedBid(self);
     if (!bid) return;
 
-    // v1.6.67: 文件夹内图标必须始终显示 App 名称、不显示指示器。
-    // layoutSubviews 之前没有 inFolder 保护，会把文件夹内运行中 App 的 label 隐藏掉，
-    // 导致"文件夹内看不到 App 名称"（日志显示 inFolder 分支确实恢复了 label，但
-    // 系统随后调用 layoutSubviews 又把它藏了）。
+    // v1.6.70: 文件夹内图标不再强制"显示名称并 return"——运行中 App 走下方
+    // running 分支（隐藏名称、显示指示器在文件夹 overlay）；非运行中 App 落到
+    // !running 分支恢复名称。MKIsIconInFolder 仅留作诊断打点（仍被引用，避免 -Wunused）。
     if (MKIsIconInFolder((UIView *)self)) {
-        UIView *label = MKGetCachedLabel(self);
-        if (label && label.superview) {
-            label.hidden = NO;
-            label.alpha = 1.0f;
-            label.layer.opacity = 1.0f;
-            label.opaque = YES;
-        }
-        return;
+        if (sDebugLog) RDLog(@"INFOLDER layout bid=%@ fg=%d", MKGetCachedBid(self), MKIsForeground(MKGetCachedBid(self)));
     }
 
     BOOL running = MKIsAppRunning(bid);
@@ -1963,24 +1941,27 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         return;
     }
 
-    if (!indicator) {
-        // 无 overlay 指示器 → 仅当本图标是运行中后台 App 时才需要创建
-        if (!running || isForeground) return;
+        if (!indicator) {
+            // 无 overlay 指示器 → 仅当本图标是运行中后台 App 时才需要创建
+            if (!running || isForeground) return;
 
-        if (MKIsFadingLabel(bid)) return;
-        if (MKIsPending(bid)) {
-            UIView *label = MKGetCachedLabel(self);
-            if (label) {
-                label.hidden = YES;
-                label.alpha = 0.0f;
-                label.layer.opacity = 0.0f;
-                label.opaque = NO;
+            // v1.6.70: 后台运行中、指示器待建(pending)或正在渐隐(fading)期间，
+            // 立即把名称强制隐藏——否则回桌面转场动画会把 label 复显(系统图标入场
+            // 把 alpha 拉回 1)，与 300ms 后建出的指示器同显一瞬 = 名称与指示器重叠。
+            // 原先在 isFading 时直接 return 不藏名，正是重叠窗口的成因。
+            if (MKIsPending(bid) || MKIsFadingLabel(bid)) {
+                UIView *label = MKGetCachedLabel(self);
+                if (label && label.superview) {
+                    label.hidden = YES;
+                    label.alpha = 0.0f;
+                    label.layer.opacity = 0.0f;
+                    label.opaque = NO;
+                }
+                return;
             }
+            MKUpdate(self);  // 创建（写入 overlay）
             return;
         }
-        MKUpdate(self);  // 创建（写入 overlay）
-        return;
-    }
 
     // 有 overlay 指示器 → 校验是否还应存在
     if (!running || isForeground) {
