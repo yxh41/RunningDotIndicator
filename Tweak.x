@@ -1099,10 +1099,10 @@ static void MKUpdate(SBIconView *self) {
 
         // v1.5.3: 使用缓存的 bundleID（避免每次都调 applicationBundleID）
         NSString *bundleID = MKGetCachedBid(self);
-        // v1.6.58: 不再"纯滚动跳过"。滚动中不立即创建（避免 v1.6.56 的 fg 闪烁 churn），
-        // 但对"运行中+后台+尚无指示器"的 App 登记并安排可靠翻停重试，
-        // 根治 v1.6.57 回归：后台 App 首次出现在滚动/启动动画期被永久跳过、且翻停重试(MKRefreshAllIcons)不可靠覆盖。
-        // 重试走定向 MKRefreshIconForBundleID(bid)（350ms 晚于翻停 320ms，落点时 sScrolling 已复位），每 bid 只排一次。
+        // v1.6.59: 滚动中不再一律跳过创建（v1.6.57/58 因此导致后台 App 永久零指示器）。
+        // 改为：滚动中仅为「运行中+后台+尚无指示器」的 App 即时补建；其余（前台/文件夹/非运行）仍跳过以防 churn。
+        // 可靠兜底：MKOnStateChange 在 App 转后台时还会于 300ms/800ms 调 MKRefreshIconForBundleID→MKUpdate，
+        // 即使当时仍在滚动也会落点创建，不再依赖翻停重试。
         BOOL running = MKIsAppRunning(bundleID);
         BOOL isForeground = MKIsForeground(bundleID);
         UIView *existingIndicator = MKGetIndicator(self);
@@ -1113,21 +1113,17 @@ static void MKUpdate(SBIconView *self) {
                 NSString *k = bundleID ? bundleID : NSStringFromClass([self class]);
                 if (![sGateScroll containsObject:k]) { [sGateScroll addObject:k]; RDLog(@"RDGATE %@ ret=scroll", k); }
             }
-            // 运行中+后台+尚无指示器 → 登记待建 + 安排可靠重试（不立即创建，避免 churn）
+            // v1.6.59: 滚动中不再一律跳过。仅为「运行中+后台+尚无指示器」的 App 即时补建，
+            // 根治 v1.6.57/58 零指示器回归（滚动门控把创建永久挡在门外、翻停重试又不可靠覆盖）。
+            // 其余场景（前台/文件夹/非运行）滚动中仍跳过，避免 v1.6.56 的 fg 闪烁 churn：
+            //   · 指示器是图标子视图、随图标一起移动，滚动中创建不会"乱跑/跳错"；
+            //   · 前台 App 由下方 !running||isForeground 分支统一移除，不会在滚动中误建；
+            //   · 已有指示器的 App 落点走 return，不会被反复重建（这正是 v1.6.56 churn 的根因）。
             if (running && !isForeground && !existingIndicator) {
-                static NSMutableSet *sScrollRetry; static dispatch_once_t sOnceR;
-                dispatch_once(&sOnceR, ^{ sScrollRetry = [NSMutableSet new]; });
-                if (![sScrollRetry containsObject:bundleID]) {
-                    [sScrollRetry addObject:bundleID];
-                    NSString *bid = [bundleID copy];
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), ^{
-                        [sScrollRetry removeObject:bid];
-                        MKRefreshIconForBundleID(bid);
-                    });
-                }
+                // 缺指示器后台 App → 落点直接创建，不 return
+            } else {
+                return;  // 非「缺指示器后台 App」→ 滚动中跳过即时操作（防 churn）
             }
-            return;  // v1.6.58: 滚动中仍跳过即时创建，但后台运行 App 已登记待建、翻停后由定向重试补建
         }
         // v1.6.57: 跳过"已打开文件夹内部"的 App 图标 —— 文件夹内 App 不应显示桌面指示器
         // （否则重新打开文件夹时名称与指示器重叠、且文件夹内 App 都有指示器，视觉错乱）。
@@ -1299,7 +1295,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.58: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.59: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
