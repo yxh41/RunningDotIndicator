@@ -256,11 +256,13 @@ static void MKRemoveAllIndicators(void) {
     for (UIView *ind in all) { if (ind) [ind removeFromSuperview]; }
     [sBidToIndicator removeAllObjects];
 }
-// v1.6.69: 锁屏时一次性隐藏/恢复所有指示器（不销毁，解锁后刷新即可复位）。
+// v1.6.71: 改为隐藏/恢复所有 overlay（而非逐个 indicator）。
+// 锁屏时 overlay.hidden=YES 即隐藏其下全部指示器；解锁时 overlay.hidden=NO 立即全局恢复，
+// 不再依赖逐图标 MKUpdate 重新布局 → 根治"解锁后指示器长时间空白、需滑动才出现"。
 static void MKSetAllIndicatorsHidden(BOOL hidden) {
-    if (!sBidToIndicator) return;
-    NSArray *all = [[sBidToIndicator objectEnumerator].allObjects copy];
-    for (UIView *ind in all) { if (ind) ind.hidden = hidden; }
+    if (!sContainerToOverlay) return;
+    NSArray *all = [sContainerToOverlay.objectEnumerator.allObjects copy];
+    for (UIView *ov in all) { if (ov) ov.hidden = hidden; }
 }
 // v1.6.67: 计算某 bid 的指示器在 overlay 坐标系中的 frame（transform/滚动偏移安全）。
 // 使用传入的图标视图 iv，而不是去 sBidToIconView 注册表里取——注册表里存的是"最后一次
@@ -1280,6 +1282,7 @@ static void MKUpdate(SBIconView *self) {
             NSTimeInterval now = [NSDate date].timeIntervalSince1970;
             if (now - sLockAt > 0.7) {
                 sLocked = NO;  // 解锁动画已结束，正常显示
+                MKSetAllIndicatorsHidden(NO);  // v1.6.71: 全局恢复所有 overlay（指示器立即显现，无需逐图标重布局）
             } else {
                 UIView *ind = MKFindIndicator(MKGetCachedBid(self));
                 if (ind) ind.hidden = YES;
@@ -1486,7 +1489,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.70: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.71: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -1505,11 +1508,25 @@ static void MKUpdate(SBIconView *self) {
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:bundleID];
             }
+            [overlay bringSubviewToFront:indicator];  // v1.6.71: 确保指示器在文件夹 overlay 顶层（z-order）
             if (sDebugLog) RDLog(@"IND-OVERLAY bid=%@ container=%@ frame=%@ hidden=%d alpha=%.2f",
                   bundleID, NSStringFromClass([container class]),
                   NSStringFromCGRect(indicator.frame), indicator.hidden, (float)indicator.alpha);
         } else {
-            // v1.6.64: 已存在 → 仅重定位（不重设外观，避免打断渐显）；图标离屏时保留最后位置不重算
+            // v1.6.64: 已存在 → 校验是否还在正确的 overlay 上（容器变了需重父）。
+            // v1.6.71: 同一 bid 在主屏/文件夹是两处不同图标实例、各自 overlay；
+            // 文件夹打开/关闭切换时，若指示器仍挂在旧 overlay（如已移除的文件夹 overlay）上
+            // 会不可见。这里检测到 superview 不匹配就重父到当前 overlay。
+            if (indicator.superview != overlay) {
+                UIView *oldParent = indicator.superview;
+                [indicator removeFromSuperview];
+                [overlay addSubview:indicator];
+                [overlay bringSubviewToFront:indicator];
+                if (sDebugLog) RDLog(@"IND-REPARENT bid=%@ from=%@ to=%@",
+                      bundleID, NSStringFromClass([oldParent class]),
+                      NSStringFromClass([overlay class]));
+            }
+            // 图标离屏时保留最后位置不重算
             if (!CGRectIsEmpty(indicatorFrame)) {
                 indicator.frame = indicatorFrame;
                 indicator.hidden = NO;
