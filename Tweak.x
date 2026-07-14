@@ -1,5 +1,5 @@
 //
-//  Tweak.x — RunningDotIndicator v1.6.67
+//  Tweak.x — RunningDotIndicator v1.6.68
 //  v1.6.67: 修复滑动重叠 + 文件夹内 App 名称消失（基于 rd_log(25) 真机日志定位）——
 //           · 抽出 inFolder 检测为 MKIsIconInFolder()，layoutSubviews 也共享：
 //             旧逻辑只有 MKUpdate 识别文件夹，layoutSubviews 没有保护，会把文件夹内
@@ -11,6 +11,15 @@
 //           · layoutSubviews 滚动期间不再直接 return，而是同步隐藏 label（不重定位），
 //             解决滚动中系统恢复 label 导致的"指示器与名称重叠"。
 //           · FOLDER CLOSE 刷新改为同步+异步双保险，进一步消除关闭动画中名称闪现。
+//  v1.6.68: 修复「文件夹内 App 名称闪一下」（基于 rd_log(26) 真机日志定位）——
+//           · 根因：MKIsIconInFolder 同时要求 sFolderOpen 且容器被识别成文件夹容器，
+//             但文件夹打开动画的某一帧图标临时挂在裸 UIView 下、层级未组装，容器检测
+//             误判成主屏/Dock（SBIconListView*/SBDock* 回退）→ inFolder 返回 NO →
+//             走进"有指示器"分支隐藏 label，下一帧层级组装完才恢复 → 名称闪一下。
+//           · 修复：在 layoutSubviews 与 MKUpdate 最顶部加 sFolderOpen 守卫——
+//             只要文件夹开着，任何图标一律"显示 label、直接 return"，根本不碰 label/指示器。
+//             文件夹浮层覆盖主屏，主屏图标即便 label 暂显也不可见；关闭时 FOLDER CLOSE
+//             刷新会复位，从根上消除那一帧误判。
 //  v1.6.66: 修复文件夹场景三处回归（基于 rd_log(24) 真机日志定位）——
 //           · 重叠/文件夹内误建指示器：inFolder 检测从「祖先链爬 SBFolderView」
 //             改为「sFolderOpen 时按容器类型判定」(主屏 SBIconScrollView / Dock SBDock* 之外即文件夹)。
@@ -1276,6 +1285,13 @@ static void MKUpdate(SBIconView *self) {
         if (sDebugLog && running && !isForeground) {
             RDLog(@"MKU-bg bid=%@ scroll=%d hasInd=%d", bundleID, sScrolling, (int)!!existingIndicator);
         }
+        // v1.6.68: 文件夹打开期间，不隐藏任何 label、不创建/移除指示器（理由同 layoutSubviews）。
+        // 优先于 sScrolling 与 inFolder 检测：只要文件夹开着，统一"显示名称、直接返回"。
+        if (sFolderOpen) {
+            UIView *lbl = MKGetCachedLabel(self);
+            if (lbl) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; }
+            return;
+        }
         if (sScrolling) {
             if (sDebugLog) {
                 static NSMutableSet *sGateScroll; static dispatch_once_t sOnceS;
@@ -1426,7 +1442,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.67: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.68: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -1835,6 +1851,21 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
 - (void)layoutSubviews {
     %orig;
     if (!sInitDone) return;
+
+    // v1.6.68: 文件夹打开期间，任何图标的 label 一律保持可见、不创建/重定位指示器。
+    // 否则文件夹打开动画的某一帧（图标临时挂在裸 UIView 下、层级未组装）会被误判成
+    // 主屏运行中 App，隐藏 label 又走"有指示器"分支，造成"文件夹内名称闪一下"。
+    // 文件夹浮层覆盖主屏，主屏图标即便 label 暂显也不可见；关闭时 FOLDER CLOSE 刷新会复位。
+    if (sFolderOpen) {
+        UIView *label = MKGetCachedLabel(self);
+        if (label && label.superview) {
+            label.hidden = NO;
+            label.alpha = 1.0f;
+            label.layer.opacity = 1.0f;
+            label.opaque = YES;
+        }
+        return;
+    }
 
     NSString *bid = MKGetCachedBid(self);
     if (!bid) return;
