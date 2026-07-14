@@ -1,5 +1,16 @@
 //
-//  Tweak.x — RunningDotIndicator v1.6.66
+//  Tweak.x — RunningDotIndicator v1.6.67
+//  v1.6.67: 修复滑动重叠 + 文件夹内 App 名称消失（基于 rd_log(25) 真机日志定位）——
+//           · 抽出 inFolder 检测为 MKIsIconInFolder()，layoutSubviews 也共享：
+//             旧逻辑只有 MKUpdate 识别文件夹，layoutSubviews 没有保护，会把文件夹内
+//             运行中 App 的 label 隐藏，造成"文件夹内看不到 App 名称"。
+//           · MKIndicatorFrameInOverlay 改用传入的图标视图 iv，不再读取 sBidToIconView：
+//             多页桌面中同一 bid 在不同页面有独立图标，注册表里存的是"最后一次
+//             MKUpdate 的图标"，layoutSubviews 重定位时若拿错实例，会把指示器
+//             漂到非当前页，与当前页名字形成"重叠/错位"。
+//           · layoutSubviews 滚动期间不再直接 return，而是同步隐藏 label（不重定位），
+//             解决滚动中系统恢复 label 导致的"指示器与名称重叠"。
+//           · FOLDER CLOSE 刷新改为同步+异步双保险，进一步消除关闭动画中名称闪现。
 //  v1.6.66: 修复文件夹场景三处回归（基于 rd_log(24) 真机日志定位）——
 //           · 重叠/文件夹内误建指示器：inFolder 检测从「祖先链爬 SBFolderView」
 //             改为「sFolderOpen 时按容器类型判定」(主屏 SBIconScrollView / Dock SBDock* 之外即文件夹)。
@@ -170,6 +181,18 @@ static UIView *MKContainerForIconView(UIView *iv) {
     }
     return fallback;
 }
+// v1.6.67: 抽出文件夹内检测，供 layoutSubviews 与 MKUpdate 共享，避免 layoutSubviews
+// 把文件夹内 App 的 label 隐藏掉（这是"文件夹内看不到 App 名称"的根因）。
+static BOOL MKIsIconInFolder(UIView *iv) {
+    if (!sFolderOpen) return NO;
+    UIView *container = MKContainerForIconView(iv);
+    NSString *cls = container ? NSStringFromClass([container class]) : @"";
+    // 主屏(SBIconScrollView) / Dock(SBDock*) 之外的容器即文件夹内容器(SBFloatyFolderScrollView 等)。
+    // 不依赖 isKindOfClass:UIScrollView —— Dock 的 SBDockIconListView 未必是 scrollView 子类，
+    // 误判会让 Dock 后台 App 被当成文件夹内而不显指示器（1.6.65 已修好的 Dock 回退）。
+    BOOL isHomeOrDock = [cls isEqualToString:@"SBIconScrollView"] || [cls hasPrefix:@"SBDock"];
+    return (container && !isHomeOrDock);
+}
 static UIView *MKOverlayForContainer(UIView *container) {
     if (!container) return nil;
     if (!sContainerToOverlay) sContainerToOverlay = [NSMapTable weakToStrongObjectsMapTable];
@@ -216,13 +239,13 @@ static void MKRemoveAllIndicators(void) {
     for (UIView *ind in all) { if (ind) [ind removeFromSuperview]; }
     [sBidToIndicator removeAllObjects];
 }
-// v1.6.64: 计算某 bid 的指示器在 overlay 坐标系中的 frame（transform/滚动偏移安全）。
+// v1.6.67: 计算某 bid 的指示器在 overlay 坐标系中的 frame（transform/滚动偏移安全）。
+// 使用传入的图标视图 iv，而不是去 sBidToIconView 注册表里取——注册表里存的是"最后一次
+// 调用 MKUpdate 的图标实例"，在多页桌面中如果当前 layout 的是另一页的图标，会拿错位置
+// 导致指示器飘到别的页面（"左右滑动后重叠/错位"的根因之一）。
 // 无 live 视图（图标离屏/被回收）→ 返回 CGRectZero，调用方保留其最后位置不重算。
-static CGRect MKIndicatorFrameInOverlay(NSString *bid, UIView *overlay, MKConfig *cfg) {
-    if (!overlay || !bid || !cfg) return CGRectZero;
-    SBIconView *iv = nil;
-    if (sBidToIconView) iv = [sBidToIconView objectForKey:bid];
-    if (!iv) return CGRectZero;
+static CGRect MKIndicatorFrameInOverlay(SBIconView *iv, UIView *overlay, MKConfig *cfg) {
+    if (!iv || !overlay || !cfg) return CGRectZero;
     CGFloat indW = (cfg.shape == MKShapeDot) ? cfg.dotSize : cfg.barWidth;
     CGFloat indH = (cfg.shape == MKShapeDot) ? cfg.dotSize : cfg.barHeight;
     UIView *label = MKGetCachedLabel(iv);
@@ -235,14 +258,14 @@ static CGRect MKIndicatorFrameInOverlay(NSString *bid, UIView *overlay, MKConfig
     }
     return CGRectMake(CGRectGetMidX(r) - indW/2.0f, CGRectGetMidY(r) - indH/2.0f, indW, indH);
 }
-static void MKRepositionIndicator(NSString *bid, UIView *iv, MKConfig *cfg) {
-    if (!bid || !cfg) return;
+static void MKRepositionIndicator(NSString *bid, SBIconView *iv, MKConfig *cfg) {
+    if (!bid || !iv || !cfg) return;
     UIView *ind = MKFindIndicator(bid);
     if (!ind) return;
-    UIView *container = MKContainerForIconView(iv);
+    UIView *container = MKContainerForIconView((UIView *)iv);
     UIView *overlay = MKOverlayForContainer(container);
     if (!overlay) return;
-    CGRect f = MKIndicatorFrameInOverlay(bid, overlay, cfg);
+    CGRect f = MKIndicatorFrameInOverlay(iv, overlay, cfg);
     if (!CGRectIsEmpty(f)) { ind.frame = f; ind.hidden = NO; }
 }
 
@@ -1283,17 +1306,7 @@ static void MKUpdate(SBIconView *self) {
             // 旧逻辑 MKRemoveIndicatorForBid 还会误删主屏那个，导致主屏后台 App 丢失指示。
             // 修正：sFolderOpen 时按"当前容器类型"判定——主屏(SBIconScrollView)/Dock(SBDock*)
             // 之外即视为文件夹内容器(SBFloatyFolderScrollView 等)，不再依赖祖先链爬类名。
-            BOOL inFolder = NO;
-            if (sFolderOpen) {
-                UIView *container = MKContainerForIconView((UIView *)self);
-                NSString *cls = container ? NSStringFromClass([container class]) : @"";
-                // 主屏(SBIconScrollView) / Dock(SBDock*) 之外的容器即文件夹内容器(SBFloatyFolderScrollView 等)。
-                // 不依赖 isKindOfClass:UIScrollView —— Dock 的 SBDockIconListView 未必是 scrollView 子类，
-                // 误判会让 Dock 后台 App 被当成文件夹内而不显指示器（1.6.65 已修好的 Dock 回退）。
-                BOOL isHomeOrDock = [cls isEqualToString:@"SBIconScrollView"] || [cls hasPrefix:@"SBDock"];
-                if (container && !isHomeOrDock) inFolder = YES;
-            }
-            if (inFolder) {
+            if (MKIsIconInFolder((UIView *)self)) {
                 if (sDebugLog) RDLog(@"RET-folder bid=%@ container=%@", bundleID,
                       NSStringFromClass([MKContainerForIconView((UIView *)self) class]));
                 // v1.6.66: 只恢复名字，**不**动 sBidToIndicator —— 主屏与文件夹内是同一 bid 的两个
@@ -1386,7 +1399,7 @@ static void MKUpdate(SBIconView *self) {
         UIView *container = MKContainerForIconView((UIView *)self);
         UIView *overlay = MKOverlayForContainer(container);
         if (!overlay) return;  // v1.6.65: 无可用容器（如 Dock 层级异常）时不创建，避免 addSubview:nil 崩溃
-        CGRect indicatorFrame = MKIndicatorFrameInOverlay(bundleID, overlay, cfg);
+        CGRect indicatorFrame = MKIndicatorFrameInOverlay(self, overlay, cfg);
 
         // v1.6.64: 统一用「按 bid 索引的 overlay 指示器」作为唯一真相来源（替代旧的 self 子视图关联）。
         indicator = MKFindIndicator(bundleID);
@@ -1411,7 +1424,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.66: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.67: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -1821,15 +1834,46 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     %orig;
     if (!sInitDone) return;
 
-    if (sScrolling) return;  // v1.6.52: 滚动中不重定位/创建，避免 churn
-
-    // v1.6.64: 指示器按 bid 索引、挂在稳定 overlay 层，不再作为 SBIconView 子视图。
     NSString *bid = MKGetCachedBid(self);
-    UIView *indicator = bid ? MKFindIndicator(bid) : nil;
+    if (!bid) return;
+
+    // v1.6.67: 文件夹内图标必须始终显示 App 名称、不显示指示器。
+    // layoutSubviews 之前没有 inFolder 保护，会把文件夹内运行中 App 的 label 隐藏掉，
+    // 导致"文件夹内看不到 App 名称"（日志显示 inFolder 分支确实恢复了 label，但
+    // 系统随后调用 layoutSubviews 又把它藏了）。
+    if (MKIsIconInFolder((UIView *)self)) {
+        UIView *label = MKGetCachedLabel(self);
+        if (label && label.superview) {
+            label.hidden = NO;
+            label.alpha = 1.0f;
+            label.layer.opacity = 1.0f;
+            label.opaque = YES;
+        }
+        return;
+    }
+
+    BOOL running = MKIsAppRunning(bid);
+    BOOL isForeground = MKIsForeground(bid);
+    UIView *indicator = MKFindIndicator(bid);
+
+    // v1.6.67: 滚动期间不重定位/创建指示器（避免 churn），但必须保持 label 状态同步。
+    // 若 App 后台运行且已有指示器，系统可能在滚动中恢复 label，导致"指示器与名称重叠"。
+    if (sScrolling) {
+        if (running && !isForeground && indicator) {
+            UIView *label = MKGetCachedLabel(self);
+            if (label && label.superview) {
+                label.hidden = YES;
+                label.alpha = 0.0f;
+                label.layer.opacity = 0.0f;
+                label.opaque = NO;
+            }
+        }
+        return;
+    }
 
     if (!indicator) {
         // 无 overlay 指示器 → 仅当本图标是运行中后台 App 时才需要创建
-        if (!bid || !MKIsAppRunning(bid) || MKIsForeground(bid)) return;
+        if (!running || isForeground) return;
 
         if (MKIsFadingLabel(bid)) return;
         if (MKIsPending(bid)) {
@@ -1847,7 +1891,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     }
 
     // 有 overlay 指示器 → 校验是否还应存在
-    if (!bid || !MKIsAppRunning(bid) || MKIsForeground(bid)) {
+    if (!running || isForeground) {
         MKUpdate(self);  // 移除（App 退出/前台/文件夹）
         return;
     }
@@ -1863,7 +1907,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         label.layer.opacity = 0.0f;
         label.opaque = NO;
     }
-    MKRepositionIndicator(bid, (UIView *)self, cfg);
+    MKRepositionIndicator(bid, self, cfg);
 }
 
 %end
@@ -1904,12 +1948,17 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     } else if (!me.window) {
         sFolderOpen = NO;
         if (sDebugLog) RDLog(@"FOLDER CLOSE: SBFolderView removed from window");
-        // v1.6.66: 关闭文件夹立即刷新主屏 —— 主屏图标重新可见后系统默认恢复 label 可见，
+        // v1.6.67: 关闭文件夹立即同步刷新主屏 —— 主屏图标重新可见后系统默认恢复 label 可见，
         // 若不立即重刷，运行 App 的名字会在文件夹缩回动画后才被我们藏回去，肉眼看到"闪一下"。
-        // 下一 runloop 刷一次即可（关闭是低频操作，开销可忽略）。
+        // 先同步立即刷一次（动画期间就藏好），再异步补一次确保 layout 稳定后状态仍正确。
+        NSArray *wins = [UIApplication sharedApplication].windows;
+        for (UIWindow *w in wins) {
+            UIView *home = MKFindDescendantView(w, @"SBIconScrollView");
+            if (home) { MKRefreshSubviews(home); break; }
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
-            NSArray *wins = [UIApplication sharedApplication].windows;
-            for (UIWindow *w in wins) {
+            NSArray *wins2 = [UIApplication sharedApplication].windows;
+            for (UIWindow *w in wins2) {
                 UIView *home = MKFindDescendantView(w, @"SBIconScrollView");
                 if (home) { MKRefreshSubviews(home); break; }
             }
