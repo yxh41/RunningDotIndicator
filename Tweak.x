@@ -155,6 +155,10 @@ static NSMapTable *sBidToIconView;
 // 图标离屏时随容器自然移出视野（不销毁），滚回自动对齐。坐标用 convertRect:toView:overlay（transform/滚动偏移安全）。
 static NSMapTable *sBidToIndicator;     // bid(NSString) -> 指示器(UIView) 强引用，跨回收存活
 static NSMapTable *sContainerToOverlay; // 滚动容器(UIScrollView) -> overlay(UIView) 弱->强
+// v1.6.61: 文件夹是否处于打开态（由 SBFolderView -didMoveToWindow 维护）。
+// 仅当为 YES 时才允许把图标判定为"在文件夹内"，消除主屏图标被误判。
+// 声明提前到此处，确保 MKIsIconInFolder()(v1.6.67) 等辅助函数在其定义前即可引用，满足 -Werror 先声明后使用。
+static BOOL  sFolderOpen     = NO;
 static char kMKIndicatorContainerKey;    // 指示器记录的所属容器（仅供调试/稳健性）
 
 // v1.6.64: 以下 helpers 管理「按 bid 索引、挂在稳定 overlay 层」的指示器。
@@ -183,6 +187,7 @@ static UIView *MKContainerForIconView(UIView *iv) {
 }
 // v1.6.67: 抽出文件夹内检测，供 layoutSubviews 与 MKUpdate 共享，避免 layoutSubviews
 // 把文件夹内 App 的 label 隐藏掉（这是"文件夹内看不到 App 名称"的根因）。
+// 前向声明：sFolderOpen 已在文件顶部全局区声明（static BOOL sFolderOpen = NO），此处直接使用。
 static BOOL MKIsIconInFolder(UIView *iv) {
     if (!sFolderOpen) return NO;
     UIView *container = MKContainerForIconView(iv);
@@ -400,9 +405,6 @@ static BOOL  sInitDone     = NO;
 
 // v1.6.52: 滚动/翻页守卫 —— 滚动中不重定位/创建指示器，避免翻页 churn 与粘错
 static BOOL  sScrolling     = NO;
-// v1.6.61: 文件夹是否处于打开态（由 SBFolderView -didMoveToWindow 维护）。
-// 仅当为 YES 时才允许把图标判定为"在文件夹内"，消除主屏图标被误判。
-static BOOL  sFolderOpen     = NO;
 static NSTimeInterval sLastScrollTS = 0;
 static BOOL  sScrollSettleScheduled = NO;
 static void MKMarkScrolling(UIView *scrollView) {
