@@ -955,6 +955,11 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
         NSInteger mkLevels = 0;
         while (levelView && mkLevels < 8) {
             if (levelView.subviews.count > 0 && levelView.subviews.count <= 256) {
+                // v1.6.54: 几何命中优先 —— 标签必须与"本图标"水平居中且位于图标正下方，
+                // 避免密集排列（文件夹/多页）时误命中邻居标签，导致"名称亮着 + 圆点画在别处"的重叠。
+                CGRect iconFrameInLevel = [iconView convertRect:iconView.bounds toView:levelView];
+                CGFloat iconCX = iconFrameInLevel.origin.x + iconFrameInLevel.size.width / 2.0f;
+                CGFloat iconBY = iconFrameInLevel.origin.y + iconFrameInLevel.size.height;
                 UIView *bestMatch = nil;
                 NSInteger bestScore = 0;
                 for (UIView *sv in levelView.subviews) {
@@ -968,12 +973,19 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
                     else if ([sv isKindOfClass:[UILabel class]])          score = 60;
                     else if ([cls containsString:@"LabelView"])           score = 50;
                     else if ([cls containsString:@"Label"])              score = 40;
+                    if (score < 50) continue;
+                    // 几何校验：水平居中接近 + 位于图标下方
+                    CGFloat labelCX = sv.frame.origin.x + sv.frame.size.width / 2.0f;
+                    CGFloat labelTY = sv.frame.origin.y;
+                    BOOL aligned = fabs(labelCX - iconCX) < (iconFrameInLevel.size.width * 0.6f);
+                    BOOL below   = labelTY > (iconBY - 6.0f);
+                    if (!aligned || !below) continue;
                     if (score > bestScore) {
                         bestScore = score;
                         bestMatch = sv;
                     }
                 }
-                if (bestMatch && bestScore >= 50) {
+                if (bestMatch) {
                     return bestMatch;
                 }
             }
@@ -1008,9 +1020,19 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
             [stack addObjectsFromArray:v.subviews];
         }
 
-        // 诊断：标签未找到 -> dump iconView + 父视图层级
+        // 诊断：标签未找到 -> dump（跳过 Dock / 多任务切换器里的图标，避免浪费预算）
+        BOOL skipDump = NO;
+        UIView *dd = iconView.superview;
+        while (dd) {
+            NSString *dc = NSStringFromClass([dd class]);
+            if ([dc containsString:@"Dock"] || [dc containsString:@"Switcher"] ||
+                [dc containsString:@"Snapshot"] || [dc containsString:@"Recycled"]) {
+                skipDump = YES; break;
+            }
+            dd = dd.superview;
+        }
         static int sNoLabelLogs = 0;
-        if (sNoLabelLogs < 10) {
+        if (!skipDump && sNoLabelLogs < 20) {
             sNoLabelLogs++;
             NSMutableString *dump = [NSMutableString stringWithFormat:@"NO LABEL - %@ direct:[", NSStringFromClass([iconView class])];
             for (UIView *sv in iconView.subviews) {
@@ -1159,33 +1181,33 @@ static void MKUpdate(SBIconView *self) {
                 indicatorH
             );
         } else {
-            // v1.5.9: 无标签 → 估算标签位置（图标下方居中）
-            // 对于 Dock 图标：确实没有标签，估算位置跟之前差不多
-            // 对于系统 App（AppStore/Preferences）：标签不在视图层级中，但指示器应出现在名字区域
-            UIView *host = self.superview;
-            if (host) {
-                hostView = host;
-                host.clipsToBounds = NO;  // v1.6.53: fallback 指示器画在 wrapper bounds 外，避免被裁剪
-                CGRect iconFrame = self.frame;
-                CGFloat estimatedLabelY = iconFrame.origin.y + iconFrame.size.height + 4.0f;
-                CGFloat estimatedLabelH = 14.0f;
-                indicatorFrame = CGRectMake(
-                    iconFrame.origin.x + (iconFrame.size.width - indicatorW) / 2.0f,
-                    estimatedLabelY + (estimatedLabelH - indicatorH) / 2.0f,
-                    indicatorW,
-                    indicatorH
-                );
-            } else {
-                hostView = self;
-                CGSize mySize = self.bounds.size;
-                if (mySize.width < 10 || mySize.height < 10) return;
-                indicatorFrame = CGRectMake(
-                    (mySize.width - indicatorW) / 2.0f,
-                    mySize.height - indicatorH - 4.0f,
-                    indicatorW,
-                    indicatorH
-                );
+            // v1.6.54: 稳健 fallback —— 把图标折算到"标签所在层"(SBIconListView 类)，
+            // 落在图标正下方的名称区域；并关闭该层裁剪，避免被裁掉。
+            // 旧版挂 self.superview(wrapper) + 估算坐标：wrapper 尺寸=图标尺寸、祖先仍可能裁 → 圆点看不到。
+            UIView *listView = nil;
+            UIView *p = self.superview;
+            while (p) {
+                NSString *pc = NSStringFromClass([p class]);
+                if ([pc containsString:@"IconListView"] ||
+                    [pc containsString:@"IconListPageContent"] ||
+                    [pc containsString:@"ListContentView"] ||
+                    [pc containsString:@"HomeScreen"]) {
+                    listView = p; break;
+                }
+                p = p.superview;
             }
+            UIView *host = listView ?: self.superview;
+            if (!host) host = self;
+            host.clipsToBounds = NO;
+            CGRect iconRect = [self convertRect:self.bounds toView:host];
+            CGFloat labelY = iconRect.origin.y + iconRect.size.height + 4.0f;
+            indicatorFrame = CGRectMake(
+                iconRect.origin.x + (iconRect.size.width - indicatorW) / 2.0f,
+                labelY + (14.0f - indicatorH) / 2.0f,
+                indicatorW,
+                indicatorH
+            );
+            hostView = host;
         }
 
         // 宿主视图变了 → 需要重新添加指示器
@@ -1964,7 +1986,7 @@ static BOOL MKIsSupportedOS(void) {
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
     NSLog(@"[RunningDotIndicator] v1.6.30 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible");
-    RDLog(@"======== v1.6.53 loading (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap) ========");
+    RDLog(@"======== v1.6.54 loading (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
