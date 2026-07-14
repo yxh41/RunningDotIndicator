@@ -113,6 +113,7 @@ static char kMKIndicatorKey;
 static char kMKLabelKey;     // 缓存的名字标签视图
 static char kMKBidKey;       // 缓存的 bundleID
 static char kMKIconKey;      // 缓存的 icon 指针（检测视图回收复用）
+static char kMKIndicatorBidKey; // v1.6.63: 指示器归属的 bid（防回收复用导致"乱跑"）
 // v1.6.60: bid → SBIconView 弱引用注册表（替代不可靠的窗口遍历刷新）
 // iOS 16 SpringBoard 在文件夹/滚动/转场等活跃态下，主屏图标视图常不在
 // [UIApplication sharedApplication].windows 的常规遍历可达路径，导致 MKRefreshIconForBundleID
@@ -126,6 +127,27 @@ static UIView *MKGetIndicator(SBIconView *iv) {
 }
 static void MKSetIndicator(SBIconView *iv, UIView *dot) {
     objc_setAssociatedObject(iv, &kMKIndicatorKey, dot, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// v1.6.63: 计算指示器在 self(SBIconView) 坐标系中的 frame。
+// 改用窗口(nil)坐标系换算，彻底摆脱对 label.superview / self.superview
+// 是否同层的假设（旧版 convertRect:fromView: 在部分 iOS16 布局下坐标错位→位置错误）。
+// 无论 label 真实父视图在哪一层、self 是否带 transform，结果都正确。
+static CGRect MKIndicatorFrameInSelf(UIView *self, UIView *label, CGFloat indW, CGFloat indH) {
+    CGRect labelWin;
+    if (label && label.superview) {
+        labelWin = [label.superview convertRect:label.frame toView:nil];
+    } else {
+        // 无标签（Dock 等）→ 图标正下方居中
+        CGRect selfWin = [self convertRect:self.bounds toView:nil];
+        labelWin = CGRectMake(CGRectGetMidX(selfWin) - 20.0f,
+                              CGRectGetMaxY(selfWin) + 4.0f,
+                              40.0f, 14.0f);
+    }
+    CGRect selfWin = [self convertRect:self.bounds toView:nil];
+    CGFloat cx = CGRectGetMidX(labelWin) - CGRectGetMinX(selfWin);
+    CGFloat cy = CGRectGetMidY(labelWin) - CGRectGetMinY(selfWin);
+    return CGRectMake(cx - indW / 2.0f, cy - indH / 2.0f, indW, indH);
 }
 
 // 前向声明（MKFindLabelView 定义在后面，但 MKGetCachedLabel 需要调用它）
@@ -1272,27 +1294,21 @@ static void MKUpdate(SBIconView *self) {
         CGRect indicatorFrame;
         self.clipsToBounds = NO;  // 允许指示器在图标下方超出 SBIconView bounds 显示
 
-        if (label && label.superview) {
-            // 标签在 label.superview 坐标系中；将其转换到 SBIconView 自身坐标系，
-            // 这样无论标签真实父视图是 SBIconListView/SBFTouchPassThroughView/Wrapper，
-            // 指示器在 self 中的相对位置都正确。
-            CGRect labelFrameInSelf = [self convertRect:label.frame fromView:label.superview];
-            indicatorFrame = CGRectMake(
-                labelFrameInSelf.origin.x + (labelFrameInSelf.size.width - indicatorW) / 2.0f,
-                labelFrameInSelf.origin.y + (labelFrameInSelf.size.height - indicatorH) / 2.0f,
-                indicatorW,
-                indicatorH
-            );
-        } else {
-            // 无标签（如 Dock 图标）→ 放在图标正下方，self 坐标系
-            CGRect iconBounds = self.bounds;
-            CGFloat labelY = iconBounds.origin.y + iconBounds.size.height + 4.0f;
-            indicatorFrame = CGRectMake(
-                iconBounds.origin.x + (iconBounds.size.width - indicatorW) / 2.0f,
-                labelY + (14.0f - indicatorH) / 2.0f,
-                indicatorW,
-                indicatorH
-            );
+        // v1.6.63: 窗口坐标系换算（见 MKIndicatorFrameInSelf），不依赖层级假设，位置恒正确
+        indicatorFrame = MKIndicatorFrameInSelf((UIView *)self, label, indicatorW, indicatorH);
+
+        // v1.6.63: 防「乱跑」终极保险 —— 校验指示器归属的 bid 与当前图标 bid 是否一致。
+        // SBIconView 会被 SpringBoard 回收复用：同一 view 先后承载不同 App。
+        // 即使 MKGetCachedBid 的回收检测因布局批处理偶发漏判，这里也强制把
+        // 「挂错 App」的指示器摘掉，杜绝指示器跳到其他 App 图标上的视觉问题。
+        NSString *indBid = objc_getAssociatedObject(indicator, &kMKIndicatorBidKey);
+        if (existingIndicator && indBid && bundleID && ![indBid isEqualToString:bundleID]) {
+            [existingIndicator removeFromSuperview];
+            MKSetIndicator(self, nil);
+            // 同时置空 indicator 副本，确保下方 if(!indicator) 重建分支能重新创建正确归属的指示器
+            existingIndicator = nil;
+            indicator = nil;
+            if (sDebugLog) RDLog(@"IND-RECLAIM bid=%@ stale=%@", bundleID, indBid);
         }
 
         // 宿主视图变了 → 需要重新添加指示器
@@ -1305,6 +1321,7 @@ static void MKUpdate(SBIconView *self) {
         if (!indicator) {
             indicator = [[MKIndicatorDotView alloc] initWithFrame:indicatorFrame];
             indicator.tag = kDotTag;
+            objc_setAssociatedObject(indicator, &kMKIndicatorBidKey, bundleID, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v1.6.63: 记录归属，供防乱跑校验
             [(MKIndicatorDotView *)indicator applyConfig];
 
             // v1.6.11: AutoIcon 模式 — 从图标取主色调作为指示器颜色
@@ -1321,7 +1338,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.62: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.63: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -1774,16 +1791,11 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     if (MKIsFadingLabel(bid)) {
         UIView *label = MKGetCachedLabel(self);
         if (indicator && label && label.superview) {
-            // v1.6.62: 用 convertRect 转换到 self 坐标系，确保指示器锚定跟随 SBIconView
-            CGRect lf = [self convertRect:label.frame fromView:label.superview];
-            CGFloat indW, indH;
+            // v1.6.63: 窗口坐标系换算（同 MKUpdate 创建逻辑），翻页/转场中位置正确
             MKConfig *cfg = [MKConfig sharedConfig];
-            if (cfg.shape == MKShapeDot) { indW = cfg.dotSize; indH = cfg.dotSize; }
-            else { indW = cfg.barWidth; indH = cfg.barHeight; }
-            indicator.frame = CGRectMake(
-                lf.origin.x + (lf.size.width - indW) / 2.0f,
-                lf.origin.y + (lf.size.height - indH) / 2.0f,
-                indW, indH);
+            CGFloat indW = (cfg.shape == MKShapeDot) ? cfg.dotSize : cfg.barWidth;
+            CGFloat indH = (cfg.shape == MKShapeDot) ? cfg.dotSize : cfg.barHeight;
+            indicator.frame = MKIndicatorFrameInSelf((UIView *)self, label, indW, indH);
         }
         return;
     }
@@ -1808,14 +1820,8 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         label.alpha = 0.0f;
         label.layer.opacity = 0.0f;
         label.opaque = NO;
-        // v1.6.62: 标签在 label.superview 坐标系；转换到 SBIconView 自身坐标系，
-        // 保证指示器作为 self 的子视图时位置正确。
-        CGRect lf = [self convertRect:label.frame fromView:label.superview];
-        indicator.frame = CGRectMake(
-            lf.origin.x + (lf.size.width - indW) / 2.0f,
-            lf.origin.y + (lf.size.height - indH) / 2.0f,
-            indW, indH
-        );
+        // v1.6.63: 窗口坐标系换算（同创建逻辑），保证位置恒正确
+        indicator.frame = MKIndicatorFrameInSelf((UIView *)self, label, indW, indH);
     } else {
         // v1.5.9: 无标签 → 估算标签位置（图标下方居中），self 坐标系
         // 对于非 Dock 的系统 App（AppStore/Preferences 等），标签可能不在视图层级中
