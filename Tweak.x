@@ -256,6 +256,9 @@ static BOOL  sInitDone     = NO;
 
 // v1.6.52: 滚动/翻页守卫 —— 滚动中不重定位/创建指示器，避免翻页 churn 与粘错
 static BOOL  sScrolling     = NO;
+// v1.6.61: 文件夹是否处于打开态（由 SBFolderView -didMoveToWindow 维护）。
+// 仅当为 YES 时才允许把图标判定为"在文件夹内"，消除主屏图标被误判。
+static BOOL  sFolderOpen     = NO;
 static NSTimeInterval sLastScrollTS = 0;
 static BOOL  sScrollSettleScheduled = NO;
 static void MKMarkScrolling(UIView *scrollView) {
@@ -1152,14 +1155,27 @@ static void MKUpdate(SBIconView *self) {
         // （否则重新打开文件夹时名称与指示器重叠、且文件夹内 App 都有指示器，视觉错乱）。
         // 检测 self 的视图层级是否处在某个 SBFolderView 子树内；文件夹【容器】图标本身不在其内部，不受影响。
         {
+            // v1.6.61: 收窄文件夹检测 —— 旧逻辑用 containsString:@"Folder" 沿祖先链匹配，
+            // 会误命中主屏图标视图某层祖先类名（iOS16 主屏列表类含 "Folder" 字样），
+            // 导致【主屏上所有后台 App】都被误判成"在文件夹内"→提前 return、恢复名字、不建指示器
+            // （日志铁证：MKU-bg 打了、但无 RDUPD/Indicator CREATE，且多发生在文件夹开合时间窗内）。
+            // 修正：仅当"确有文件夹打开"(sFolderOpen) 且祖先是真正的文件夹容器 SBFolderView/SBFolderController 时才算 inFolder。
+            // 主屏图标永远不挂在 SBFolderView 之下，误判归零；文件夹内部图标仍正确跳过。
             UIView *anc = (UIView *)self;
             BOOL inFolder = NO;
-            while (anc) {
-                NSString *cls = NSStringFromClass([anc class]);
-                if ([cls containsString:@"FolderView"] || [cls containsString:@"Folder"]) { inFolder = YES; break; }
-                anc = anc.superview;
+            NSString *matchedCls = nil;
+            if (sFolderOpen) {
+                while (anc) {
+                    NSString *cls = NSStringFromClass([anc class]);
+                    if ([cls isEqualToString:@"SBFolderView"] ||
+                        [cls isEqualToString:@"SBFolderController"]) {
+                        inFolder = YES; matchedCls = cls; break;
+                    }
+                    anc = anc.superview;
+                }
             }
             if (inFolder) {
+                if (sDebugLog) RDLog(@"RET-folder bid=%@ cls=%@", bundleID, matchedCls);
                 UIView *leftover = MKGetIndicator(self);
                 if (leftover) { [leftover removeFromSuperview]; MKSetIndicator(self, nil); }
                 UIView *lbl = MKGetCachedLabel(self);
@@ -1193,6 +1209,7 @@ static void MKUpdate(SBIconView *self) {
 
         // 当前被用户打开在前台的 App，桌面上不再显示指示器（避免启动动画残留）
         if (!running || isForeground) {
+            if (sDebugLog) RDLog(@"RET-fg bid=%@ running=%d fg=%d", bundleID, running, isForeground);
             // ── App 不在运行 / 在前台 → 移除指示器，恢复名字 ──
             if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
             if (label) {
@@ -1209,12 +1226,14 @@ static void MKUpdate(SBIconView *self) {
         // v1.5.8: 标签正在渐隐中 → 不干扰动画，不创建指示器
         // 让 250ms 渐隐动画自然播放，300ms后才创建指示器
         if (isFading) {
+            if (sDebugLog) RDLog(@"RET-fading bid=%@", bundleID);
             return;  // 不做任何操作，让渐隐动画继续
         }
 
         // v1.5.6+: pending 期间只隐藏标签，不创建指示器（等300ms回调）
         // 标签渐隐已完成（alpha=0），但仍需保持隐藏状态防止系统恢复
         if (isPending) {
+            if (sDebugLog) RDLog(@"RET-pending bid=%@", bundleID);
             if (label) {
                 label.hidden = YES;
                 label.alpha = 0.0f;
@@ -1318,7 +1337,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.60: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.61: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -1335,6 +1354,9 @@ static void MKUpdate(SBIconView *self) {
                 [hostView addSubview:indicator];
                 MKSetIndicator(self, indicator);
             }
+            if (sDebugLog) RDLog(@"IND-HOST bid=%@ host=%@ frame=%@ hidden=%d alpha=%.2f",
+                  bundleID, NSStringFromClass([hostView class]),
+                  NSStringFromCGRect(indicator.frame), indicator.hidden, (float)indicator.alpha);
         } else {
             // v1.5.9: 只重定位指示器，不调用 applyConfig
             // applyConfig 会设置 self.alpha = cfg.opacity，打断渐显动画
@@ -1845,6 +1867,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
             return; // 同一打开事件的重复触发，跳过
         }
         sLastFolderOpenTS = now;
+        sFolderOpen = YES;
         if (sDebugLog) RDLog(@"FOLDER OPEN: SBFolderView appeared in window");
         // v1.6.53: 立即刷新 —— 文件夹打开瞬间标签与指示器会重叠；
         // 0.4s 去重已防止同一打开事件多次触发，这里再排一次异步刷新即可。
@@ -1858,6 +1881,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
             });
         }
     } else if (!me.window) {
+        sFolderOpen = NO;
         if (sDebugLog) RDLog(@"FOLDER CLOSE: SBFolderView removed from window");
     }
 }
