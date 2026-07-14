@@ -1316,6 +1316,16 @@ static void MKUpdate(SBIconView *self) {
             return;
         }
 
+        // v1.6.73: 文件夹打开期间，主屏/Dock 图标实例不抢指示器所有权。
+        // 同一 bid 在主屏与文件夹内各有一个 SBIconView 实例；文件夹打开时主屏实例
+        // 仍在窗口内（被文件夹盖住），其 MKUpdate 会把指示器重父回主屏 overlay
+        // → 被文件夹盖住不可见，与文件夹图标实例争抢 → "重开空位置 / 有些 App 没反应"。
+        // 文件夹图标实例才是该 bid 在文件夹期间的权威所有者，故主屏/Dock 实例在
+        // sFolderOpen 时完全跳过指示器管理；FOLDER CLOSE 刷新会复位主屏。
+        if (sFolderOpen && !MKIsIconInFolder((UIView *)self)) {
+            return;
+        }
+
         // v1.5.3: 使用缓存的 bundleID（避免每次都调 applicationBundleID）
         NSString *bundleID = MKGetCachedBid(self);
         // v1.6.60: 维护 bid→图标视图 注册表（弱引用），供 MKRefreshIconForBundleID 直接命中
@@ -1489,7 +1499,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.72: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.73: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -1958,6 +1968,13 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         return;
     }
 
+    // v1.6.73: 文件夹打开期间，主屏/Dock 图标实例不管理指示器
+    // （与 MKUpdate 同款守卫）。否则主屏实例把指示器重父回主屏 overlay
+    // → 被文件夹盖住，造成"重开空位置 / 有些 App 没反应"。
+    if (sFolderOpen && !MKIsIconInFolder((UIView *)self)) {
+        return;
+    }
+
         if (!indicator) {
             // 无 overlay 指示器 → 仅当本图标是运行中后台 App 时才需要创建
             if (!running || isForeground) return;
@@ -2341,6 +2358,11 @@ static BOOL MKIsSupportedOS(void) {
                 if (!sLocked) return;   // 非锁屏态（如普通切 App 回前台），不动
                 sLocked = NO;
                 MKSetAllIndicatorsHidden(NO);  // 全局恢复所有 overlay → 指示器瞬间显现
+                // v1.6.73: 解锁后补一次全量刷新，确保任何被 wedged 的指示器状态复位。
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    MKRefreshAllIcons();
+                });
                 if (sDebugLog) RDLog(@"UNLOCK(active): revealed indicators");
             } @catch (NSException *e) {}
         }];
