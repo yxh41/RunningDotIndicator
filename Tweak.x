@@ -1282,7 +1282,13 @@ static void MKUpdate(SBIconView *self) {
             NSTimeInterval now = [NSDate date].timeIntervalSince1970;
             if (now - sLockAt > 0.7) {
                 sLocked = NO;  // 解锁动画已结束，正常显示
-                MKSetAllIndicatorsHidden(NO);  // v1.6.71: 全局恢复所有 overlay（指示器立即显现，无需逐图标重布局）
+                // v1.6.74: 解锁用「全量重建」替代单纯 unhide overlay ——
+                // 锁屏期间部分指示器可能因视图层级变动而孤儿化（superview 失效），
+                // 单纯 MKSetAllIndicatorsHidden(NO) 救不回，必须按运行集合在当前正确
+                // overlay 上重建。下一帧异步全量刷新，确保解锁后完整显现、无需滑动。
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    MKRefreshAllIcons();
+                });
             } else {
                 UIView *ind = MKFindIndicator(MKGetCachedBid(self));
                 if (ind) ind.hidden = YES;
@@ -1473,7 +1479,16 @@ static void MKUpdate(SBIconView *self) {
         // 容器滚动时 overlay 与图标同处同一滚动坐标系，指示器自动跟随，无需逐帧重定位。
         UIView *container = MKContainerForIconView((UIView *)self);
         UIView *overlay = MKOverlayForContainer(container);
-        if (!overlay) return;  // v1.6.65: 无可用容器（如 Dock 层级异常）时不创建，避免 addSubview:nil 崩溃
+        if (!overlay) {
+            // v1.6.74: 文件夹打开动画尚未把 SBFloatyFolderScrollView 组装入树，
+            // 此刻容器 overlay 还拿不到 → 不要静默跳过（否则该运行 App 本次开文件夹
+            // 漏建指示器，表现为「重复开文件夹时有些 App 没反应 / 那一瞬是空的」）。
+            // 下一帧重试，overlay 就绪后自然建出。
+            dispatch_async(dispatch_get_main_queue(), ^{
+                MKUpdate(self);
+            });
+            return;
+        }
         CGRect indicatorFrame = MKIndicatorFrameInOverlay(self, overlay, cfg);
 
         // v1.6.64: 统一用「按 bid 索引的 overlay 指示器」作为唯一真相来源（替代旧的 self 子视图关联）。
@@ -1499,7 +1514,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.73: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.74: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -2357,13 +2372,12 @@ static BOOL MKIsSupportedOS(void) {
             @try {
                 if (!sLocked) return;   // 非锁屏态（如普通切 App 回前台），不动
                 sLocked = NO;
-                MKSetAllIndicatorsHidden(NO);  // 全局恢复所有 overlay → 指示器瞬间显现
-                // v1.6.73: 解锁后补一次全量刷新，确保任何被 wedged 的指示器状态复位。
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
+                // v1.6.74: 解锁用「全量重建」替代单纯 unhide overlay（见 MKUpdate 时间闸门注释）。
+                // 对锁屏期间孤儿化的指示器免疫，确保解锁后完整显现、无需滑动。
+                dispatch_async(dispatch_get_main_queue(), ^{
                     MKRefreshAllIcons();
                 });
-                if (sDebugLog) RDLog(@"UNLOCK(active): revealed indicators");
+                if (sDebugLog) RDLog(@"UNLOCK(active): MKRefreshAllIcons");
             } @catch (NSException *e) {}
         }];
 
