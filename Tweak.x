@@ -113,6 +113,13 @@ static char kMKIndicatorKey;
 static char kMKLabelKey;     // 缓存的名字标签视图
 static char kMKBidKey;       // 缓存的 bundleID
 static char kMKIconKey;      // 缓存的 icon 指针（检测视图回收复用）
+// v1.6.60: bid → SBIconView 弱引用注册表（替代不可靠的窗口遍历刷新）
+// iOS 16 SpringBoard 在文件夹/滚动/转场等活跃态下，主屏图标视图常不在
+// [UIApplication sharedApplication].windows 的常规遍历可达路径，导致 MKRefreshIconForBundleID
+// 刷新落空、活跃态下指示器永远建不出来（静止态靠 layoutSubviews 才偶尔建成）。
+// 注册表由 MKUpdate(每次有 bid 的图标视图都会跑) 实时维护，不依赖窗口层级，
+// 刷新时直接命中图标视图 → MKUpdate，彻底绕开窗口遍历的坑。值用弱引用避免持有视图导致泄漏。
+static NSMapTable *sBidToIconView;
 
 static UIView *MKGetIndicator(SBIconView *iv) {
     return objc_getAssociatedObject(iv, &kMKIndicatorKey);
@@ -147,6 +154,9 @@ static NSString *MKGetCachedBid(SBIconView *iv) {
     id cachedIcon = objc_getAssociatedObject(iv, &kMKIconKey);
     if (cachedIcon && cachedIcon != icon) {
         // icon 变了 → 清除所有缓存 + 移除旧指示器
+        // v1.6.60: 同步清掉注册表里这个视图的旧 bid 条目（避免回收复用后旧 bid 仍指向它）
+        NSString *oldBid = objc_getAssociatedObject(iv, &kMKBidKey);
+        if (oldBid && sBidToIconView) [sBidToIconView removeObjectForKey:oldBid];
         objc_setAssociatedObject(iv, &kMKBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(iv, &kMKLabelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         UIView *oldIndicator = MKGetIndicator(iv);
@@ -1099,6 +1109,12 @@ static void MKUpdate(SBIconView *self) {
 
         // v1.5.3: 使用缓存的 bundleID（避免每次都调 applicationBundleID）
         NSString *bundleID = MKGetCachedBid(self);
+        // v1.6.60: 维护 bid→图标视图 注册表（弱引用），供 MKRefreshIconForBundleID 直接命中
+        // 不依赖窗口遍历，文件夹/滚动/转场等活跃态下也能可靠刷新。
+        if (bundleID && [self isKindOfClass:MKSBIconViewClass()]) {
+            if (!sBidToIconView) sBidToIconView = [NSMapTable strongToWeakObjectsMapTable];
+            [sBidToIconView setObject:self forKey:bundleID];
+        }
         // v1.6.59: 滚动中不再一律跳过创建（v1.6.57/58 因此导致后台 App 永久零指示器）。
         // 改为：滚动中仅为「运行中+后台+尚无指示器」的 App 即时补建；其余（前台/文件夹/非运行）仍跳过以防 churn。
         // 可靠兜底：MKOnStateChange 在 App 转后台时还会于 300ms/800ms 调 MKRefreshIconForBundleID→MKUpdate，
@@ -1106,6 +1122,13 @@ static void MKUpdate(SBIconView *self) {
         BOOL running = MKIsAppRunning(bundleID);
         BOOL isForeground = MKIsForeground(bundleID);
         UIView *existingIndicator = MKGetIndicator(self);
+        // v1.6.60 诊断：仅针对「后台运行中 App」的 MKUpdate 打点（不刷屏）。
+        // 能看到：MKUpdate 是否真的被调到、当时 sScrolling/hasIndicator 状态、最终是否建出。
+        // 若 REFRESH 命中却无本行 → MKUpdate 没被调（触发链断）；
+        // 若有本行却无 Indicator CREATE → MKUpdate 内部早退；据此一击定位。
+        if (sDebugLog && running && !isForeground) {
+            RDLog(@"MKU-bg bid=%@ scroll=%d hasInd=%d", bundleID, sScrolling, (int)!!existingIndicator);
+        }
         if (sScrolling) {
             if (sDebugLog) {
                 static NSMutableSet *sGateScroll; static dispatch_once_t sOnceS;
@@ -1295,7 +1318,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.59: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.60: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -1404,7 +1427,23 @@ static void MKRefreshAllIcons() {
 static void MKRefreshIconForBundleID(NSString *bid) {
     MKSafe(^{
         if (!sInitDone || !bid.length) return;
+        // v1.6.60: 优先用 bid→图标视图 注册表（弱引用），不依赖窗口遍历。
+        // iOS 16 SpringBoard 在文件夹/滚动/转场等活跃态下，主屏图标视图常不在
+        // [UIApplication sharedApplication].windows 的常规遍历可达路径，导致刷新落空、
+        // 活跃态下指示器永远建不出来（静止态靠 layoutSubviews 才偶尔建成）。
+        if (!sBidToIconView) sBidToIconView = [NSMapTable strongToWeakObjectsMapTable];
+        SBIconView *regView = [sBidToIconView objectForKey:bid];
+        if (regView && [regView isKindOfClass:MKSBIconViewClass()]) {
+            NSString *regBid = MKGetCachedBid(regView);
+            if (regBid && [regBid isEqualToString:bid]) {
+                if (sDebugLog) RDLog(@"REFRESH bid=%@ via=registry", bid);
+                MKUpdate(regView);
+                return;
+            }
+        }
+        // 兜底：原窗口遍历（兼容视图尚未入注册表 / 注册表条目已弱引用失效的情况）
         NSArray *windows = [UIApplication sharedApplication].windows;
+        int walked = 0;
         for (UIWindow *window in windows) {
             NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
             while (stack.count > 0) {
@@ -1414,6 +1453,7 @@ static void MKRefreshIconForBundleID(NSString *bid) {
                     SBIconView *iv = (SBIconView *)current;
                     NSString *ivBid = MKGetCachedBid(iv);
                     if (ivBid && [ivBid isEqualToString:bid]) {
+                        walked++;
                         MKUpdate(iv);
                     }
                 }
@@ -1422,6 +1462,7 @@ static void MKRefreshIconForBundleID(NSString *bid) {
                 }
             }
         }
+        if (sDebugLog) RDLog(@"REFRESH bid=%@ via=walk matched=%d", bid, walked);
     });
 }
 
