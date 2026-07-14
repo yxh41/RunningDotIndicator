@@ -132,6 +132,8 @@ static BOOL MKIsForeground(NSString *bid);
 static void MKRefreshSubviews(UIView *containerView);
 // 前向声明（setContentOffset: 钩子调用，定义在 sInitDone 之后）
 static void MKMarkScrolling(UIView *scrollView);
+// 前向声明（v1.6.31: SBIconView 类静态化，定义在文件后部，但前部遍历循环已调用）
+static Class MKSBIconViewClass(void);
 
 // 缓存 bundleID（避免每次 layoutSubviews 都调 applicationBundleID）
 // v1.5.4: 检测 icon 变化（SBIconView 回收复用）+ 过滤文件夹图标
