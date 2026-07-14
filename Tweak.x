@@ -1,5 +1,5 @@
 //
-//  Tweak.x — RunningDotIndicator v1.6.51
+//  Tweak.x — RunningDotIndicator v1.6.28
 //  v1.6.28: 重加宽松 iOS 版本守卫（只挡 iOS 15 及更低，16.0+ 均挂钩）；
 //           修复「部分 App 指示器偶尔消失、桌面滑动才回来」——layoutSubviews 加孤儿自愈
 //           （指示器存在但 superview==nil 时立即 MKUpdate 重建，不等滚动触发）。
@@ -61,9 +61,6 @@
 // ─── RDLog 前向声明（避免 C99 "use before declaration" 错误）──
 static void RDLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
 
-// ─── MKSBIconViewClass 前向声明（定义见刷新辅助区，MKCachedIconColorForBundleID 先调用）──
-static Class MKSBIconViewClass(void);
-
 // libproc 函数声明（iOS 运行时存在，但 iPhoneOS SDK 不含此头文件）
 extern int proc_listallpids(void *buffer, int buffersize);
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
@@ -113,37 +110,9 @@ static NSInteger const kDotTag  = 9999;
 
 // ─── 关联对象：SBIconView ↔ 指示器视图（跨层级追踪）──
 static char kMKIndicatorKey;
-static char kMKLabelKey;     // v1.6.48 起不再缓存标签（每次现找），保留声明
+static char kMKLabelKey;     // 缓存的名字标签视图
 static char kMKBidKey;       // 缓存的 bundleID
 static char kMKIconKey;      // 缓存的 icon 指针（检测视图回收复用）
-static char kMKPendBidKey;  // v1.6.37/v1.6.46 用过，v1.6.48 起不再使用（保留声明防误用）
-static char kMKBidOfIndicatorKey; // v1.6.39: bundleID associated onto the indicator view (stale detection / logging)
-static char kMKTransitKey;  // v1.6.42: recycle-settle counter (NSNumber) for MKSlotTransitioning
-static char kMKBidStableCountKey; // v1.6.46 稳定帧计数器，v1.6.48 起不再使用（保留声明防误用）
-
-// v1.6.39: own the indicator by bundleID, NOT by SBIconView instance.
-// Root cause: iOS recycles SBIconView instances (same object re-shows a different app
-//   during scroll / page-swipe). The old model attached the indicator to the instance,
-//   so the dot rode the recycled instance onto another app's icon ("runs around").
-// New model: each running bid keeps ONE indicator view in sIndicatorByBid.
-//   Every MKUpdate/layoutSubviews just re-parents that one view onto whatever
-//   view currently shows the bid. When a view is recycled to another bid we only
-//   DETACH the old bid's indicator from that slot (keep it alive); it re-attaches
-//   when the correct view shows up -> no hopping, no rebuild.
-static NSMutableDictionary<NSString*, UIView*> *sIndicatorByBid = nil;
-
-static UIView *MKIndicatorForBid(NSString *bid) {
-    if (!bid || !sIndicatorByBid) return nil;
-    return sIndicatorByBid[bid];
-}
-// Only destroy on a REAL exit (bid removed from running set); scroll/recycle only detaches.
-static void MKDestroyIndicatorForBid(NSString *bid) {
-    if (!bid || !sIndicatorByBid) return;
-    UIView *ind = sIndicatorByBid[bid];
-    if (ind) [ind removeFromSuperview];
-    [sIndicatorByBid removeObjectForKey:bid];
-    // stale kMKIndicatorKey caches on views self-heal via the stale check in MKUpdate/layoutSubviews
-}
 
 static UIView *MKGetIndicator(SBIconView *iv) {
     return objc_getAssociatedObject(iv, &kMKIndicatorKey);
@@ -151,47 +120,6 @@ static UIView *MKGetIndicator(SBIconView *iv) {
 static void MKSetIndicator(SBIconView *iv, UIView *dot) {
     objc_setAssociatedObject(iv, &kMKIndicatorKey, dot, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
-// v1.6.42: recycle/scroll transition guard (fixes "indicator hops to wrong icon on scroll").
-// Root cause: the indicator is a subview of the recyclable SBIconView slot. During scroll,
-// iOS reuses a slot's SBIconView instance to display a DIFFERENT app; because
-// [iv icon].applicationBundleID is unreliable during the swap (returns the OLD bid for the
-// frames where the slot already shows the new app), MKUpdate keeps gluing the old app's
-// indicator onto the slot now displaying a different app -> the dot "hops". The per-bid
-// registry (v1.6.39) fixed churn/persistence but NOT this visual ride-along.
-// Fix: detect the recycle via the ICON OBJECT POINTER. The visual content is derived from
-// the same object, so they change together -- unlike applicationBundleID. When the pointer
-// changes we HIDE this slot's indicator and suppress show/create until the pointer is stable
-// for MK_TRANSIT_FRAMES consecutive layout passes; then MKUpdate re-attaches the correct
-// indicator (per-bid registry) to the settled slot. No churn, no hop.
-static const NSInteger MK_TRANSIT_FRAMES = 5;  // v1.6.48: 5 帧覆盖 applicationBundleID 滞后
-static BOOL MKSlotTransitioning(SBIconView *self) {
-    id cur = [self icon];
-    if (!cur) return NO;
-    id last = objc_getAssociatedObject(self, &kMKIconKey);
-    if (last && last != cur) {
-        // icon object swapped this pass -> slot is being recycled to another app.
-        UIView *ind = MKGetIndicator(self);
-        if (ind) ind.hidden = YES;
-        objc_setAssociatedObject(self, &kMKTransitKey, @(MK_TRANSIT_FRAMES), OBJC_ASSOCIATION_COPY_NONATOMIC);
-        objc_setAssociatedObject(self, &kMKBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(self, &kMKLabelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(self, &kMKPendBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(self, &kMKBidStableCountKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
-        objc_setAssociatedObject(self, &kMKIconKey, cur, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        return YES;
-    }
-    objc_setAssociatedObject(self, &kMKIconKey, cur, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    NSInteger t = [objc_getAssociatedObject(self, &kMKTransitKey) integerValue];
-    if (t > 0) {
-        t -= 1;
-        objc_setAssociatedObject(self, &kMKTransitKey, @(t), OBJC_ASSOCIATION_COPY_NONATOMIC);
-        UIView *ind = MKGetIndicator(self);
-        if (ind) ind.hidden = YES;
-        return YES;
-    }
-    return NO;
-}
-
 
 // 前向声明（MKFindLabelView 定义在后面，但 MKGetCachedLabel 需要调用它）
 static UIView *MKFindLabelView(SBIconView *iconView);
@@ -200,6 +128,10 @@ static void MKRefreshIconForBundleID(NSString *bid);
 // 前向声明（miss 重试的 dispatch 块内需要判断运行状态）
 static BOOL MKIsAppRunning(NSString *bundleID);
 static BOOL MKIsForeground(NSString *bid);
+// 前向声明（滚动守卫刷新需要）
+static void MKRefreshSubviews(UIView *containerView);
+// 前向声明（setContentOffset: 钩子调用，定义在 sInitDone 之后）
+static void MKMarkScrolling(UIView *scrollView);
 
 // 缓存 bundleID（避免每次 layoutSubviews 都调 applicationBundleID）
 // v1.5.4: 检测 icon 变化（SBIconView 回收复用）+ 过滤文件夹图标
@@ -207,9 +139,22 @@ static NSString *MKGetCachedBid(SBIconView *iv) {
     id icon = [iv icon];
     if (!icon) return nil;
 
+// 检测图标是否变了（SBIconView 回收复用：同一个 view 可能从 App A 变成文件夹）
+    id cachedIcon = objc_getAssociatedObject(iv, &kMKIconKey);
+    if (cachedIcon && cachedIcon != icon) {
+        // icon 变了 → 清除所有缓存 + 移除旧指示器
+        objc_setAssociatedObject(iv, &kMKBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(iv, &kMKLabelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        UIView *oldIndicator = MKGetIndicator(iv);
+        if (oldIndicator) { [oldIndicator removeFromSuperview]; MKSetIndicator(iv, nil); }
+    }
+    objc_setAssociatedObject(iv, &kMKIconKey, icon, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
     // v1.6.0: 过滤文件夹图标 — 精确匹配，不误杀文件夹内App
-    //   只过滤 SBFolderIcon / SBIconFolderIcon（文件夹本身的复合图标），不过滤文件夹内的App图标
-    //   v1.6.31: 常量类静态化，避免每个图标每次 layoutSubviews 都跑 NSClassFromString。
+    // 旧版 containsString:@"Folder" 可能误杀类名含 Folder 的App图标
+    // 只过滤 SBFolderIcon（文件夹本身的复合图标），不过滤文件夹内的App图标
+    // v1.6.31: 常量类静态化 —— 避免每个图标每次 layoutSubviews 都跑
+    // NSStringFromClass + 2×NSClassFromString + 2×字符串比较（纯边角料、行为不变）
     static Class sFolderIconClass = Nil;
     static Class sIconFolderIconClass = Nil;
     static dispatch_once_t sFolderClsOnce;
@@ -222,38 +167,27 @@ static NSString *MKGetCachedBid(SBIconView *iv) {
         return nil;
     }
 
-    // v1.6.48: 取当前 icon 的 applicationBundleID 并信任它。
-    //   回收/翻页防粘不再靠「稳定帧去抖」——v1.6.46 的去抖导致翻页后若刷新次数不足，
-    //   计数器不够、指示器永久 hidden（即用户这次说的"翻回不会重新出现"）。
-    //   防粘改由 MKSlotTransitioning（icon 指针切换隐藏 5 帧）+ sScrolling 滚动隐藏负责。
-    NSString *oldBid = objc_getAssociatedObject(iv, &kMKBidKey);
-    NSString *newBid = nil;
+    NSString *bid = objc_getAssociatedObject(iv, &kMKBidKey);
+    if (bid) return bid;
     if ([icon respondsToSelector:@selector(applicationBundleID)]) {
-        newBid = [icon applicationBundleID];
+        bid = [icon applicationBundleID];
+        if (bid) objc_setAssociatedObject(iv, &kMKBidKey, bid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    // 更新缓存的 icon 指针（供 MKSlotTransitioning 比较回收）
-    objc_setAssociatedObject(iv, &kMKIconKey, icon, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    NSString *bid = newBid ? newBid : oldBid;  // 临时取不到 bid 时回退旧缓存
-    if (bid) objc_setAssociatedObject(iv, &kMKBidKey, bid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return bid;
 }
 
-
-// v1.6.48: 标签不再缓存。SBIconView 回收复用会让缓存的标签指向别的槽位，
-//   导致指示器被定位到别的 App 名称位置。每次现找（Strategy 2 按 icon 中心最近匹配），
-//   保证拿的一定是当前这个 icon 的标签。
+// 缓存名字标签视图（避免每次 layoutSubviews 都跑 MKFindLabelView 4 重策略）
 static UIView *MKGetCachedLabel(SBIconView *iv) {
-    return MKFindLabelView(iv);
+    UIView *label = objc_getAssociatedObject(iv, &kMKLabelKey);
+    if (label && label.superview) return label;  // 仍然有效
+    // 缓存失效 → 重新查找
+    label = MKFindLabelView(iv);
+    if (label) objc_setAssociatedObject(iv, &kMKLabelKey, label, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return label;
 }
 
 // ─── 状态去重：同一个 bundleID 的 (running, foreground) 没变就不刷新 ──
 static NSMutableDictionary<NSString*, NSDictionary*> *sLastState = nil;
-
-// v1.6.34: 标签未找到时的"延迟重试"去重集合（每个 bid 仅重试一次，防无限重试）
-// v1.6.35: 标签重试计数（取代 v1.6.34 的 sLabelRetryBids 单次布尔）。
-// 同一 bid 最多重试 N 次、延迟递增，捕获 App 退到后台后 1~2s 才挂上的标签视图。
-static NSMutableDictionary<NSString*, NSNumber*> *sLabelRetryCount = nil;
 static BOOL MKStateDidChange(NSString *bid, BOOL running, BOOL foreground) {
     if (!sLastState) sLastState = [NSMutableDictionary dictionary];
     NSDictionary *prev = sLastState[bid];
@@ -305,6 +239,28 @@ static BOOL MKIsBlacklisted(NSString *bid) {
 // ─── 全局状态 ─────────────────────────────────────────────
 static int   sCallCount    = 0;
 static BOOL  sInitDone     = NO;
+
+// v1.6.52: 滚动/翻页守卫 —— 滚动中不重定位/创建指示器，避免翻页 churn 与粘错
+static BOOL  sScrolling     = NO;
+static NSTimeInterval sLastScrollTS = 0;
+static BOOL  sScrollSettleScheduled = NO;
+static void MKMarkScrolling(UIView *scrollView) {
+    if (!sInitDone) return;
+    sScrolling = YES;
+    sLastScrollTS = [NSDate date].timeIntervalSince1970;
+    if (!sScrollSettleScheduled) {
+        sScrollSettleScheduled = YES;
+        __strong UIView *sv = scrollView;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 320 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            sScrollSettleScheduled = NO;
+            if (sInitDone && [NSDate date].timeIntervalSince1970 - sLastScrollTS >= 0.30) {
+                sScrolling = NO;
+                if (sv) MKRefreshSubviews(sv);
+            }
+        });
+    }
+}
 static NSMutableSet<NSString*> *sRunningSet = nil;
 static NSMutableDictionary<NSString*, NSString*> *sPathToBundleID = nil;
 static NSMutableDictionary<NSString*, NSString*> *sBidToExePath = nil;
@@ -332,10 +288,6 @@ static void MKUpdateDebugFlag(void) {
 static BOOL  sFolderRefreshScheduled = NO;   // 文件夹刷新是否已排程（300ms 内只排一次）
 static NSTimeInterval sLastFolderOpenTS = 0; // 上次文件夹打开时间戳（0.4s 内去重）
 static BOOL  sScrollRefreshScheduled = NO;   // 滚动刷新是否已排程（120ms 内只排一次）
-
-static BOOL sScrolling = NO;        // v1.6.43: 滚动进行中 -> 隐藏所有指示器（不显示/不创建），滚动停后由 MKRefreshSubviews 重显
-static dispatch_block_t sScrollStopBlock; // v1.6.43: 滚动心跳 -> 末次 scroll 事件后 200ms 清 sScrolling 并重刷（静态默认零初始化即 nil）
-
 
 // ─── sPendingBIDs 辅助 ─── v1.5.6+ ───
 // 前台→后台时，立即隐藏标签但延迟300ms创建指示器
@@ -968,66 +920,12 @@ static int MKGetIntFromState(id stateObj, NSString *propName) {
 // 渲染辅助 — Lynx2 风格：替换 App 名字标签区域
 // ====================================================================
 
-// v1.6.51: 定位到真正的图标图片视图，无 label 时也能把指示器放在图标正下方。
-static UIView *MKFindIconImageView(SBIconView *iconView) {
-    @try {
-        NSArray *accessorNames = @[
-            @"iconImageView", @"imageView", @"_iconImageView",
-            @"_imageView", @"iconContentView", @"contentView",
-            @"contentImageView", @"iconImage", @"image"
-        ];
-        for (NSString *name in accessorNames) {
-            SEL sel = NSSelectorFromString(name);
-            if ([iconView respondsToSelector:sel]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                id result = [iconView performSelector:sel];
-#pragma clang diagnostic pop
-                if (result && [result isKindOfClass:[UIView class]]) {
-                    return (UIView *)result;
-                }
-            }
-        }
-    } @catch (NSException *e) {}
-    NSMutableArray *stack = [NSMutableArray arrayWithArray:iconView.subviews];
-    while (stack.count > 0) {
-        UIView *v = [stack lastObject];
-        [stack removeLastObject];
-        NSString *cls = NSStringFromClass([v class]);
-        if ([cls isEqualToString:@"SBIconImageView"] ||
-            [cls containsString:@"IconImageView"] ||
-            [cls containsString:@"IconContentView"] ||
-            [cls isEqualToString:@"UIImageView"] ||
-            [cls containsString:@"ImageView"]) {
-            return v;
-        }
-        [stack addObjectsFromArray:v.subviews];
-    }
-    return nil;
-}
-
-static CGRect MKIconImageFrameInSelf(SBIconView *iconView) {
-    UIView *img = MKFindIconImageView(iconView);
-    if (!img) return CGRectZero;
-    return [img convertRect:img.bounds toView:(UIView *)iconView];
-}
-
-// v1.6.51: 当图标图片视图找不到时，用估计的图标底部作为锚点，避免 SBIconView bounds 异常大时
-// 把锚点算到 bounds 中心，导致标签查找被过滤 / fallback 位置错误。
-static CGFloat MKEstimatedIconImageBottomInSelf(SBIconView *iconView) {
-    CGRect imgFrame = MKIconImageFrameInSelf(iconView);
-    if (!CGRectIsEmpty(imgFrame)) return imgFrame.origin.y + imgFrame.size.height;
-    CGFloat h = iconView.bounds.size.height;
-    // 典型图标高度 60pt；若 bounds 很大（日志里见过 390pt），只取顶部 60pt 区域。
-    return (h > 0 && h < 120.0f) ? h : 60.0f;
-}
-
 // 找到 SBIconView 对应的名字标签视图 — v1.5.0 四重策略
 // v1.4.9 问题：iOS 16 SBIconListLabel 不在 SBIconView 内部，是其兄弟节点
 // 日志证实：NO LABEL — SBIconView subviews: [SBFTouchPassThroughView]
 static UIView *MKFindLabelView(SBIconView *iconView) {
     @try {
-        // ── Strategy 1: SBIconView accessor 方法（iOS 16 运行时头文件）──
+        // Strategy 1: SBIconView accessor 方法（iOS 16 运行时头文件）
         NSArray *accessorNames = @[
             @"labelView", @"listLabelView", @"_listLabelView",
             @"_titleLabelView", @"titleLabel", @"_labelView",
@@ -1037,107 +935,51 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
         for (NSString *name in accessorNames) {
             SEL sel = NSSelectorFromString(name);
             if ([iconView respondsToSelector:sel]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                #pragma clang diagnostic push
+                #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
                 id result = [iconView performSelector:sel];
-#pragma clang diagnostic pop
+                #pragma clang diagnostic pop
                 if (result && [result isKindOfClass:[UIView class]]) {
-                    return (UIView *)result;
+                    return result;
                 }
             }
         }
 
-        // ── Strategy 2: 祖先视图兄弟节点搜索（iOS 16 核心）──
-        // v1.6.51: 名称标签在 iOS 16 中并不是 SBIconView 的 direct sibling，
-        //   而是在它外层 wrapper 的父容器（SBIconListView / SBDockIconListView 等）
-        //   中与它同列。之前只查 iconView.superview，当 superview 是只有一个子视图
-        //   的 wrapper 时永远找不到标签，导致普通 App 只能走 fallback 而看不到指示器。
-        //   现在从 superview 开始向上遍历 8 层，在每一层中找「与图标底部同列、
-        //   且纵向落在图标下方」的标签。锚点用 MKEstimatedIconImageBottomInSelf，
-        //   避免 SBIconView bounds 异常大时把锚点算到 bounds 中心。
-        CGFloat colTol = 50.0f;
-        UIView *container = iconView.superview;
-        NSInteger depth = 0;
-        while (container && depth < 8) {
-            CGFloat iconBottomY = MKEstimatedIconImageBottomInSelf(iconView);
-            CGPoint iconBottomCenter = CGPointMake(
-                iconView.bounds.size.width / 2.0f,
-                iconBottomY);
-            iconBottomCenter = [iconView convertPoint:iconBottomCenter toView:container];
-
-            UIView *bestMatch = nil;
-            CGFloat bestDy = CGFLOAT_MAX;
-            NSInteger bestScore = 0;
-            for (UIView *sv in container.subviews) {
-                if (sv == iconView || sv == iconView.superview) continue;
-                NSString *cls = NSStringFromClass([sv class]);
-                NSInteger score = 0;
-                if ([cls isEqualToString:@"SBIconListLabel"])        score = 100;
-                else if ([cls containsString:@"IconListLabel"])      score = 90;
-                else if ([cls containsString:@"ListLabel"])          score = 80;
-                else if ([cls containsString:@"IconLabel"])          score = 70;
-                else if ([sv isKindOfClass:[UILabel class]])          score = 60;
-                else if ([cls containsString:@"LabelView"])           score = 50;
-                else if ([cls containsString:@"Label"])              score = 40;
-                if (score < 50) continue;
-                // 同列：标签中心 x 与图标底部中心 x 对齐
-                CGFloat dx = sv.center.x - iconBottomCenter.x;
-                if (dx < 0) dx = -dx;
-                if (dx > colTol) continue;
-                // 纵向：标签在图标下方不远处，允许较大范围
-                CGFloat dy = sv.center.y - iconBottomCenter.y;
-                if (dy < -30.0f || dy > 150.0f) continue;
-                if (score > bestScore || (score == bestScore && dy < bestDy)) {
-                    bestScore = score;
-                    bestDy = dy;
-                    bestMatch = sv;
+        // Strategy 2: 祖先视图兄弟节点（v1.6.52 修复 iOS16 wrapper 包裹问题）
+        // iOS 16 中 SBIconView 常被包进一个只有它自己的 wrapper(UIView)，
+        // 真正的 SBIconListLabel 在 wrapper 的父容器（SBIconListView / SBDockIconListView）中。
+        // 因此从 iconView.superview 开始向上遍历最多 8 层祖先，在每一层找兄弟标签。
+        UIView *levelView = iconView.superview;
+        NSInteger mkLevels = 0;
+        while (levelView && mkLevels < 8) {
+            if (levelView.subviews.count > 0 && levelView.subviews.count <= 256) {
+                UIView *bestMatch = nil;
+                NSInteger bestScore = 0;
+                for (UIView *sv in levelView.subviews) {
+                    if (sv == iconView) continue;
+                    NSString *cls = NSStringFromClass([sv class]);
+                    NSInteger score = 0;
+                    if ([cls isEqualToString:@"SBIconListLabel"])        score = 100;
+                    else if ([cls containsString:@"IconListLabel"])      score = 90;
+                    else if ([cls containsString:@"ListLabel"])          score = 80;
+                    else if ([cls containsString:@"IconLabel"])          score = 70;
+                    else if ([sv isKindOfClass:[UILabel class]])          score = 60;
+                    else if ([cls containsString:@"LabelView"])           score = 50;
+                    else if ([cls containsString:@"Label"])              score = 40;
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestMatch = sv;
+                    }
+                }
+                if (bestMatch && bestScore >= 50) {
+                    return bestMatch;
                 }
             }
-            if (bestMatch) return bestMatch;
-            container = container.superview;
-            depth++;
+            levelView = levelView.superview;
+            mkLevels++;
         }
 
-        // ── Strategy 2.5: 兜底——放宽 dy，只要求同列，取最近中心的标签 ──
-        container = iconView.superview;
-        depth = 0;
-        while (container && depth < 8) {
-            CGFloat iconBottomY = MKEstimatedIconImageBottomInSelf(iconView);
-            CGPoint iconBottomCenter = CGPointMake(
-                iconView.bounds.size.width / 2.0f,
-                iconBottomY);
-            iconBottomCenter = [iconView convertPoint:iconBottomCenter toView:container];
-
-            UIView *bestMatch = nil;
-            CGFloat bestDist = CGFLOAT_MAX;
-            for (UIView *sv in container.subviews) {
-                if (sv == iconView || sv == iconView.superview) continue;
-                NSString *cls = NSStringFromClass([sv class]);
-                NSInteger score = 0;
-                if ([cls isEqualToString:@"SBIconListLabel"])        score = 100;
-                else if ([cls containsString:@"IconListLabel"])      score = 90;
-                else if ([cls containsString:@"ListLabel"])          score = 80;
-                else if ([cls containsString:@"IconLabel"])          score = 70;
-                else if ([sv isKindOfClass:[UILabel class]])          score = 60;
-                else if ([cls containsString:@"LabelView"])           score = 50;
-                else if ([cls containsString:@"Label"])              score = 40;
-                if (score < 40) continue;
-                CGFloat dx = sv.center.x - iconBottomCenter.x;
-                if (dx < 0) dx = -dx;
-                if (dx > colTol) continue;
-                CGFloat dy = sv.center.y - iconBottomCenter.y;
-                CGFloat dist = dx + (dy < 0 ? -dy : dy);
-                if (dist < bestDist) {
-                    bestDist = dist;
-                    bestMatch = sv;
-                }
-            }
-            if (bestMatch) return bestMatch;
-            container = container.superview;
-            depth++;
-        }
-
-        // ── Strategy 3: 直接子视图搜索（兼容标签在图标内部的情况）──
+        // Strategy 3: 直接子视图搜索
         for (UIView *sv in iconView.subviews) {
             NSString *cls = NSStringFromClass([sv class]);
             if ([sv isKindOfClass:[UILabel class]] ||
@@ -1147,7 +989,7 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
             }
         }
 
-        // ── Strategy 4: 递归子视图搜索 ──
+        // Strategy 4: 递归子视图搜索
         NSMutableArray *stack = [NSMutableArray arrayWithArray:iconView.subviews];
         while (stack.count > 0) {
             UIView *v = [stack lastObject];
@@ -1158,29 +1000,31 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
                 [cls containsString:@"LabelView"] ||
                 [cls containsString:@"ListLabel"] ||
                 [cls containsString:@"TitleLabel"] ||
-                [cls containsString:@"TextLabel"] ||
-                [cls containsString:@"Label"]) {
+                [cls containsString:@"TextLabel"]) {
                 return v;
             }
             [stack addObjectsFromArray:v.subviews];
         }
 
-        // ── 诊断：标签未找到 → dump iconView + 父视图层级 ──
+        // 诊断：标签未找到 -> dump iconView + 父视图层级
         static int sNoLabelLogs = 0;
-        if (sNoLabelLogs < 60) {
+        if (sNoLabelLogs < 10) {
             sNoLabelLogs++;
-            NSMutableString *dump = [NSMutableString stringWithFormat:@"NO LABEL — %@ direct:[", NSStringFromClass([iconView class])];
+            NSMutableString *dump = [NSMutableString stringWithFormat:@"NO LABEL - %@ direct:[", NSStringFromClass([iconView class])];
             for (UIView *sv in iconView.subviews) {
                 [dump appendFormat:@" %@", NSStringFromClass([sv class])];
             }
             [dump appendString:@"]"];
             UIView *parent = iconView.superview;
-            if (parent) {
-                [dump appendFormat:@" parent(%@, %lu kids):[", NSStringFromClass([parent class]), (unsigned long)parent.subviews.count];
+            NSInteger lvl = 0;
+            while (parent && lvl < 8) {
+                [dump appendFormat:@" | L%ld(%@, %lu kids):[", (long)lvl, NSStringFromClass([parent class]), (unsigned long)parent.subviews.count];
                 for (UIView *sv in parent.subviews) {
                     [dump appendFormat:@" %@(y=%.0f,h=%.0f)", NSStringFromClass([sv class]), sv.frame.origin.y, sv.frame.size.height];
                 }
                 [dump appendString:@"]"];
+                parent = parent.superview;
+                lvl++;
             }
             RDLog(@"%@", dump);
         }
@@ -1191,169 +1035,207 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
     return nil;
 }
 
-
 // ====================================================================
-// v1.6.51: 计算指示器中心在 self (SBIconView) 本地坐标系中的位置。
-//   有 label → 用 label 中心；无 label → 图标图片底部 + 间隙（避免落到图标内部）。
-static CGPoint MKIndicatorCenterInSelf(SBIconView *self, UIView *label, CGFloat indicatorW, CGFloat indicatorH) {
-    if (label && label.superview) {
-        return [(UIView *)self convertPoint:label.center fromView:label.superview];
-    }
-    CGRect imgFrame = MKIconImageFrameInSelf(self);
-    CGFloat y;
-    if (imgFrame.size.height > 0) {
-        y = imgFrame.origin.y + imgFrame.size.height + 4.0f + indicatorH / 2.0f;
-    } else {
-        CGSize s = self.bounds.size;
-        if (s.width < 10 || s.height < 10) return CGPointZero;
-        // v1.6.51: 用估计图标底部 + 间隙，不再用 self.bounds 底部（避免图标内/错误位置）
-        CGFloat iconBottom = (s.height > 0 && s.height < 120.0f) ? s.height : 60.0f;
-        y = iconBottom + 4.0f + indicatorH / 2.0f;
-    }
-    return CGPointMake(self.bounds.size.width / 2.0f, y);
-}
-
-// 主更新函数 — v1.5.1：标签找到→指示器在标签位置，标签未找到→图标底部边缘（不遮挡）
+// 主更新函数
 // ====================================================================
 
 static void MKUpdate(SBIconView *self) {
     MKSafe(^{
         if (!sInitDone) return;
 
-        // v1.6.42: while this slot is mid-recycle (icon object swapped during scroll),
-        // hide its indicator and skip show/create; the per-bid registry re-attaches
-        // the correct indicator once the slot settles on its new app.
-        if (MKSlotTransitioning(self)) return;
-
-        // v1.6.43: 滚动进行中 -> 隐藏本槽指示器、不显示/不创建；滚动停后统一重刷。
-        //   结构根治「翻页粘到别的图标」：滚动时啥都不显示，自然谈不上粘错。
-        if (sScrolling) {
-            UIView *ind = MKGetIndicator(self);
-            if (ind) ind.hidden = YES;
+        sCallCount++;
+        if (MKIsDisabled()) {
+            UIView *indicator = MKGetIndicator(self);
+            if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
+            UIView *label = MKGetCachedLabel(self);
+            if (label) {
+                label.hidden = NO;
+                label.alpha = 1.0f;
+                label.layer.opacity = 1.0f;
+                label.opaque = YES;
+            }
             return;
         }
-
-        sCallCount++;
-
-        NSString *bundleID = MKGetCachedBid(self);
-        if (!bundleID || bundleID.length == 0) return;
-
-        // v1.6.39: grab both "indicator cached on this slot" and "indicator this bid SHOULD have".
-        //   If they differ, the cache belongs to a previously-recycled bid -> detach from our slot, don't destroy.
-        UIView *label = MKGetCachedLabel(self);
-        // v1.6.49: 指示器直接挂到 self（SBIconView）上，定位走 self.bounds 坐标。
-        //   彻底摆脱「共享内容视图坐标」与「错槽兄弟 label.frame」两套干扰：
-        //   - Dock 图标各自持有自己的指示器子视图 → 不再堆积进 SBDockIconListView（y=73 重叠）；
-        //   - 滚动/回收时指示器随 self 一起移动，无坐标换算错位、也不被误挂共享视图。
-        UIView *hostView = (UIView *)self;
-        [hostView setClipsToBounds:NO]; // v1.6.50: 指示器可能位于图标 bounds 外（标签/Dock 下方），必须允许绘制出来
-        UIView *cachedInd = MKGetIndicator(self);
-        UIView *bidInd     = MKIndicatorForBid(bundleID);
-        if (cachedInd && cachedInd != bidInd) {
-            if (cachedInd.superview == hostView) [cachedInd removeFromSuperview];
-            MKSetIndicator(self, nil);
-            cachedInd = nil;
-        }
-        UIView *indicator = (bidInd ? bidInd : cachedInd);
-
-        // v1.6.48: 不再使用 kMKPendBidKey 作为去抖守卫。回收/翻页防粘由
-        //   MKSlotTransitioning（icon 指针切换隐藏 5 帧）+ sScrolling 滚动隐藏负责。
 
         MKConfig *cfg = [MKConfig sharedConfig];
-        if (MKIsDisabled() || !cfg || !cfg.enabled) {
-            if (indicator) {
-                if (indicator.superview == hostView) [indicator removeFromSuperview];
-                MKSetIndicator(self, nil);
+        if (!cfg || !cfg.enabled) {
+            UIView *indicator = MKGetIndicator(self);
+            if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
+            UIView *label = MKGetCachedLabel(self);
+            if (label) {
+                label.hidden = NO;
+                label.alpha = 1.0f;
+                label.layer.opacity = 1.0f;
+                label.opaque = YES;
             }
-            if (label) { label.hidden = NO; label.alpha = 1.0f; label.layer.opacity = 1.0f; label.opaque = YES; }
             return;
         }
 
-        BOOL running     = MKIsAppRunning(bundleID);
+        // v1.5.3: 使用缓存的 bundleID（避免每次都调 applicationBundleID）
+        NSString *bundleID = MKGetCachedBid(self);
+        if (sScrolling) return;  // v1.6.52: 滚动中只让 MKGetCachedBid 清掉过期指示器，不重定位/创建
+        if (!bundleID || bundleID.length == 0) return;
+
+        BOOL running = MKIsAppRunning(bundleID);
         BOOL isForeground = MKIsForeground(bundleID);
-        BOOL isPending   = MKIsPending(bundleID);
-        BOOL isFading   = MKIsFadingLabel(bundleID);
+        BOOL isPending = MKIsPending(bundleID);       // v1.5.6+: 等待300ms的App
+        BOOL isFading = MKIsFadingLabel(bundleID);    // v1.5.8: 标签正在渐隐中
 
-        if (label) {
-            if (!sLabelRetryCount) sLabelRetryCount = [NSMutableDictionary dictionary];
-            [sLabelRetryCount removeObjectForKey:bundleID];
-        }
+        // v1.5.3: 使用缓存的标签视图（避免每次都跑 MKFindLabelView 4 重策略）
+        UIView *label = MKGetCachedLabel(self);
+        UIView *indicator = MKGetIndicator(self);
 
-        // ---- current bid should NOT show in our slot -> just detach (real exit handled by MKDestroyIndicatorForBid) ----
-        if (!running || isForeground || isFading || isPending) {
-            if (indicator) {
-                if (!running) {
-                    if (indicator.superview == hostView) [indicator removeFromSuperview];
-                    MKSetIndicator(self, nil);
-                } else {
-                    indicator.hidden = YES; // foreground / fading / pending: keep attached, just hide; reappears when backgrounded
-                }
+        // 当前被用户打开在前台的 App，桌面上不再显示指示器（避免启动动画残留）
+        if (!running || isForeground) {
+            // ── App 不在运行 / 在前台 → 移除指示器，恢复名字 ──
+            if (indicator) { [indicator removeFromSuperview]; MKSetIndicator(self, nil); }
+            if (label) {
+                label.hidden = NO;
+                label.alpha = 1.0f;
+                label.layer.opacity = 1.0f;
+                label.opaque = YES;
             }
-            if (label) { label.hidden = NO; label.alpha = 1.0f; label.layer.opacity = 1.0f; label.opaque = YES; }
-            if (!running) { MKRemovePending(bundleID); MKRemoveFadingLabel(bundleID); }
+            MKRemovePending(bundleID);  // v1.5.6+: 清除 pending 状态
+            MKRemoveFadingLabel(bundleID); // v1.5.8: 清除渐隐状态
             return;
         }
 
-        // ---- running (background) -> show THIS bid's indicator, re-parented into our slot ----
+        // v1.5.8: 标签正在渐隐中 → 不干扰动画，不创建指示器
+        // 让 250ms 渐隐动画自然播放，300ms后才创建指示器
+        if (isFading) {
+            return;  // 不做任何操作，让渐隐动画继续
+        }
+
+        // v1.5.6+: pending 期间只隐藏标签，不创建指示器（等300ms回调）
+        // 标签渐隐已完成（alpha=0），但仍需保持隐藏状态防止系统恢复
+        if (isPending) {
+            if (label) {
+                label.hidden = YES;
+                label.alpha = 0.0f;
+                label.layer.opacity = 0.0f;
+                label.opaque = NO;
+            }
+            return;  // 不创建指示器，等300ms后 MKRefreshIconForBundleID 回调
+        }
+
         RDLogRunning(bundleID);
-        if (label) { label.hidden = YES; label.alpha = 0.0f; label.layer.opacity = 0.0f; label.opaque = NO; }
-        else { if (sDebugLog) RDLog(@"NO LABEL for running app: %@", bundleID); }
 
+        // ── App 正在运行 → 隐藏名字，显示指示器 ──
+        if (label) {
+            label.hidden = YES;
+            label.alpha = 0.0f;
+            label.layer.opacity = 0.0f;
+            label.opaque = NO;
+        } else {
+            // v1.5.5 诊断：App 在运行但找不到标签
+            if (sDebugLog) RDLog(@"NO LABEL for running app: %@", bundleID);
+        }
+
+        // 指示器尺寸
         CGFloat indicatorW, indicatorH;
-        if (cfg.shape == MKShapeDot) { indicatorW = cfg.dotSize; indicatorH = cfg.dotSize; }
-        else { indicatorW = cfg.barWidth; indicatorH = cfg.barHeight; }
+        if (cfg.shape == MKShapeDot) {
+            indicatorW = cfg.dotSize;
+            indicatorH = cfg.dotSize;
+        } else {
+            // Bar/Pill 形状
+            indicatorW = cfg.barWidth;
+            indicatorH = cfg.barHeight;
+        }
 
-        // v1.6.49: 在 self.bounds 坐标系内定位（指示器是 self 的子视图）。
-        //   有标签 → 把标签中心经 convertPoint:fromView: 精确折算进 self 本地坐标
-        //   （名称相对图标的位置，与共享视图/滚动无关）；无标签（Dock 等）→ 落在 self 底部居中。
-        CGPoint indCenter = MKIndicatorCenterInSelf(self, label, indicatorW, indicatorH);
-        if (CGPointEqualToPoint(indCenter, CGPointZero)) return;
-        CGRect indicatorFrame = CGRectMake(
-            indCenter.x - indicatorW / 2.0f,
-            indCenter.y - indicatorH / 2.0f,
-            indicatorW, indicatorH);
+        // ── 决定宿主视图和位置 ──
+        UIView *hostView;
+        CGRect indicatorFrame;
+
+        if (label && label.superview) {
+            // 标签找到 → 指示器放在标签位置（替换名字）
+            hostView = label.superview;
+            CGRect labelFrame = label.frame;
+            indicatorFrame = CGRectMake(
+                labelFrame.origin.x + (labelFrame.size.width - indicatorW) / 2.0f,
+                labelFrame.origin.y + (labelFrame.size.height - indicatorH) / 2.0f,
+                indicatorW,
+                indicatorH
+            );
+        } else {
+            // v1.5.9: 无标签 → 估算标签位置（图标下方居中）
+            // 对于 Dock 图标：确实没有标签，估算位置跟之前差不多
+            // 对于系统 App（AppStore/Preferences）：标签不在视图层级中，但指示器应出现在名字区域
+            UIView *host = self.superview;
+            if (host) {
+                hostView = host;
+                CGRect iconFrame = self.frame;
+                CGFloat estimatedLabelY = iconFrame.origin.y + iconFrame.size.height + 4.0f;
+                CGFloat estimatedLabelH = 14.0f;
+                indicatorFrame = CGRectMake(
+                    iconFrame.origin.x + (iconFrame.size.width - indicatorW) / 2.0f,
+                    estimatedLabelY + (estimatedLabelH - indicatorH) / 2.0f,
+                    indicatorW,
+                    indicatorH
+                );
+            } else {
+                hostView = self;
+                CGSize mySize = self.bounds.size;
+                if (mySize.width < 10 || mySize.height < 10) return;
+                indicatorFrame = CGRectMake(
+                    (mySize.width - indicatorW) / 2.0f,
+                    mySize.height - indicatorH - 4.0f,
+                    indicatorW,
+                    indicatorH
+                );
+            }
+        }
+
+        // 宿主视图变了 → 需要重新添加指示器
+        if (indicator && indicator.superview != hostView) {
+            [indicator removeFromSuperview];
+            indicator = nil;
+            MKSetIndicator(self, nil);
+        }
 
         if (!indicator) {
-            // v1.6.39: create ONCE per bid, store in sIndicatorByBid; afterwards only re-parent -> zero rebuild/churn.
-            if (!sIndicatorByBid) sIndicatorByBid = [NSMutableDictionary dictionary];
             indicator = [[MKIndicatorDotView alloc] initWithFrame:indicatorFrame];
             indicator.tag = kDotTag;
             [(MKIndicatorDotView *)indicator applyConfig];
+
+            // v1.6.11: AutoIcon 模式 — 从图标取主色调作为指示器颜色
             if (cfg.colorMode == MKColorModeAutoIcon) {
                 UIColor *iconColor = MKCachedIconColorForBundleID(bundleID);
                 [(MKIndicatorDotView *)indicator setIndicatorColor:iconColor];
-                [indicator setNeedsDisplay];
+                [indicator setNeedsDisplay];  // 用新颜色重绘
             }
+
+            // v1.5.7: 渐显动画 — 状态切换时指示器 alpha 0→cfg.opacity 200ms
             BOOL shouldAnimate = MKShouldAnimateIndicator(bundleID);
-            MKRemoveAnimateIndicator(bundleID);
+            MKRemoveAnimateIndicator(bundleID);  // 消费标记（一次性）
+
+            // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             if (sDebugLog) RDLog(@"Indicator CREATE: %@ shape=%d animate=%d label=%@",
-                  bundleID, (int)cfg.shape, shouldAnimate, label ? @"YES" : @"NO(FALLBACK)");
-            [sIndicatorByBid setObject:indicator forKey:bundleID];
-            objc_setAssociatedObject(indicator, &kMKBidOfIndicatorKey, bundleID, OBJC_ASSOCIATION_COPY_NONATOMIC);
-            MKSetIndicator(self, indicator);
+                  bundleID, (int)cfg.shape, shouldAnimate,
+                  label ? @"YES" : @"NO(FALLBACK)");
+
             if (shouldAnimate) {
-                indicator.alpha = 0.0f;
+                indicator.alpha = 0.0f;  // 从不可见开始
                 [hostView addSubview:indicator];
-                [hostView bringSubviewToFront:indicator];
+                MKSetIndicator(self, indicator);
                 CGFloat finalAlpha = cfg.opacity;
-                if (sDebugLog) RDLog(@"Indicator FADE-IN: %@ alpha 0->%.2f", bundleID, finalAlpha);
-                [UIView animateWithDuration:0.2 animations:^{ indicator.alpha = finalAlpha; }];
+                if (sDebugLog) RDLog(@"Indicator FADE-IN: %@ alpha 0→%.2f", bundleID, finalAlpha);
+                [UIView animateWithDuration:0.2 animations:^{
+                    indicator.alpha = finalAlpha;
+                }];
             } else {
                 [hostView addSubview:indicator];
-                [hostView bringSubviewToFront:indicator];
+                MKSetIndicator(self, indicator);
             }
         } else {
-            // v1.6.39: already exists (same single indicator for this bid) -> only re-parent + reposition, no rebuild, no re-animate.
-            if (indicator.superview != hostView) {
-                [hostView addSubview:indicator]; // auto-detaches from the old slot
-                [hostView bringSubviewToFront:indicator];
-                if (sDebugLog) RDLog(@"Indicator REPARENT: %@ -> new slot", bundleID);
-            }
+            // v1.5.9: 只重定位指示器，不调用 applyConfig
+            // applyConfig 会设置 self.alpha = cfg.opacity，打断渐显动画
+            // 指示器外观只在创建时和配置变更时设置，layoutSubviews 不需要
             indicator.frame = indicatorFrame;
             indicator.hidden = NO;
-            MKSetIndicator(self, indicator);
         }
 
+        // v1.6.11: AutoIcon 主色调 —— 创建时上色；后续 layout 取色成功(或从绿兜底修正)时自动重绘
+        // 配合 MKCachedIconColorForBundleID 不缓存失败：首次取不到→绿兜底，下次取到真实色→这里自动更新
         if (cfg.colorMode == MKColorModeAutoIcon && indicator) {
             UIColor *iconColor = MKCachedIconColorForBundleID(bundleID);
             MKIndicatorDotView *dot = (MKIndicatorDotView *)indicator;
@@ -1361,24 +1243,6 @@ static void MKUpdate(SBIconView *self) {
             if (!cur || !CGColorEqualToColor(cur.CGColor, iconColor.CGColor)) {
                 [dot setIndicatorColor:iconColor];
                 [indicator setNeedsDisplay];
-            }
-        }
-
-        if (!label) {
-            if (!sLabelRetryCount) sLabelRetryCount = [NSMutableDictionary dictionary];
-            NSInteger tries = [sLabelRetryCount[bundleID] integerValue];
-            if (tries < 4) {
-                sLabelRetryCount[bundleID] = @(tries + 1);
-                NSArray *delays = @[@200, @600, @1200, @2000];
-                NSInteger d = [delays[MIN(tries, 3)] integerValue];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_MSEC)),
-                               dispatch_get_main_queue(), ^{
-                    if (MKIsAppRunning(bundleID) && !MKIsForeground(bundleID)) {
-                        MKUpdate(self);
-                    } else {
-                        [sLabelRetryCount removeObjectForKey:bundleID];
-                    }
-                });
             }
         }
     });
@@ -1473,24 +1337,6 @@ static void MKRefreshIconForBundleID(NSString *bid) {
             }
         }
     });
-}
-
-// v1.6.44: 统一的滚动开始检测入口。SBIconScrollView 的 delegate 钩子不一定被 SpringBoard 调到，
-//   因此也 hook setContentOffset: 系列，确保任何滚动/动画偏移都能置 sScrolling=YES。
-//   300ms 心跳：末次偏移事件后 300ms 清 sScrolling 并刷新图标。
-static void MKSetScrollingFlag(UIView *scrollView) {
-    if (!sInitDone) return;
-    BOOL wasScrolling = sScrolling;
-    sScrolling = YES;
-    if (sDebugLog && !wasScrolling) RDLog(@"PAGE SCROLL: scrolling started");
-    if (sScrollStopBlock) dispatch_block_cancel(sScrollStopBlock);
-    sScrollStopBlock = dispatch_block_create(0, ^{
-        if (sDebugLog) RDLog(@"PAGE SCROLL: scrolling stopped (300ms idle)");
-        sScrolling = NO;
-        MKRefreshSubviews(scrollView);
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)),
-                   dispatch_get_main_queue(), sScrollStopBlock);
 }
 
 // ====================================================================
@@ -1655,81 +1501,13 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
             }
         });
     } else {
-        // v1.6.39: App exited -> destroy the indicator for real (scroll/recycle only detaches)
-        MKDestroyIndicatorForBid(bid);
-        MKRemovePending(bid);     // clear pending state
+        // ── App 退出 → 立即移除指示器 + 恢复标签 ──
+        MKRemovePending(bid);     // 清除 pending 状态
         MKRemoveFadingLabel(bid); // v1.5.8: 清除渐隐状态
         dispatch_async(dispatch_get_main_queue(), ^{
             MKRefreshIconForBundleID(bid);
         });
     }
-}
-
-// ====================================================================
-// v1.6.33: 自愈 —— 定期清除 stale running set 误报（对应问题③）
-// 现象：App 被系统杀（内存压力等）但退出通知/状态回调未送达本插件，
-//   running set 残留 → 桌面仍显示指示器，但点击 App 是冷启动（需重载）。
-// 这是 iOS 进程状态事件可能丢通知的机制限制，无法 100% 杜绝；
-// 此自愈作为缓解：周期性用 SBApplicationController.runningApplications 的
-//   实时 processState 交叉校验，把"集合里有、但系统已确认进程不在跑"的条目清掉。
-// ====================================================================
-static void MKScheduleSelfHeal(void);  // 前向声明（递归调度）
-
-static void MKSelfHealRunningSet(void) {
-    if (!sInitDone || MKIsDisabled()) return;
-    @try {
-        id appCtrl = [SBApplicationController sharedInstance];
-        if (!appCtrl) return;
-        SEL runningSel = NSSelectorFromString(@"runningApplications");
-        if (![appCtrl respondsToSelector:runningSel]) return;
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        NSArray *runningApps = [appCtrl performSelector:runningSel];
-#pragma clang diagnostic pop
-        if (!runningApps) return;
-
-        // 构建"当前确实活着"的 bundleID 集合（用 processState 权威校验，而非仅名单成员）
-        NSMutableSet *aliveBids = [NSMutableSet set];
-        Class sbAppCls = NSClassFromString(@"SBApplication");
-        for (id app in runningApps) {
-            if (![app isKindOfClass:sbAppCls]) continue;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            id ps = [app performSelector:NSSelectorFromString(@"processState")];
-            NSString *bid = [app performSelector:NSSelectorFromString(@"bundleIdentifier")];
-#pragma clang diagnostic pop
-            BOOL alive = YES;
-            if (ps) {
-                BOOL isRunning = MKGetBoolFromState(ps, @"isRunning");
-                int taskState = MKGetIntFromState(ps, @"taskState");
-                alive = (isRunning || taskState == 2 || taskState == 3);
-            }
-            if (bid.length && alive) [aliveBids addObject:bid];
-        }
-
-        // 交叉校验：集合里的条目若既不在 alive 集合、又非前台（前台一定活着）→ 视为 stale，清除
-        for (NSString *bid in [sRunningSet copy]) {
-            if ([aliveBids containsObject:bid]) continue;
-            if (MKIsForeground(bid)) continue;     // 前台 App 必然活着，不被误清
-            MKSetForeground(bid, NO);              // 同步清前台标记（防退出通知也丢时前台位残留）
-            MKRemoveFromRunningSet(bid);
-            if (sDebugLog) RDLog(@"SELF-HEAL: removed stale running entry %@", bid);
-            MKOnStateChange(bid, NO, NO);         // 刷新图标：移除残留指示器、恢复名字
-        }
-    } @catch (NSException *e) {
-        RDLog(@"SELF-HEAL EXCEPTION: %@", e.reason);
-    }
-}
-
-// v1.6.33: 每 25 秒递归调度一次自愈（不阻塞、轻量；仅对集合中少数 App 做交叉校验）
-static void MKScheduleSelfHeal(void) {
-    if (!sInitDone) return;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        MKSelfHealRunningSet();
-        MKScheduleSelfHeal();
-    });
 }
 
 // ====================================================================
@@ -1762,9 +1540,6 @@ static void MKDelayedInit() {
 
     // ─── 首次刷新所有图标 ──────
     MKRefreshAllIcons();
-
-    // v1.6.33: 启动 stale running set 自愈定时器（每 25 秒交叉校验，缓解问题③）
-    MKScheduleSelfHeal();
 }
 
 static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observer,
@@ -1821,31 +1596,10 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     %orig;
     if (!sInitDone) return;
 
-    // v1.6.42: same recycle guard as MKUpdate (see MKSlotTransitioning).
-    if (MKSlotTransitioning(self)) return;
-
-    // v1.6.43: 同 MKUpdate 的滚动隐藏守卫。
-    if (sScrolling) {
-        UIView *ind = MKGetIndicator(self);
-        if (ind) ind.hidden = YES;
-        return;
-    }
+    if (sScrolling) return;  // v1.6.52: 滚动中不重定位/创建，避免 churn
 
     // v1.5.3 性能优化：快速跳过不需要处理的图标
     UIView *indicator = MKGetIndicator(self);
-    // v1.6.39: stale detection -- after an instance is recycled to another app, the cached
-    //   indicator may belong to a different bid. If so, detach it from our slot and clear the
-    //   cache; let the logic below re-evaluate for the current bid.
-    {
-        NSString *lsBid = MKGetCachedBid(self);
-        UIView *lsBidInd = (sIndicatorByBid ? sIndicatorByBid[lsBid] : nil);
-        if (indicator && indicator != lsBidInd) {
-            UIView *host = (UIView *)self;
-            if (indicator.superview == host) [indicator removeFromSuperview];
-            MKSetIndicator(self, nil);
-            indicator = nil;
-        }
-    }
     if (!indicator || (indicator && indicator.superview == nil)) {
         // v1.6.28: 孤儿自愈 —— 指示器被 SpringBoard 在重布局时从宿主移除
         // （SBIconView 对象仍在，关联对象仍指向这个 superview=nil 的不可见视图）。
@@ -1883,23 +1637,19 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         return;
     }
 
-
     // v1.5.8: 标签正在渐隐 → 只重定位指示器，不操作标签（让动画自然播放）
     if (MKIsFadingLabel(bid)) {
-        if (indicator) {
-            // v1.6.50: 渐隐期间只重定位，锚点与 MKUpdate 一致。
+        UIView *label = MKGetCachedLabel(self);
+        if (indicator && label && label.superview) {
+            CGRect lf = label.frame;
             CGFloat indW, indH;
             MKConfig *cfg = [MKConfig sharedConfig];
             if (cfg.shape == MKShapeDot) { indW = cfg.dotSize; indH = cfg.dotSize; }
             else { indW = cfg.barWidth; indH = cfg.barHeight; }
-            UIView *label = MKGetCachedLabel(self);
-            CGPoint indCenter = MKIndicatorCenterInSelf(self, label, indW, indH);
-            if (!CGPointEqualToPoint(indCenter, CGPointZero)) {
-                indicator.frame = CGRectMake(
-                    indCenter.x - indW / 2.0f,
-                    indCenter.y - indH / 2.0f,
-                    indW, indH);
-            }
+            indicator.frame = CGRectMake(
+                lf.origin.x + (lf.size.width - indW) / 2.0f,
+                lf.origin.y + (lf.size.height - indH) / 2.0f,
+                indW, indH);
         }
         return;
     }
@@ -1917,25 +1667,32 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         indH = cfg.barHeight;
     }
 
-    // v1.6.50: 标签只用于「隐藏名称」，定位锚点与 MKUpdate 一致。
     UIView *label = MKGetCachedLabel(self);
-    if (label) {
+    if (label && label.superview) {
         // 重新强制隐藏标签（防止系统 layout 恢复）
         label.hidden = YES;
         label.alpha = 0.0f;
         label.layer.opacity = 0.0f;
         label.opaque = NO;
-    }
-    if (indicator) {
-        [(UIView *)self setClipsToBounds:NO]; // 允许指示器绘制到 self bounds 外
-        CGPoint indCenter = MKIndicatorCenterInSelf(self, label, indW, indH);
-        if (!CGPointEqualToPoint(indCenter, CGPointZero)) {
-            indicator.frame = CGRectMake(
-                indCenter.x - indW / 2.0f,
-                indCenter.y - indH / 2.0f,
-                indW, indH
-            );
-        }
+        // 标签找到 → 指示器在标签中心
+        CGRect lf = label.frame;
+        indicator.frame = CGRectMake(
+            lf.origin.x + (lf.size.width - indW) / 2.0f,
+            lf.origin.y + (lf.size.height - indH) / 2.0f,
+            indW, indH
+        );
+    } else if (self.superview) {
+        // v1.5.9: 无标签 → 估算标签位置（图标下方居中，替代图标底部边缘）
+        // 对于非 Dock 的系统 App（AppStore/Preferences 等），标签可能不在视图层级中
+        // 但指示器应该出现在名字标签应该出现的位置，而不是图标底部
+        CGRect icf = self.frame;
+        CGFloat estimatedLabelY = icf.origin.y + icf.size.height + 4.0f;  // 图标下方4pt间隙
+        CGFloat estimatedLabelH = 14.0f;  // iOS 标签典型高度
+        indicator.frame = CGRectMake(
+            icf.origin.x + (icf.size.width - indW) / 2.0f,
+            estimatedLabelY + (estimatedLabelH - indH) / 2.0f,
+            indW, indH
+        );
     }
 }
 
@@ -2014,6 +1771,16 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     }
 }
 
+- (void)setContentOffset:(CGPoint)offset {
+    %orig;
+    MKMarkScrolling((UIView *)self);
+}
+
+- (void)setContentOffset:(CGPoint)offset animated:(BOOL)animated {
+    %orig;
+    MKMarkScrolling((UIView *)self);
+}
+
 - (void)scrollViewDidEndScrollingAnimation:(id)scrollView {
     %orig;
     if (sInitDone) {
@@ -2030,29 +1797,6 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     }
 }
 
-// v1.6.44: 滚动期间隐藏指示器（根治翻页粘错）。
-//   v1.6.43 只 hook scrollView delegate 方法，但实测 SpringBoard paging 时这些 delegate
-//   方法未必被调到（指示器在滚动中仍被重父化）。这里同时 hook setContentOffset: 系列，
-//   任何内容偏移（拖动/减速/动画）都会置 sScrolling=YES，300ms 心跳后刷新。
-- (void)scrollViewWillBeginDragging:(id)scrollView {
-    %orig;
-    MKSetScrollingFlag((UIView *)self);
-}
-
-- (void)scrollViewDidScroll:(id)scrollView {
-    %orig;
-    MKSetScrollingFlag((UIView *)self);
-}
-
-- (void)setContentOffset:(CGPoint)offset {
-    %orig;
-    MKSetScrollingFlag((UIView *)self);
-}
-
-- (void)setContentOffset:(CGPoint)offset animated:(BOOL)animated {
-    %orig;
-    MKSetScrollingFlag((UIView *)self);
-}
 %end
 
 // ====================================================================
@@ -2218,21 +1962,8 @@ static BOOL MKIsSupportedOS(void) {
     %init;
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
-    NSLog(@"[RunningDotIndicator] v1.6.51 ctor: indicator stays attached to SBIconView (hostView=self). Label search now walks up the ancestor chain with estimated icon-bottom anchor, fixing the v1.6.50 'other apps no indicator / label not found' issue. When no label is found (Dock/transient), the indicator falls back to just below the estimated icon bottom instead of the bottom of self.bounds. Recycle guard + scroll-hide unchanged.");
-
-    // v1.6.37: 根除问题①(churn) + 问题②的瞬时部分。
-    //   根因(rd_log(66) 确证)：iOS 的 SBIconView.icon 在布局/滚动/角标刷新等过渡期，会瞬时返回
-    //     别的 App 的 icon 对象(指针不同 + applicationBundleID 返回别的 bid)。旧 MKGetCachedBid 的
-    //     图标复用检测把这种"duti 变成别的 App"误判 → removeFromSuperview + MKSetIndicator(iv,nil)
-    //     → 下一轮 MKUpdate 发现 !indicator → 重建 Indicator CREATE(animate=0)。
-    //     rd_log(66) 共 92 次 CREATE、79 次是 animate=0，且 RUNNING SET 仅 +8/-2(运行集稳定)
-    //     → 证明不是运行集移除、也不是指针误判(1.6.35 已改 bid 比较仍抖)，而是"瞬时 bid 翻转"误杀。
-    //   修复：MKGetCachedBid 用"待定 bid 去抖"——同一新 bid 连续 2 次调用都出现才确认是真回收
-    //     (采用新 bid、清标签缓存，随后由 MKUpdate 的 !running 分支按新 bid 自然清理)；
-    //     本轮看到不同 newBid 时只记为待定、仍返回旧 bid，让 MKUpdate 按稳定 bid 操作(保留指示器)。
-    //     对"仍在运行 App"的瞬时翻转零误杀 → churn 根除。FALLBACK(问题②)的瞬时部分随之消失
-    //     (不再因误杀后建于 label 未挂上的瞬间而落 fallback)；仅 Dock 等无独立标签视图的 App
-    //     仍有 fallback，属该环境已知限制(标签视图确不在层级中)。
+    NSLog(@"[RunningDotIndicator] v1.6.30 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible");
+    RDLog(@"======== v1.6.52 loading (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
