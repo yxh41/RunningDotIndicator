@@ -1268,47 +1268,31 @@ static void MKUpdate(SBIconView *self) {
         }
 
         // ── 决定宿主视图和位置 ──
-        UIView *hostView;
+        UIView *hostView = (UIView *)self;  // v1.6.62: 锚定到 SBIconView 自身
         CGRect indicatorFrame;
+        self.clipsToBounds = NO;  // 允许指示器在图标下方超出 SBIconView bounds 显示
 
         if (label && label.superview) {
-            // 标签找到 → 指示器放在标签位置（替换名字）
-            hostView = label.superview;
-            CGRect labelFrame = label.frame;
+            // 标签在 label.superview 坐标系中；将其转换到 SBIconView 自身坐标系，
+            // 这样无论标签真实父视图是 SBIconListView/SBFTouchPassThroughView/Wrapper，
+            // 指示器在 self 中的相对位置都正确。
+            CGRect labelFrameInSelf = [self convertRect:label.frame fromView:label.superview];
             indicatorFrame = CGRectMake(
-                labelFrame.origin.x + (labelFrame.size.width - indicatorW) / 2.0f,
-                labelFrame.origin.y + (labelFrame.size.height - indicatorH) / 2.0f,
+                labelFrameInSelf.origin.x + (labelFrameInSelf.size.width - indicatorW) / 2.0f,
+                labelFrameInSelf.origin.y + (labelFrameInSelf.size.height - indicatorH) / 2.0f,
                 indicatorW,
                 indicatorH
             );
         } else {
-            // v1.6.54: 稳健 fallback —— 把图标折算到"标签所在层"(SBIconListView 类)，
-            // 落在图标正下方的名称区域；并关闭该层裁剪，避免被裁掉。
-            // 旧版挂 self.superview(wrapper) + 估算坐标：wrapper 尺寸=图标尺寸、祖先仍可能裁 → 圆点看不到。
-            UIView *listView = nil;
-            UIView *p = self.superview;
-            while (p) {
-                NSString *pc = NSStringFromClass([p class]);
-                if ([pc containsString:@"IconListView"] ||
-                    [pc containsString:@"IconListPageContent"] ||
-                    [pc containsString:@"ListContentView"] ||
-                    [pc containsString:@"HomeScreen"]) {
-                    listView = p; break;
-                }
-                p = p.superview;
-            }
-            UIView *host = listView ?: self.superview;
-            if (!host) host = self;
-            host.clipsToBounds = NO;
-            CGRect iconRect = [self convertRect:self.bounds toView:host];
-            CGFloat labelY = iconRect.origin.y + iconRect.size.height + 4.0f;
+            // 无标签（如 Dock 图标）→ 放在图标正下方，self 坐标系
+            CGRect iconBounds = self.bounds;
+            CGFloat labelY = iconBounds.origin.y + iconBounds.size.height + 4.0f;
             indicatorFrame = CGRectMake(
-                iconRect.origin.x + (iconRect.size.width - indicatorW) / 2.0f,
+                iconBounds.origin.x + (iconBounds.size.width - indicatorW) / 2.0f,
                 labelY + (14.0f - indicatorH) / 2.0f,
                 indicatorW,
                 indicatorH
             );
-            hostView = host;
         }
 
         // 宿主视图变了 → 需要重新添加指示器
@@ -1337,7 +1321,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.61: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.62: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -1790,7 +1774,8 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     if (MKIsFadingLabel(bid)) {
         UIView *label = MKGetCachedLabel(self);
         if (indicator && label && label.superview) {
-            CGRect lf = label.frame;
+            // v1.6.62: 用 convertRect 转换到 self 坐标系，确保指示器锚定跟随 SBIconView
+            CGRect lf = [self convertRect:label.frame fromView:label.superview];
             CGFloat indW, indH;
             MKConfig *cfg = [MKConfig sharedConfig];
             if (cfg.shape == MKShapeDot) { indW = cfg.dotSize; indH = cfg.dotSize; }
@@ -1823,22 +1808,23 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         label.alpha = 0.0f;
         label.layer.opacity = 0.0f;
         label.opaque = NO;
-        // 标签找到 → 指示器在标签中心
-        CGRect lf = label.frame;
+        // v1.6.62: 标签在 label.superview 坐标系；转换到 SBIconView 自身坐标系，
+        // 保证指示器作为 self 的子视图时位置正确。
+        CGRect lf = [self convertRect:label.frame fromView:label.superview];
         indicator.frame = CGRectMake(
             lf.origin.x + (lf.size.width - indW) / 2.0f,
             lf.origin.y + (lf.size.height - indH) / 2.0f,
             indW, indH
         );
-    } else if (self.superview) {
-        // v1.5.9: 无标签 → 估算标签位置（图标下方居中，替代图标底部边缘）
+    } else {
+        // v1.5.9: 无标签 → 估算标签位置（图标下方居中），self 坐标系
         // 对于非 Dock 的系统 App（AppStore/Preferences 等），标签可能不在视图层级中
         // 但指示器应该出现在名字标签应该出现的位置，而不是图标底部
-        CGRect icf = self.frame;
-        CGFloat estimatedLabelY = icf.origin.y + icf.size.height + 4.0f;  // 图标下方4pt间隙
+        CGRect iconBounds = self.bounds;
+        CGFloat estimatedLabelY = iconBounds.origin.y + iconBounds.size.height + 4.0f;  // 图标下方4pt间隙
         CGFloat estimatedLabelH = 14.0f;  // iOS 标签典型高度
         indicator.frame = CGRectMake(
-            icf.origin.x + (icf.size.width - indW) / 2.0f,
+            iconBounds.origin.x + (iconBounds.size.width - indW) / 2.0f,
             estimatedLabelY + (estimatedLabelH - indH) / 2.0f,
             indW, indH
         );
