@@ -239,7 +239,7 @@ static BOOL MKIsFolderIcon(SBIconView *iv) {
     NSString *cls = NSStringFromClass([icon class]);
     static NSMutableSet *sFolderIconLog;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ sFolderIconLog = [NSMutableSet new]; });
+    dispatch_once(&once, ^{ RDLog(@"RDBREAD: once sFolderIconLog"); sFolderIconLog = [NSMutableSet new]; });
     if (sDebugLog && cls.length) {
         if (![sFolderIconLog containsObject:cls]) {
             [sFolderIconLog addObject:cls];
@@ -555,6 +555,7 @@ static void MKScheduleUnlock(void) {
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
         DISPATCH_TIME_FOREVER, 0);
     dispatch_source_set_event_handler(sUnlockTimer, ^{
+        RDLog(@"RDBREAD: UNLOCK timer fired");
         @try {
             if (sUnlockTimer) { dispatch_source_cancel(sUnlockTimer); sUnlockTimer = NULL; }
             if (!sLocked) return;
@@ -641,6 +642,7 @@ static NSString *MKGetCachedBid(SBIconView *iv) {
     static Class sIconFolderIconClass = Nil;
     static dispatch_once_t sFolderClsOnce;
     dispatch_once(&sFolderClsOnce, ^{
+        RDLog(@"RDBREAD: once sFolderClsOnce");
         sFolderIconClass     = NSClassFromString(@"SBFolderIcon");
         sIconFolderIconClass = NSClassFromString(@"SBIconFolderIcon");
     });
@@ -1673,6 +1675,7 @@ static void MKHookOneLabelClass(Class cls) {
 static void MKInstallLabelHook(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
+        RDLog(@"RDBREAD: once MKInstallLabelHook");
         @try {
             if (!sHiddenBids) sHiddenBids = [NSMutableSet set];
             // 候选标签类：覆盖 iOS 16.x 各子类名变体
@@ -1858,7 +1861,7 @@ static void MKUpdate(SBIconView *self) {
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:fBid];
                 if (sHiddenBids) [sHiddenBids addObject:fBid]; // v1.6.85: 文件夹合成 key 也要藏名
-                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.88: %@ rep=%@ mode=%ld fixed=%d", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor);
+                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.89: %@ rep=%@ mode=%ld fixed=%d", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor);
             } else {
                 if (indicator.superview != overlay) {
                     [indicator removeFromSuperview];
@@ -1917,7 +1920,7 @@ static void MKUpdate(SBIconView *self) {
         if (sScrolling && !isInFolder) {
             if (sDebugLog) {
                 static NSMutableSet *sGateScroll; static dispatch_once_t sOnceS;
-                dispatch_once(&sOnceS, ^{ sGateScroll = [NSMutableSet new]; });
+                dispatch_once(&sOnceS, ^{ RDLog(@"RDBREAD: once sGateScroll"); sGateScroll = [NSMutableSet new]; });
                 NSString *k = bundleID ? bundleID : NSStringFromClass([self class]);
                 if (![sGateScroll containsObject:k]) { [sGateScroll addObject:k]; RDLog(@"RDGATE %@ ret=scroll", k); }
             }
@@ -1958,7 +1961,7 @@ static void MKUpdate(SBIconView *self) {
         if (!bundleID || bundleID.length == 0) {
             if (sDebugLog) {
                 static NSMutableSet *sGateBid; static dispatch_once_t sOnceB;
-                dispatch_once(&sOnceB, ^{ sGateBid = [NSMutableSet new]; });
+                dispatch_once(&sOnceB, ^{ RDLog(@"RDBREAD: once sGateBid"); sGateBid = [NSMutableSet new]; });
                 NSString *k = NSStringFromClass([self class]);
                 if (![sGateBid containsObject:k]) { [sGateBid addObject:k]; RDLog(@"RDGATE %@ ret=nobid", k); }
             }
@@ -2074,7 +2077,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.88: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.89: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -2147,6 +2150,7 @@ static Class MKSBIconViewClass(void) {
     static Class c = Nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
+        RDLog(@"RDBREAD: once MKSBIconViewClass");
         c = NSClassFromString(@"SBIconView");
     });
     return c;
