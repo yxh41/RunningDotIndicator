@@ -129,6 +129,13 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
     return 0;
 }
 
+// v1.6.86: 文件夹图标「优先最近消息/活动 App」总开关，默认开
+- (BOOL)folderLatestMsgPriority {
+    id v = _prefs[@"folderLatestMsgPriority"];
+    if ([v isKindOfClass:[NSNumber class]]) return [v boolValue];
+    return YES;
+}
+
 + (UIColor *)colorFromHex:(NSString *)hex {
     if (![hex isKindOfClass:[NSString class]] || ![hex length]) {
         return [UIColor systemGreenColor];

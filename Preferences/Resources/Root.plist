@@ -10,7 +10,7 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>RunningDotIndicator 1.6.85</string>
+			<string>RunningDotIndicator 1.6.86</string>
 			<key>footerText</key>
 			<string>为运行中的 App 图标添加指示器。App 运行时自动替换图标下方的名称文字，退出后恢复原名称。支持系统：iOS 16.x（roothide / rootless）；iOS 15 及更低不挂钩。</string>
 		</dict>
@@ -286,7 +286,7 @@
 		<key>label</key>
 		<string>文件夹图标</string>
 		<key>footerText</key>
-		<string>控制桌面/Dock 上的文件夹图标是否显示指示器：里面任意 App 在后台运行时，文件夹图标显示 1 个指示器。指示器颜色按下方「指示器取哪个 App 主色」挑选里面某个 App 的主色；颜色模式为「固定颜色」时该策略自动按排序靠前处理。里面运行的 App 各自仍显示自己的指示器（主功能不变）。v1.6.85 起：文件夹图标优先展示文件夹内最近有活动/消息的 App 作为代表（替代原排序靠前/角标最多）。</string>
+		<string>控制桌面/Dock 上的文件夹图标是否显示指示器：里面任意 App 在后台运行时，文件夹图标显示 1 个指示器。指示器颜色按下方「指示器取哪个 App 主色」挑选里面某个 App 的主色；颜色模式为「固定颜色」时该策略自动按排序靠前处理。里面运行的 App 各自仍显示自己的指示器（主功能不变）。v1.6.86 起可由「优先展示最近消息的 App」开关控制：开启时文件夹图标优先展示最近有活动/消息的 App 作为代表（替代原排序靠前/角标最多）。</string>
 	</dict>
 
 	<dict>
@@ -325,6 +325,23 @@
 		</array>
 		<key>label</key>
 		<string>指示器取哪个 App 主色</string>
+		<key>PostNotification</key>
+		<string>com.mk.runningdotindicator.reload</string>
+	</dict>
+
+	<dict>
+		<key>cell</key>
+		<string>PSSwitchCell</string>
+		<key>default</key>
+		<true/>
+		<key>defaults</key>
+		<string>com.mk.runningdotindicatorprefs</string>
+		<key>key</key>
+		<string>folderLatestMsgPriority</string>
+		<key>label</key>
+		<string>优先展示最近消息的 App</string>
+		<key>footerText</key>
+		<string>开启后，文件夹图标优先取文件夹内「最近被打开/切到前台/收到消息」的后台运行 App 作为代表（替代原排序靠前/角标最多）。关闭则按上方「指示器取哪个 App 主色」策略。</string>
 		<key>PostNotification</key>
 		<string>com.mk.runningdotindicator.reload</string>
 	</dict>
