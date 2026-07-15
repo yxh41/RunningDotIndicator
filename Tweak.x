@@ -1612,7 +1612,9 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
             c = class_getSuperclass(c);
         }
     }
-    if (orig) {
+    // v1.6.88: 终防自递归/坏 orig —— 若继承链查表误把 hook 自身当 orig 捕回（未来回归），
+    // 调用它会无限递归直至栈爆崩；这里硬拒 hook 自身，物理上杜绝该类崩溃。
+    if (orig && orig != (void(*)(id,SEL,BOOL))MKSetHiddenHook) {
         @try { orig(self, _cmd, hidden); }
         @catch (NSException *e) { RDLog(@"MKSetHiddenHook orig EXCEPTION: %@", e.reason); }
     }
@@ -1633,7 +1635,8 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
             c = class_getSuperclass(c);
         }
     }
-    if (orig) {
+    // v1.6.88: 终防自递归/坏 orig（见 MKSetHiddenHook 注释）
+    if (orig && orig != (void(*)(id,SEL,CGFloat))MKSetAlphaHook) {
         @try { orig(self, _cmd, a); }
         @catch (NSException *e) { RDLog(@"MKSetAlphaHook orig EXCEPTION: %@", e.reason); }
     }
@@ -1855,7 +1858,7 @@ static void MKUpdate(SBIconView *self) {
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:fBid];
                 if (sHiddenBids) [sHiddenBids addObject:fBid]; // v1.6.85: 文件夹合成 key 也要藏名
-                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.86: %@ rep=%@ mode=%ld fixed=%d", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor);
+                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.88: %@ rep=%@ mode=%ld fixed=%d", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor);
             } else {
                 if (indicator.superview != overlay) {
                     [indicator removeFromSuperview];
@@ -2071,7 +2074,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.86: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.88: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
