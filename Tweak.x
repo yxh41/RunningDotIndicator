@@ -1672,11 +1672,21 @@ static void MKHookOneLabelClass(Class cls) {
     }
 }
 
-// v1.6.90: 用 runtime C 函数替代 [sub isSubclassOfClass:c] 选择子发送。
-// 启动 15s(MKDelayedInit) 时全局类表可能含半初始化/悬垂 Class，
+// v1.6.91: 安全判断 sub 是否为 c 的子类，且【完全不发 selector】。
+// 启动 15s(MKDelayedInit) 时 objc_getClassList 返回的全局类表可能含半初始化/悬垂 Class，
 // 对其发 isSubclassOfClass: 会走 ___forwarding___ 硬陷阱(SIGTRAP) → 安全模式。
-// class_isSubclassOfClass 是 C 直接调用，不发 selector，不可能 forwarding。
-OBJC_EXTERN BOOL class_isSubclassOfClass(Class cls, Class other);
+// class_isSubclassOfClass() 在构建 SDK 的 stub 中未导出（链接报 undefined symbol），
+// 故改用 class_getSuperclass() 沿继承链逐层 C 指针比较：直接读 superclass 字段，
+// 不经过 objc_msgSend / forwarding，对任何 Class 指针都安全，且 100% 存在于 SDK stub。
+static BOOL MKClassIsSubclass(Class sub, Class c) {
+    if (!sub || !c) return NO;
+    Class cur = sub;
+    while (cur) {
+        if (cur == c) return YES;
+        cur = class_getSuperclass(cur);
+    }
+    return NO;
+}
 static void MKInstallLabelHook(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -1703,8 +1713,8 @@ static void MKInstallLabelHook(void) {
                         for (int i = 0; i < n; i++) {
                             Class sub = buf[i];
                             if (class_isMetaClass(sub)) continue;
-                            // v1.6.90: 用 runtime C 函数替代 selector 发送，杜绝 ___forwarding___ 硬陷阱
-                            if (class_isSubclassOfClass(sub, c)) [toHook addObject:NSStringFromClass(sub)];
+                            // v1.6.91: 用 MKClassIsSubclass 走 superclass 指针比较，杜绝 ___forwarding___ 硬陷阱
+                            if (MKClassIsSubclass(sub, c)) [toHook addObject:NSStringFromClass(sub)];
                         }
                         free(buf);
                     }
@@ -1867,7 +1877,7 @@ static void MKUpdate(SBIconView *self) {
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:fBid];
                 if (sHiddenBids) [sHiddenBids addObject:fBid]; // v1.6.85: 文件夹合成 key 也要藏名
-                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.90: %@ rep=%@ mode=%ld fixed=%d", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor);
+                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.91: %@ rep=%@ mode=%ld fixed=%d", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor);
             } else {
                 if (indicator.superview != overlay) {
                     [indicator removeFromSuperview];
@@ -2083,7 +2093,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.90: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.91: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -3101,7 +3111,7 @@ static void MKRefreshFolderIcons(void) {
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
     NSLog(@"[RunningDotIndicator] v1.6.30 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible");
-    RDLog(@"======== RDBUILD v1.6.90 (v1.6.90: label swizzle now hooks ONLY override classes + superclass-chain orig lookup + @try around orig()/unlock-timer; kills unlock safe-mode from corrupted orig map; source-level label hook (SBIconListLabel setHidden:/setAlpha: swizzle) supersedes layoutSubviews alpha=0 -> kills name+dot overlap race AND folder-close name flash; folder-icon indicator now prefers latest-msg app (MKTouchMsg+MKFolderChosenBid); previous: proactive label-hide in SBIconView layoutSubviews: unconditionally hide icon name when this bid has an indicator, placed right after %%orig before any branch/return, closing the race window that caused occasional name+dot overlap; v1.6.83 label-overlap fix: scroll-layout keeps any indicator-bearing icon's label hidden via indicator-present check, covering folder-container icons whose bid is not an app; SBIconView didMoveToWindow(nil) no longer restores label while an indicator exists, killing the in-folder app name flash on folder close; v1.6.81 perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped; v1.6.83 folder refresh-storm fix: FICON branch skips expensive recompute when sFolderContentGen unchanged (reuse kMKFIconGenKey), cheap reposition only); v1.6.90 CRASH-FIX: MKInstallLabelHook delayed-init dispatch_once now uses class_isSubclassOfClass() C runtime call instead of [sub isSubclassOfClass:c] selector send -> removes the ___forwarding___ hard-trap (SIGTRAP) safe-mode that fired ~15s after every reboot during delayed init (proven via rd_log(44) breadcrumb: last line before death was RDBREAD: once MKInstallLabelHook) ========");
+    RDLog(@"======== RDBUILD v1.6.91 (v1.6.91: label swizzle now hooks ONLY override classes + superclass-chain orig lookup + @try around orig()/unlock-timer; kills unlock safe-mode from corrupted orig map; source-level label hook (SBIconListLabel setHidden:/setAlpha: swizzle) supersedes layoutSubviews alpha=0 -> kills name+dot overlap race AND folder-close name flash; folder-icon indicator now prefers latest-msg app (MKTouchMsg+MKFolderChosenBid); previous: proactive label-hide in SBIconView layoutSubviews: unconditionally hide icon name when this bid has an indicator, placed right after %%orig before any branch/return, closing the race window that caused occasional name+dot overlap; v1.6.83 label-overlap fix: scroll-layout keeps any indicator-bearing icon's label hidden via indicator-present check, covering folder-container icons whose bid is not an app; SBIconView didMoveToWindow(nil) no longer restores label while an indicator exists, killing the in-folder app name flash on folder close; v1.6.81 perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped; v1.6.83 folder refresh-storm fix: FICON branch skips expensive recompute when sFolderContentGen unchanged (reuse kMKFIconGenKey), cheap reposition only); v1.6.90 CRASH-FIX: MKInstallLabelHook delayed-init dispatch_once now uses class_isSubclassOfClass() C runtime call instead of [sub isSubclassOfClass:c] selector send -> removes the ___forwarding___ hard-trap (SIGTRAP) safe-mode that fired ~15s after every reboot during delayed init (proven via rd_log(44) breadcrumb: last line before death was RDBREAD: once MKInstallLabelHook) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
