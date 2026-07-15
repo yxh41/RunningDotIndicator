@@ -177,6 +177,19 @@ static char kMKFIconGenKey;    // v1.6.76: 该缓存的代际（sFolderContentGe
 static NSUInteger sFolderContentGen = 0; // v1.6.76: 文件夹内容代际；App 运行态变化时 +1 使缓存失效
 static NSMutableDictionary<NSNumber*, NSArray<NSString*>*> *sFolderVisualOrder = nil; // v1.6.81: 文件夹内图标视觉顺序
 
+// v1.6.85: 「本 bid 有指示器 → 名字必须隐藏」的源头级强制。
+// 以往所有藏名都在分支内/事后（layoutSubviews / MKUpdate 各路径），系统布局或转场
+// 动画会在我们的藏名之后把 label 复显一帧 → 名字与圆点偶发重叠；且 v1.6.84 的
+// 主动式堵窗对关闭文件夹时系统「名字 pop」动画产生 alpha 冲突 → 桌面上运行中 App 名称闪一下。
+// 改在标签自身的 setHidden:/setAlpha: 上 hook：凡是当前有指示器的 bid，无论系统怎么
+// 复显都强制隐藏 → 空档彻底归零，重叠与关闭闪现一并根除。
+static NSMutableSet<NSString*> *sHiddenBids = nil;          // 当前「有指示器、名字必须隐藏」的 bid（含文件夹合成 key __folder__%p）
+static NSMutableDictionary<NSString*, NSNumber*> *sLastMsgTime = nil; // v1.6.85: 各 App「最近活动/消息」时间戳，供文件夹图标指示器选代表 App
+// 前向声明（定义见文件后部）
+static NSString *MKLabelToBid(UIView *label);
+static void MKInstallLabelHook(void);
+static void MKTouchMsg(NSString *bid);
+
 // v1.6.75: 锁屏后兜底「解锁复原」定时器句柄（不依赖 iOS 解锁通知/布局事件）
 static dispatch_source_t sUnlockTimer = NULL;
 
@@ -274,12 +287,14 @@ static void MKRemoveIndicatorForBid(NSString *bid) {
         objc_setAssociatedObject(ind, &kMKIndicatorContainerKey, nil, OBJC_ASSOCIATION_ASSIGN);
     }
     if (sBidToIndicator) [sBidToIndicator removeObjectForKey:bid];
+    if (sHiddenBids) [sHiddenBids removeObject:bid]; // v1.6.85: 名字恢复前置清除
 }
 static void MKRemoveAllIndicators(void) {
     if (!sBidToIndicator) return;
     NSArray *all = [[sBidToIndicator objectEnumerator].allObjects copy];
     for (UIView *ind in all) { if (ind) [ind removeFromSuperview]; }
     [sBidToIndicator removeAllObjects];
+    if (sHiddenBids) [sHiddenBids removeAllObjects]; // v1.6.85: 全清
 }
 // v1.6.71: 改为隐藏/恢复所有 overlay（而非逐个 indicator）。
 // 锁屏时 overlay.hidden=YES 即隐藏其下全部指示器；解锁时 overlay.hidden=NO 立即全局恢复，
@@ -372,15 +387,28 @@ static NSInteger MKBadgeForBid(NSString *bid) {
 static NSString *MKFolderChosenBid(NSArray<NSString*> *bids, NSInteger mode, BOOL fixedColor) {
     if (!bids || bids.count == 0) return nil;
     if (bids.count == 1) return bids.firstObject;
+    // v1.6.85: 优先「最近有消息/活动」的 App —— 文件夹图标指示器展示
+    // 文件夹内最近被你打开/切前台/收到通知兜底的那个后台运行 App（latest-msg 代理）。
+    NSString *best = nil;
+    double bestT = -1.0;
+    for (NSString *b in bids) {
+        double t = (sLastMsgTime && sLastMsgTime[b]) ? [sLastMsgTime[b] doubleValue] : 0.0;
+        if (t > bestT) { bestT = t; best = b; }
+    }
+    if (best && bestT > 0.0) {
+        if (sDebugLog) RDLog(@"FICON-CHOSEN latest-msg bid=%@ t=%.0f (mode=%ld tiebreak)", best, bestT, (long)mode);
+        return best;
+    }
+    // 兜底：无任何时间戳时退回原 mode 逻辑（排序靠前 / 角标最多）
     NSInteger pick = fixedColor ? 0 : mode; // 固定颜色退化为「排序靠前」
     if (pick == 1) {
-        NSString *best = bids.firstObject;
-        NSInteger bestB = MKBadgeForBid(best);
+        NSString *best2 = bids.firstObject;
+        NSInteger bestB = MKBadgeForBid(best2);
         for (NSString *b in bids) {
             NSInteger n = MKBadgeForBid(b);
-            if (n > bestB) { best = b; bestB = n; }
+            if (n > bestB) { best2 = b; bestB = n; }
         }
-        return best;
+        return best2;
     }
     return bids.firstObject; // 排序靠前 = 数组第一个
 }
@@ -1504,6 +1532,100 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
 // 主更新函数
 // ====================================================================
 
+// ====================================================================
+// v1.6.85: 标签隐藏不变量「本 bid 有指示器 → 名字必须隐藏」的源头级强制。
+// 拦截 SBIconListLabel 的 setHidden:/setAlpha:：凡本 bid 当前有指示器，
+// 无论系统（布局/转场/关闭文件夹的 pop 动画）怎么复显名字，都强制隐藏 →
+// 空档彻底归零。重叠 race 与「关闭文件夹名称闪一下」一并根除，且不和 alpha 动画打架。
+// 仅在 SBIconListLabel 类上 hook（图标名字标签），指示器自身(MKIndicatorDotView)不受影响。
+// ====================================================================
+static NSString *MKLabelToBid(UIView *label) {
+    if (!label) return nil;
+    Class ivCls = MKSBIconViewClass();
+    // 策略1：同 wrapper 下的兄弟 SBIconView（iOS16 中 label 与 SBIconView 同挂一个 wrapper 下）
+    UIView *p = label.superview;
+    if (p && ivCls) {
+        for (UIView *s in p.subviews) {
+            if ([s isKindOfClass:ivCls]) {
+                SBIconView *iv = (SBIconView *)s;
+                if (MKIsFolderIcon(iv)) {
+                    id fIcon = [iv icon];
+                    if (fIcon) return [NSString stringWithFormat:@"__folder__%p", fIcon];
+                }
+                NSString *b = MKGetCachedBid(iv);
+                if (b.length) return b;
+            }
+        }
+    }
+    // 策略2：沿祖先链向上找 SBIconView（极少数层级差异时兜底）
+    UIView *a = label;
+    while (a) {
+        if (ivCls && [a isKindOfClass:ivCls]) {
+            SBIconView *iv = (SBIconView *)a;
+            if (MKIsFolderIcon(iv)) {
+                id fIcon = [iv icon];
+                if (fIcon) return [NSString stringWithFormat:@"__folder__%p", fIcon];
+            }
+            NSString *b = MKGetCachedBid(iv);
+            if (b.length) return b;
+        }
+        a = a.superview;
+    }
+    return nil;
+}
+
+static void (*sOrigSetHidden)(id, SEL, BOOL) = NULL;
+static void (*sOrigSetAlpha)(id, SEL, CGFloat) = NULL;
+
+static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
+    @try {
+        NSString *bid = MKLabelToBid((UIView *)self);
+        if (bid && sHiddenBids && [sHiddenBids containsObject:bid]) {
+            sOrigSetHidden(self, _cmd, YES);
+            return;
+        }
+    } @catch (NSException *e) {}
+    sOrigSetHidden(self, _cmd, hidden);
+}
+static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
+    @try {
+        NSString *bid = MKLabelToBid((UIView *)self);
+        if (bid && sHiddenBids && [sHiddenBids containsObject:bid]) {
+            sOrigSetAlpha(self, _cmd, 0.0f);
+            return;
+        }
+    } @catch (NSException *e) {}
+    sOrigSetAlpha(self, _cmd, a);
+}
+static void MKInstallLabelHook(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (!sHiddenBids) sHiddenBids = [NSMutableSet set];
+        Class lbl = NSClassFromString(@"SBIconListLabel");
+        if (!lbl) lbl = NSClassFromString(@"SBIconLabelView");
+        if (!lbl) return;
+        Method m1 = class_getInstanceMethod(lbl, @selector(setHidden:));
+        Method m2 = class_getInstanceMethod(lbl, @selector(setAlpha:));
+        if (m1) {
+            sOrigSetHidden = (void(*)(id,SEL,BOOL))method_getImplementation(m1);
+            method_setImplementation(m1, (IMP)MKSetHiddenHook);
+        }
+        if (m2) {
+            sOrigSetAlpha = (void(*)(id,SEL,CGFloat))method_getImplementation(m2);
+            method_setImplementation(m2, (IMP)MKSetAlphaHook);
+        }
+    });
+}
+// v1.6.85: 记录各 App「最近活动/消息」时间戳，供文件夹图标指示器挑代表 App 用。
+// 在三个 SBApplication 状态钩子里（进程状态变化）调用 —— 涵盖启动/切前台/退后台，
+// 即「最近被你打开/用过」的 App；对聊天类 App 约等于「最近来消息」。
+// 如需精确「未读消息」时间戳，可后续加 BBObserver 通知钩子（更高风险，本版先用活动代理）。
+static void MKTouchMsg(NSString *bid) {
+    if (!bid.length) return;
+    if (!sLastMsgTime) sLastMsgTime = [NSMutableDictionary dictionary];
+    sLastMsgTime[bid] = @([NSDate date].timeIntervalSince1970);
+}
+
 static void MKUpdate(SBIconView *self) {
     MKSafe(^{
         if (!sInitDone) return;
@@ -1643,7 +1765,8 @@ static void MKUpdate(SBIconView *self) {
                 [overlay addSubview:indicator];
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:fBid];
-                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.84: %@ rep=%@ mode=%ld fixed=%d", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor);
+                if (sHiddenBids) [sHiddenBids addObject:fBid]; // v1.6.85: 文件夹合成 key 也要藏名
+                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.85: %@ rep=%@ mode=%ld fixed=%d", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor);
             } else {
                 if (indicator.superview != overlay) {
                     [indicator removeFromSuperview];
@@ -1859,7 +1982,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.84: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.85: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -1868,6 +1991,7 @@ static void MKUpdate(SBIconView *self) {
                 [overlay addSubview:indicator];
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:bundleID];
+                if (sHiddenBids) [sHiddenBids addObject:bundleID]; // v1.6.85: 标记此 bid 名字必须隐藏
                 CGFloat finalAlpha = cfg.opacity;
                 if (sDebugLog) RDLog(@"Indicator FADE-IN: %@ alpha 0→%.2f", bundleID, finalAlpha);
                 [UIView animateWithDuration:0.2 animations:^{
@@ -1877,6 +2001,7 @@ static void MKUpdate(SBIconView *self) {
                 [overlay addSubview:indicator];
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:bundleID];
+                if (sHiddenBids) [sHiddenBids addObject:bundleID]; // v1.6.85: 标记此 bid 名字必须隐藏
             }
             [overlay bringSubviewToFront:indicator];  // v1.6.71: 确保指示器在文件夹 overlay 顶层（z-order）
             if (sDebugLog) RDLog(@"IND-OVERLAY bid=%@ container=%@ frame=%@ hidden=%d alpha=%.2f",
@@ -2304,6 +2429,10 @@ static void MKDelayedInit() {
     // ─── 步骤 1：系统黑名单 ──────
     MKInitBlacklist();
 
+    // ─── v1.6.85：源头级藏名 hook（SBIconListLabel setHidden:/setAlpha: swizzle）───
+    // 在 MKRefreshAllIcons 之前安装，确保首次刷新时藏名即生效。
+    MKInstallLabelHook();
+
     // ─── 步骤 2：路径缓存 ──────
     MKBuildPathCache();
 
@@ -2706,6 +2835,8 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
             isRunningNow = NO;
         }
 
+        // v1.6.85: 记录「最近活动/消息」时间戳，供文件夹图标指示器选代表 App
+        MKTouchMsg(bid);
         // v1.5.3: 定向+延迟刷新（替代 MKClearAllIndicators + MKRefreshAllIcons）
         MKOnStateChange(bid, isRunningNow, isForeground);
     } @catch (NSException *e) {
@@ -2750,6 +2881,8 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
             isRunningNow = NO;
         }
 
+        // v1.6.85: 记录「最近活动/消息」时间戳，供文件夹图标指示器选代表 App
+        MKTouchMsg(bid);
         // v1.5.3: 定向+延迟刷新（替代 MKClearAllIndicators + MKRefreshAllIcons）
         MKOnStateChange(bid, isRunningNow, isForeground);
     } @catch (NSException *e) {
@@ -2788,6 +2921,8 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
             isRunningNow = NO;
         }
 
+        // v1.6.85: 记录「最近活动/消息」时间戳，供文件夹图标指示器选代表 App
+        MKTouchMsg(bid);
         // v1.5.3: 定向+延迟刷新（替代 MKClearAllIndicators + MKRefreshAllIcons）
         BOOL isFg = (state == 2);
         MKOnStateChange(bid, isRunningNow, isFg);
@@ -2860,7 +2995,7 @@ static void MKRefreshFolderIcons(void) {
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
     NSLog(@"[RunningDotIndicator] v1.6.30 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible");
-    RDLog(@"======== RDBUILD v1.6.84 (proactive label-hide in SBIconView layoutSubviews: unconditionally hide icon name when this bid has an indicator, placed right after %%orig before any branch/return, closing the race window that caused occasional name+dot overlap; v1.6.83 label-overlap fix: scroll-layout keeps any indicator-bearing icon's label hidden via indicator-present check, covering folder-container icons whose bid is not an app; SBIconView didMoveToWindow(nil) no longer restores label while an indicator exists, killing the in-folder app name flash on folder close; v1.6.81 perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped; v1.6.83 folder refresh-storm fix: FICON branch skips expensive recompute when sFolderContentGen unchanged (reuse kMKFIconGenKey), cheap reposition only) ========");
+    RDLog(@"======== RDBUILD v1.6.85 (source-level label hook (SBIconListLabel setHidden:/setAlpha: swizzle) supersedes layoutSubviews alpha=0 -> kills name+dot overlap race AND folder-close name flash; folder-icon indicator now prefers latest-msg app (MKTouchMsg+MKFolderChosenBid); previous: proactive label-hide in SBIconView layoutSubviews: unconditionally hide icon name when this bid has an indicator, placed right after %%orig before any branch/return, closing the race window that caused occasional name+dot overlap; v1.6.83 label-overlap fix: scroll-layout keeps any indicator-bearing icon's label hidden via indicator-present check, covering folder-container icons whose bid is not an app; SBIconView didMoveToWindow(nil) no longer restores label while an indicator exists, killing the in-folder app name flash on folder close; v1.6.81 perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped; v1.6.83 folder refresh-storm fix: FICON branch skips expensive recompute when sFolderContentGen unchanged (reuse kMKFIconGenKey), cheap reposition only) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
