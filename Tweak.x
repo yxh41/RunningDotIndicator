@@ -223,6 +223,15 @@ static BOOL MKIsFolderIcon(SBIconView *iv) {
     id icon = [iv icon];
     if (!icon) return NO;
     NSString *cls = NSStringFromClass([icon class]);
+    if (sDebugLog && cls.length) {
+        static NSMutableSet *sFolderIconLog;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{ sFolderIconLog = [NSMutableSet new]; });
+        if (![sFolderIconLog containsObject:cls]) {
+            [sFolderIconLog addObject:cls];
+            RDLog(@"FOLDER-ICON-CLS: %@", cls);
+        }
+    }
     return [cls isEqualToString:@"SBFolderIcon"] || [cls isEqualToString:@"SBIconFolderIcon"];
 }
 static UIView *MKOverlayForContainer(UIView *container) {
@@ -320,7 +329,7 @@ static BOOL       MKIsFolderIcon(SBIconView *iv);                              /
 static NSArray<NSString*> *MKContainedRunningBids(SBIconView *fiv);          // 取文件夹内后台运行 App
 static NSString *MKFolderChosenBid(NSArray<NSString*> *bids, NSInteger mode, BOOL fixedColor); // 选代表 App
 static void      MKRefreshFolderIcons(void);                              // 刷新所有文件夹图标
-static void      MKUpdateFolderIconsUnder(UIView *view, Class ivCls);        // 递归找文件夹图标
+static NSInteger  MKUpdateFolderIconsUnder(UIView *view, Class ivCls);        // 递归找文件夹图标
 
 // v1.6.75: 读取 App 角标数（消息数量近似）。
 // 用 NSInvocation 调 -[SBApplication badgeNumber]，避免 performSelector: 让 ARC 把
@@ -1554,7 +1563,7 @@ static void MKUpdate(SBIconView *self) {
                 [overlay addSubview:indicator];
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:fBid];
-                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.76: %@ rep=%@ mode=%ld fixed=%d", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor);
+                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.77: %@ rep=%@ mode=%ld fixed=%d", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor);
             } else {
                 if (indicator.superview != overlay) {
                     [indicator removeFromSuperview];
@@ -1578,6 +1587,7 @@ static void MKUpdate(SBIconView *self) {
         }
 
         if (sFolderOpen && !MKIsIconInFolder((UIView *)self)) {
+            if (sDebugLog) RDLog(@"MKU-FOLDER-GUARD skip bid=%@ (main-screen icon while folder open)", MKGetCachedBid(self));
             return;
         }
 
@@ -1767,7 +1777,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.76: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.77: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -1870,6 +1880,19 @@ static void MKRefreshSubviews(UIView *containerView) {
 static void MKRefreshAllIcons() {
     MKSafe(^{
         if (!sInitDone) return;
+        // v1.6.77: folder-open watchdog — if sFolderOpen=YES but no SBFolderView in window,
+        // reset it so main-screen icons are no longer skipped.
+        if (sFolderOpen) {
+            BOOL hasFolder = NO;
+            NSArray *wins = [UIApplication sharedApplication].windows;
+            for (UIWindow *w in wins) {
+                if (MKFindDescendantView(w, @"SBFolderView")) { hasFolder = YES; break; }
+            }
+            if (!hasFolder) {
+                sFolderOpen = NO;
+                if (sDebugLog) RDLog(@"FOLDER-WATCHDOG: reset sFolderOpen=NO (no SBFolderView in window)");
+            }
+        }
         NSArray *windows = [UIApplication sharedApplication].windows;
         for (UIWindow *window in windows) {
             NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
@@ -2112,9 +2135,12 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
             }
         });
     } else {
-        // ── App 退出 → 立即移除指示器 + 恢复标签 ──
-        MKRemovePending(bid);     // 清除 pending 状态
-        MKRemoveFadingLabel(bid); // v1.5.8: 清除渐隐状态
+        // App exit: remove indicator + restore label immediately
+        MKRemovePending(bid);
+        MKRemoveFadingLabel(bid);
+        // v1.6.77: direct overlay cleanup by bid (in case MKUpdate gates skip removal)
+        MKRemoveIndicatorForBid(bid);
+        MKRestoreLabelForBundleID(bid);
         dispatch_async(dispatch_get_main_queue(), ^{
             MKRefreshIconForBundleID(bid);
         });
@@ -2246,6 +2272,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     // （与 MKUpdate 同款守卫）。否则主屏实例把指示器重父回主屏 overlay
     // → 被文件夹盖住，造成"重开空位置 / 有些 App 没反应"。
     if (sFolderOpen && !MKIsIconInFolder((UIView *)self)) {
+        if (sDebugLog) RDLog(@"FOLDER-GUARD skip bid=%@ (main-screen icon while folder open)", MKGetCachedBid(self));
         return;
     }
 
@@ -2592,27 +2619,32 @@ static BOOL MKIsSupportedOS(void) {
 // v1.6.76: 刷新所有文件夹图标（桌面/Dock）。
 // 遍历主屏 SBIconScrollView 与 Dock（SBDockIconListView/SBDockView）子视图，
 // 对文件夹图标类实例调 MKUpdate，使里面 App 运行态变化时文件夹图标的圆点及时刷新。
-static void MKUpdateFolderIconsUnder(UIView *view, Class ivCls) {
+static NSInteger MKUpdateFolderIconsUnder(UIView *view, Class ivCls) {
+    NSInteger count = 0;
     for (UIView *v in view.subviews) {
         if ([v isKindOfClass:ivCls] && MKIsFolderIcon((SBIconView *)v)) {
             MKUpdate((SBIconView *)v);
+            count++;
         } else {
-            MKUpdateFolderIconsUnder(v, ivCls);
+            count += MKUpdateFolderIconsUnder(v, ivCls);
         }
     }
+    return count;
 }
 static void MKRefreshFolderIcons(void) {
     if (!sInitDone) return;
     MKSafe(^{
         Class ivCls = MKSBIconViewClass();
+        NSInteger total = 0;
         NSArray *wins = [UIApplication sharedApplication].windows;
         for (UIWindow *w in wins) {
             UIView *home = MKFindDescendantView(w, @"SBIconScrollView");
-            if (home) MKUpdateFolderIconsUnder(home, ivCls);
+            if (home) total += MKUpdateFolderIconsUnder(home, ivCls);
             UIView *dock = MKFindDescendantView(w, @"SBDockIconListView");
             if (!dock) dock = MKFindDescendantView(w, @"SBDockView");
-            if (dock) MKUpdateFolderIconsUnder(dock, ivCls);
+            if (dock) total += MKUpdateFolderIconsUnder(dock, ivCls);
         }
+        if (sDebugLog) RDLog(@"FOLDER-REFRESH: found %ld folder icon(s)", (long)total);
     });
 }
 
@@ -2629,7 +2661,7 @@ static void MKRefreshFolderIcons(void) {
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
     NSLog(@"[RunningDotIndicator] v1.6.30 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible");
-    RDLog(@"======== RDBUILD v1.6.57 (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped) ========");
+    RDLog(@"======== RDBUILD v1.6.77 (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
@@ -2669,6 +2701,18 @@ static void MKRefreshFolderIcons(void) {
         addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:[NSOperationQueue mainQueue]
         usingBlock:^(NSNotification *note){
             @try {
+                // v1.6.77: folder-open watchdog — reset stale sFolderOpen when becoming active
+                if (sFolderOpen) {
+                    BOOL hasFolder = NO;
+                    NSArray *wins = [UIApplication sharedApplication].windows;
+                    for (UIWindow *w in wins) {
+                        if (MKFindDescendantView(w, @"SBFolderView")) { hasFolder = YES; break; }
+                    }
+                    if (!hasFolder) {
+                        sFolderOpen = NO;
+                        if (sDebugLog) RDLog(@"FOLDER-WATCHDOG(active): reset sFolderOpen=NO");
+                    }
+                }
                 if (!sLocked) return;   // 非锁屏态（如普通切 App 回前台），不动
                 sLocked = NO;
                 // v1.6.74: 解锁用「全量重建」替代单纯 unhide overlay（见 MKUpdate 时间闸门注释）。
