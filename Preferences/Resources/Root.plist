@@ -10,7 +10,7 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>RunningDotIndicator 1.6.77</string>
+			<string>RunningDotIndicator 1.6.78</string>
 			<key>footerText</key>
 			<string>为运行中的 App 图标添加指示器。App 运行时自动替换图标下方的名称文字，退出后恢复原名称。支持系统：iOS 16.x（roothide / rootless）；iOS 15 及更低不挂钩。</string>
 		</dict>
@@ -286,7 +286,7 @@
 		<key>label</key>
 		<string>文件夹图标</string>
 		<key>footerText</key>
-		<string>控制桌面/Dock 上的文件夹图标是否显示指示器：里面任意 App 在后台运行时，文件夹图标显示 1 个圆点。圆点颜色按下方「圆点取哪个 App 主色」挑选里面某个 App 的主色；颜色模式为「固定颜色」时该策略自动按排序靠前处理。里面运行的 App 各自仍显示自己的圆点（主功能不变）。</string>
+		<string>控制桌面/Dock 上的文件夹图标是否显示指示器：里面任意 App 在后台运行时，文件夹图标显示 1 个指示器。指示器颜色按下方「指示器取哪个 App 主色」挑选里面某个 App 的主色；颜色模式为「固定颜色」时该策略自动按排序靠前处理。里面运行的 App 各自仍显示自己的指示器（主功能不变）。</string>
 	</dict>
 
 	<dict>
@@ -324,7 +324,7 @@
 			<integer>1</integer>
 		</array>
 		<key>label</key>
-		<string>圆点取哪个 App 主色</string>
+		<string>指示器取哪个 App 主色</string>
 		<key>PostNotification</key>
 		<string>com.mk.runningdotindicator.reload</string>
 	</dict>
