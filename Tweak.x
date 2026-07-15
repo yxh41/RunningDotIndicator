@@ -175,6 +175,7 @@ static char kMKIndicatorContainerKey;    // 指示器记录的所属容器（仅
 static char kMKFIconBidsKey;  // v1.6.76: 文件夹图标缓存的「内部后台运行中 App」bid 数组
 static char kMKFIconGenKey;    // v1.6.76: 该缓存的代际（sFolderContentGen 变化时失效）
 static NSUInteger sFolderContentGen = 0; // v1.6.76: 文件夹内容代际；App 运行态变化时 +1 使缓存失效
+static NSMutableDictionary<NSNumber*, NSArray<NSString*>*> *sFolderVisualOrder = nil; // v1.6.81: 文件夹内图标视觉顺序
 
 // v1.6.75: 锁屏后兜底「解锁复原」定时器句柄（不依赖 iOS 解锁通知/布局事件）
 static dispatch_source_t sUnlockTimer = NULL;
@@ -384,6 +385,24 @@ static NSString *MKFolderChosenBid(NSArray<NSString*> *bids, NSInteger mode, BOO
     return bids.firstObject; // 排序靠前 = 数组第一个
 }
 
+// v1.6.81: 按文件夹内图标的视觉顺序对 running bids 排序，确保 folderIndicatorMode=0 的
+// 「排序靠前」真正对应用户在屏幕上看到的顺序，而不是内部模型/添加顺序。
+static void MKSortRunningBidsByVisualOrder(id folder, NSMutableArray<NSString*> *out) {
+    if (!folder || !out || out.count < 2) return;
+    NSNumber *key = @((NSUInteger)folder);
+    NSArray<NSString*> *visual = sFolderVisualOrder[key];
+    if (!visual || visual.count == 0) return;
+    NSMutableDictionary<NSString*, NSNumber*> *rank = [NSMutableDictionary dictionary];
+    for (NSInteger i = 0; i < (NSInteger)visual.count; i++) rank[visual[i]] = @(i);
+    [out sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        NSInteger ra = [rank objectForKey:a] ? [rank[a] integerValue] : NSIntegerMax;
+        NSInteger rb = [rank objectForKey:b] ? [rank[b] integerValue] : NSIntegerMax;
+        if (ra < rb) return NSOrderedAscending;
+        if (ra > rb) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+}
+
 // v1.6.76: 递归收集文件夹（含嵌套）内「后台运行中」App 的 bid（写入 out）。
 // 全程 @try + performSelector + NSClassFromString 防御私有 API（避免 -Werror/崩溃）。
 static void MKCollectRunningFromFolder(id folder, NSMutableArray<NSString*> *out) {
@@ -469,6 +488,8 @@ static NSArray<NSString*> *MKContainedRunningBids(SBIconView *fiv) {
     } @catch (NSException *e) {
         return out; // 部分结果兜底
     }
+    // v1.6.81: 按视觉顺序重排，让 folder 图标指示器颜色真正跟随用户排序
+    MKSortRunningBidsByVisualOrder(folder, out);
     objc_setAssociatedObject(fiv, &kMKFIconBidsKey, out, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(fiv, &kMKFIconGenKey, @(sFolderContentGen), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return out;
@@ -1600,7 +1621,7 @@ static void MKUpdate(SBIconView *self) {
                 [overlay addSubview:indicator];
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:fBid];
-                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.80: %@ rep=%@ mode=%ld fixed=%d", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor);
+                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.81: %@ rep=%@ mode=%ld fixed=%d", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor);
             } else {
                 if (indicator.superview != overlay) {
                     [indicator removeFromSuperview];
@@ -1650,11 +1671,13 @@ static void MKUpdate(SBIconView *self) {
         if (sDebugLog && running && !isForeground) {
             RDLog(@"MKU-bg bid=%@ scroll=%d hasInd=%d", bundleID, sScrolling, (int)!!existingIndicator);
         }
+        // v1.6.81: folder icons don't participate in scroll gate; opening animation is mis-detected as scrolling
+        BOOL isInFolder = MKIsIconInFolder((UIView *)self);
         // v1.6.70: 移除"文件夹打开期间一律显示名称并 return"的压制。
         // 现在文件夹内运行中 App 也要显示指示器（与主屏一致）：名称隐藏、指示器
         // 建在文件夹自己的 overlay 上（MKOverlayForContainer 按当前容器懒建）。
         // 非运行中 App 自然落到下方 !running 分支恢复名称。
-        if (sScrolling) {
+        if (sScrolling && !isInFolder) {
             if (sDebugLog) {
                 static NSMutableSet *sGateScroll; static dispatch_once_t sOnceS;
                 dispatch_once(&sOnceS, ^{ sGateScroll = [NSMutableSet new]; });
@@ -1814,7 +1837,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.80: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.81: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -1895,14 +1918,47 @@ static void MKRefreshSubviews(UIView *containerView) {
         if (!sInitDone || !containerView) return;
         NSMutableArray *stack = [NSMutableArray arrayWithArray:containerView.subviews];
         int refreshed = 0;
+        // v1.6.81: collect visual order of in-folder icons for folder indicator rep strategy
+        NSMutableDictionary<NSNumber*, NSMutableArray<NSDictionary*>*> *tmpVisual = [NSMutableDictionary dictionary];
         while (stack.count > 0) {
             UIView *v = [stack lastObject];
             [stack removeLastObject];
             if ([v isKindOfClass:MKSBIconViewClass()]) {
+                SBIconView *iv = (SBIconView *)v;
+                NSString *bid = MKGetCachedBid(iv);
+                id icon = [iv icon];
+                id fldr = nil;
+                if (icon && [icon respondsToSelector:NSSelectorFromString(@"folder")])
+                    fldr = [icon performSelector:NSSelectorFromString(@"folder")];
+                if (bid.length && fldr) {
+                    NSNumber *key = @((NSUInteger)fldr);
+                    NSMutableArray *arr = tmpVisual[key];
+                    if (!arr) { arr = [NSMutableArray array]; tmpVisual[key] = arr; }
+                    [arr addObject:@{@"bid": bid, @"y": @(v.frame.origin.y), @"x": @(v.frame.origin.x)}];
+                }
                 MKUpdate((SBIconView *)v);
                 refreshed++;
             }
             [stack addObjectsFromArray:v.subviews];
+        }
+        if (tmpVisual.count > 0) {
+            if (!sFolderVisualOrder) sFolderVisualOrder = [NSMutableDictionary dictionary];
+            for (NSNumber *key in tmpVisual) {
+                NSArray *arr = [tmpVisual[key] sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                    CGFloat ya = [a[@"y"] floatValue];
+                    CGFloat yb = [b[@"y"] floatValue];
+                    if (ya < yb) return NSOrderedAscending;
+                    if (ya > yb) return NSOrderedDescending;
+                    CGFloat xa = [a[@"x"] floatValue];
+                    CGFloat xb = [b[@"x"] floatValue];
+                    if (xa < xb) return NSOrderedAscending;
+                    if (xa > xb) return NSOrderedDescending;
+                    return NSOrderedSame;
+                }];
+                NSMutableArray *bids = [NSMutableArray arrayWithCapacity:arr.count];
+                for (NSDictionary *d in arr) [bids addObject:d[@"bid"]];
+                sFolderVisualOrder[key] = bids;
+            }
         }
         if (refreshed > 0 && sDebugLog) {
             RDLog(@"FOLDER REFRESH: refreshed %d icons inside container", refreshed);
@@ -1910,7 +1966,7 @@ static void MKRefreshSubviews(UIView *containerView) {
     });
 }
 
-// v1.6.80: clear pending/fading markers for in-folder running apps before refreshing.
+// v1.6.81: clear pending/fading markers for in-folder running apps before refreshing.
 // This eliminates the visible "blank then appears" delay when opening a folder.
 static void MKClearPendingInView(UIView *root) {
     if (!root) return;
@@ -2451,6 +2507,23 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     } else if (!me.window) {
         sFolderOpen = NO;
         if (sDebugLog) RDLog(@"FOLDER CLOSE: SBFolderView removed from window");
+        // v1.6.81: 动画关闭瞬间先把所有文件夹图标的 label 强制隐藏，防止系统把 label 复显一帧。
+        MKSafe(^{
+            Class ivCls = MKSBIconViewClass();
+            NSArray *wins = [UIApplication sharedApplication].windows;
+            for (UIWindow *w in wins) {
+                NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
+                while (stack.count > 0) {
+                    UIView *v = [stack lastObject];
+                    [stack removeLastObject];
+                    if ([v isKindOfClass:ivCls] && MKIsFolderIcon((SBIconView *)v)) {
+                        UIView *lbl = MKGetCachedLabel((SBIconView *)v);
+                        if (lbl) { lbl.hidden = YES; lbl.alpha = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO; }
+                    }
+                    [stack addObjectsFromArray:v.subviews];
+                }
+            }
+        });
         // v1.6.67: 关闭文件夹立即同步刷新主屏 —— 主屏图标重新可见后系统默认恢复 label 可见，
         // 若不立即重刷，运行 App 的名字会在文件夹缩回动画后才被我们藏回去，肉眼看到"闪一下"。
         // 先同步立即刷一次（动画期间就藏好），再异步补一次确保 layout 稳定后状态仍正确。
@@ -2701,6 +2774,9 @@ static NSInteger MKUpdateFolderIconsUnder(UIView *view, Class ivCls) {
 static void MKRefreshFolderIcons(void) {
     if (!sInitDone) return;
     MKSafe(^{
+        // v1.6.81: force contained-bids recalculation on every explicit folder refresh,
+        // so reordering / new running apps are reflected in folder icon indicator color.
+        sFolderContentGen++;
         Class ivCls = MKSBIconViewClass();
         NSInteger total = 0;
         NSArray *wins = [UIApplication sharedApplication].windows;
@@ -2728,7 +2804,7 @@ static void MKRefreshFolderIcons(void) {
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
     NSLog(@"[RunningDotIndicator] v1.6.30 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible");
-    RDLog(@"======== RDBUILD v1.6.80 (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped) ========");
+    RDLog(@"======== RDBUILD v1.6.81 (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
