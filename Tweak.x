@@ -474,10 +474,10 @@ static NSArray<NSString*> *MKContainedRunningBids(SBIconView *fiv) {
         return cached;
     }
     NSMutableArray *out = [NSMutableArray array];
+    id folder = nil;
     @try {
         id icon = [fiv icon];
         if (!icon) return @[];
-        id folder = nil;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
         if ([icon respondsToSelector:NSSelectorFromString(@"folder")])
@@ -1928,8 +1928,11 @@ static void MKRefreshSubviews(UIView *containerView) {
                 NSString *bid = MKGetCachedBid(iv);
                 id icon = [iv icon];
                 id fldr = nil;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
                 if (icon && [icon respondsToSelector:NSSelectorFromString(@"folder")])
                     fldr = [icon performSelector:NSSelectorFromString(@"folder")];
+#pragma clang diagnostic pop
                 if (bid.length && fldr) {
                     NSNumber *key = @((NSUInteger)fldr);
                     NSMutableArray *arr = tmpVisual[key];
