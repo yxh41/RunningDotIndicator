@@ -555,14 +555,18 @@ static void MKScheduleUnlock(void) {
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
         DISPATCH_TIME_FOREVER, 0);
     dispatch_source_set_event_handler(sUnlockTimer, ^{
-        if (sUnlockTimer) { dispatch_source_cancel(sUnlockTimer); sUnlockTimer = NULL; }
-        if (!sLocked) return;
-        NSTimeInterval now = [NSDate date].timeIntervalSince1970;
-        if (now - sLockAt < 0.7) return;  // 又有更新的锁屏，等下一轮
-        sLocked = NO;
-        MKSetAllIndicatorsHidden(NO);  // v1.6.75: 复原所有 overlay（之前只重建不 unhide，主屏/Dock 指示器解锁后永久不显）
-        MKRefreshAllIcons();
-        if (sDebugLog) RDLog(@"UNLOCK(timer): restored all indicators");
+        @try {
+            if (sUnlockTimer) { dispatch_source_cancel(sUnlockTimer); sUnlockTimer = NULL; }
+            if (!sLocked) return;
+            NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+            if (now - sLockAt < 0.7) return;  // 又有更新的锁屏，等下一轮
+            sLocked = NO;
+            MKSetAllIndicatorsHidden(NO);  // v1.6.75: 复原所有 overlay（之前只重建不 unhide，主屏/Dock 指示器解锁后永久不显）
+            MKRefreshAllIcons();
+            if (sDebugLog) RDLog(@"UNLOCK(timer): restored all indicators");
+        } @catch (NSException *e) {
+            RDLog(@"UNLOCK(timer) EXCEPTION: %@", e.reason);
+        }
     });
     dispatch_resume(sUnlockTimer);
 }
@@ -1600,10 +1604,18 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
     } @catch (NSException *e) {}
     void(*orig)(id,SEL,BOOL) = NULL;
     if (sOrigSetHiddenByClass) {
-        NSValue *v = [sOrigSetHiddenByClass objectForKey:NSStringFromClass(object_getClass(self))];
-        if (v) orig = (void(*)(id,SEL,BOOL))[v pointerValue];
+        // v1.6.87: 沿继承链向上查 orig（叶子类可能继承自已钩基类，本身无登记项）
+        Class c = object_getClass(self);
+        while (c) {
+            NSValue *v = [sOrigSetHiddenByClass objectForKey:NSStringFromClass(c)];
+            if (v) { orig = (void(*)(id,SEL,BOOL))[v pointerValue]; break; }
+            c = class_getSuperclass(c);
+        }
     }
-    if (orig) orig(self, _cmd, hidden);
+    if (orig) {
+        @try { orig(self, _cmd, hidden); }
+        @catch (NSException *e) { RDLog(@"MKSetHiddenHook orig EXCEPTION: %@", e.reason); }
+    }
 }
 static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
     @try {
@@ -1614,10 +1626,17 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
     } @catch (NSException *e) {}
     void(*orig)(id,SEL,CGFloat) = NULL;
     if (sOrigSetAlphaByClass) {
-        NSValue *v = [sOrigSetAlphaByClass objectForKey:NSStringFromClass(object_getClass(self))];
-        if (v) orig = (void(*)(id,SEL,CGFloat))[v pointerValue];
+        Class c = object_getClass(self);
+        while (c) {
+            NSValue *v = [sOrigSetAlphaByClass objectForKey:NSStringFromClass(c)];
+            if (v) { orig = (void(*)(id,SEL,CGFloat))[v pointerValue]; break; }
+            c = class_getSuperclass(c);
+        }
     }
-    if (orig) orig(self, _cmd, a);
+    if (orig) {
+        @try { orig(self, _cmd, a); }
+        @catch (NSException *e) { RDLog(@"MKSetAlphaHook orig EXCEPTION: %@", e.reason); }
+    }
 }
 
 static void MKHookOneLabelClass(Class cls) {
@@ -1628,14 +1647,20 @@ static void MKHookOneLabelClass(Class cls) {
         sOrigSetAlphaByClass  = [NSMutableDictionary dictionary];
     }
     if ([sOrigSetHiddenByClass objectForKey:k]) return; // 已钩，幂等
+    // v1.6.87: 仅当本类「真正重写」setHidden:/setAlpha: 才替换 IMP。
+    // 此前对任意（含继承来的）Method 都 method_setImplementation，会把基类 orig 捕成
+    // MKSetHiddenHook 自身 → 调用时死循环/向错误 self 发未识别 selector → 解锁安全模式。
+    Class sup = class_getSuperclass(cls);
     Method m1 = class_getInstanceMethod(cls, @selector(setHidden:));
     Method m2 = class_getInstanceMethod(cls, @selector(setAlpha:));
-    if (m1) {
+    Method supM1 = sup ? class_getInstanceMethod(sup, @selector(setHidden:)) : NULL;
+    Method supM2 = sup ? class_getInstanceMethod(sup, @selector(setAlpha:)) : NULL;
+    if (m1 && m1 != supM1 && method_getImplementation(m1) != (IMP)MKSetHiddenHook) {
         IMP orig = method_getImplementation(m1);
         [sOrigSetHiddenByClass setObject:[NSValue valueWithPointer:(void *)orig] forKey:k];
         method_setImplementation(m1, (IMP)MKSetHiddenHook);
     }
-    if (m2) {
+    if (m2 && m2 != supM2 && method_getImplementation(m2) != (IMP)MKSetAlphaHook) {
         IMP orig = method_getImplementation(m2);
         [sOrigSetAlphaByClass setObject:[NSValue valueWithPointer:(void *)orig] forKey:k];
         method_setImplementation(m2, (IMP)MKSetAlphaHook);
@@ -1645,35 +1670,39 @@ static void MKHookOneLabelClass(Class cls) {
 static void MKInstallLabelHook(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        if (!sHiddenBids) sHiddenBids = [NSMutableSet set];
-        // 候选标签类：覆盖 iOS 16.x 各子类名变体
-        NSArray *candidates = @[
-            @"SBIconLegibilityLabelView", // iOS 16.4.1 实测真实类（FICON-LABEL 日志证实）
-            @"SBIconListLabel",
-            @"SBIconLabelView"
-        ];
-        // 收集「候选类自身 + 其全部子类」去重后统一钩
-        NSMutableSet<NSString*> *toHook = [NSMutableSet set];
-        for (NSString *name in candidates) {
-            Class c = NSClassFromString(name);
-            if (!c) continue;
-            [toHook addObject:NSStringFromClass(c)];
-            int n = objc_getClassList(NULL, 0);
-            if (n > 0) {
-                Class *buf = (Class *)malloc(sizeof(Class) * n);
-                if (buf) {
-                    objc_getClassList(buf, n);
-                    for (int i = 0; i < n; i++) {
-                        Class sub = buf[i];
-                        if (class_isMetaClass(sub)) continue;
-                        if ([sub isSubclassOfClass:c]) [toHook addObject:NSStringFromClass(sub)];
+        @try {
+            if (!sHiddenBids) sHiddenBids = [NSMutableSet set];
+            // 候选标签类：覆盖 iOS 16.x 各子类名变体
+            NSArray *candidates = @[
+                @"SBIconLegibilityLabelView", // iOS 16.4.1 实测真实类（FICON-LABEL 日志证实）
+                @"SBIconListLabel",
+                @"SBIconLabelView"
+            ];
+            // 收集「候选类自身 + 其全部子类」去重后统一钩
+            NSMutableSet<NSString*> *toHook = [NSMutableSet set];
+            for (NSString *name in candidates) {
+                Class c = NSClassFromString(name);
+                if (!c) continue;
+                [toHook addObject:NSStringFromClass(c)];
+                int n = objc_getClassList(NULL, 0);
+                if (n > 0) {
+                    Class *buf = (Class *)malloc(sizeof(Class) * n);
+                    if (buf) {
+                        objc_getClassList(buf, n);
+                        for (int i = 0; i < n; i++) {
+                            Class sub = buf[i];
+                            if (class_isMetaClass(sub)) continue;
+                            if ([sub isSubclassOfClass:c]) [toHook addObject:NSStringFromClass(sub)];
+                        }
+                        free(buf);
                     }
-                    free(buf);
                 }
             }
+            for (NSString *cn in toHook) MKHookOneLabelClass(NSClassFromString(cn));
+            if (sDebugLog) RDLog(@"MKInstallLabelHook: hooked %lu label class(es)", (unsigned long)toHook.count);
+        } @catch (NSException *e) {
+            RDLog(@"MKInstallLabelHook EXCEPTION: %@", e.reason);
         }
-        for (NSString *cn in toHook) MKHookOneLabelClass(NSClassFromString(cn));
-        if (sDebugLog) RDLog(@"MKInstallLabelHook: hooked %lu label class(es)", (unsigned long)toHook.count);
     });
 }
 // v1.6.85: 记录各 App「最近活动/消息」时间戳，供文件夹图标指示器挑代表 App 用。
@@ -3059,7 +3088,7 @@ static void MKRefreshFolderIcons(void) {
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
     NSLog(@"[RunningDotIndicator] v1.6.30 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible");
-    RDLog(@"======== RDBUILD v1.6.86 (source-level label hook (SBIconListLabel setHidden:/setAlpha: swizzle) supersedes layoutSubviews alpha=0 -> kills name+dot overlap race AND folder-close name flash; folder-icon indicator now prefers latest-msg app (MKTouchMsg+MKFolderChosenBid); previous: proactive label-hide in SBIconView layoutSubviews: unconditionally hide icon name when this bid has an indicator, placed right after %%orig before any branch/return, closing the race window that caused occasional name+dot overlap; v1.6.83 label-overlap fix: scroll-layout keeps any indicator-bearing icon's label hidden via indicator-present check, covering folder-container icons whose bid is not an app; SBIconView didMoveToWindow(nil) no longer restores label while an indicator exists, killing the in-folder app name flash on folder close; v1.6.81 perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped; v1.6.83 folder refresh-storm fix: FICON branch skips expensive recompute when sFolderContentGen unchanged (reuse kMKFIconGenKey), cheap reposition only) ========");
+    RDLog(@"======== RDBUILD v1.6.87 (v1.6.87 CRASH-FIX: label swizzle now hooks ONLY override classes + superclass-chain orig lookup + @try around orig()/unlock-timer; kills unlock safe-mode from corrupted orig map; source-level label hook (SBIconListLabel setHidden:/setAlpha: swizzle) supersedes layoutSubviews alpha=0 -> kills name+dot overlap race AND folder-close name flash; folder-icon indicator now prefers latest-msg app (MKTouchMsg+MKFolderChosenBid); previous: proactive label-hide in SBIconView layoutSubviews: unconditionally hide icon name when this bid has an indicator, placed right after %%orig before any branch/return, closing the race window that caused occasional name+dot overlap; v1.6.83 label-overlap fix: scroll-layout keeps any indicator-bearing icon's label hidden via indicator-present check, covering folder-container icons whose bid is not an app; SBIconView didMoveToWindow(nil) no longer restores label while an indicator exists, killing the in-folder app name flash on folder close; v1.6.81 perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped; v1.6.83 folder refresh-storm fix: FICON branch skips expensive recompute when sFolderContentGen unchanged (reuse kMKFIconGenKey), cheap reposition only) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
