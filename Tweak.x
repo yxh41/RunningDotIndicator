@@ -184,6 +184,7 @@ static NSMutableDictionary<NSNumber*, NSArray<NSString*>*> *sFolderVisualOrder =
 // 改在标签自身的 setHidden:/setAlpha: 上 hook：凡是当前有指示器的 bid，无论系统怎么
 // 复显都强制隐藏 → 空档彻底归零，重叠与关闭闪现一并根除。
 static NSMutableSet<NSString*> *sHiddenBids = nil;          // 当前「有指示器、名字必须隐藏」的 bid（含文件夹合成 key __folder__%p）
+static void *kMKLabelBidKey = &kMKLabelBidKey;              // v1.6.93: label→bid 直接关联键（藏名时写入，显示名时清 nil）
 static NSMutableDictionary<NSString*, NSNumber*> *sLastMsgTime = nil; // v1.6.85: 各 App「最近活动/消息」时间戳，供文件夹图标指示器选代表 App
 // 前向声明（定义见文件后部）
 static NSString *MKLabelToBid(UIView *label);
@@ -1553,8 +1554,19 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
 // 「关闭文件夹名称闪一下」「文件夹缩小内层 App 名称闪现」一并根除，且不和 alpha 动画打架。
 // 指示器自身(MKIndicatorDotView)不受影响。
 // ====================================================================
+static void MKAssocLabelBid(UIView *label, NSString *bid) {
+    if (!label) return;
+    // v1.6.93: 藏名时把 bid 写到 label 自身；MKLabelToBid 优先采信，
+    // 使藏名与视图层级无关（文件夹开/合动画重组层级时不再失效 → 名称不再闪现/重叠）。
+    objc_setAssociatedObject(label, &kMKLabelBidKey, bid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 static NSString *MKLabelToBid(UIView *label) {
     if (!label) return nil;
+    // v1.6.93: 直接关联优先 —— 仅当该 bid 仍在 sHiddenBids（确有指示器需藏名）时采信，
+    // 避免 label 回收复用残留旧 bid 导致误藏。层级遍历仅作兜底。
+    NSString *direct = objc_getAssociatedObject(label, &kMKLabelBidKey);
+    if (direct.length && sHiddenBids && [sHiddenBids containsObject:direct]) return direct;
     Class ivCls = MKSBIconViewClass();
     // 策略1：同 wrapper 下的兄弟 SBIconView（iOS16 中 label 与 SBIconView 同挂一个 wrapper 下）
     UIView *p = label.superview;
@@ -1772,6 +1784,7 @@ static void MKUpdate(SBIconView *self) {
                 label.alpha = 1.0f;
                 label.layer.opacity = 1.0f;
                 label.opaque = YES;
+                MKAssocLabelBid(label, nil);
             }
             return;
         }
@@ -1785,6 +1798,7 @@ static void MKUpdate(SBIconView *self) {
                 label.alpha = 1.0f;
                 label.layer.opacity = 1.0f;
                 label.opaque = YES;
+                MKAssocLabelBid(label, nil);
             }
             return;
         }
@@ -1837,7 +1851,7 @@ static void MKUpdate(SBIconView *self) {
                     }
                     // 顺带加固 label 隐藏不变量（呼应 v1.6.82，防与圆点重叠）
                     UIView *lbl = MKGetCachedLabel((SBIconView *)self);
-                    if (lbl) { lbl.hidden = YES; lbl.alpha = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO; }
+                    if (lbl) { lbl.hidden = YES; lbl.alpha = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO; MKAssocLabelBid(lbl, fBid); }
                 }
                 if (sDebugLog) RDLog(@"FICON-SKIP bid=%@ gen=%lu (unchanged, cheap reposition)", fBid, (unsigned long)sFolderContentGen);
                 return;
@@ -1847,7 +1861,7 @@ static void MKUpdate(SBIconView *self) {
             if (contained.count == 0) {
                 if (sDebugLog) RDLog(@"FICON-ABORT bid=%@ reason=no-running-apps", fBid);
                 UIView *lbl = MKGetCachedLabel(self);
-                if (lbl) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; }
+                if (lbl) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; MKAssocLabelBid(lbl, nil); }
                 UIView *fi = MKFindIndicator(fBid);
                 if (fi) MKRemoveIndicatorForBid(fBid);
                 return;
@@ -1856,7 +1870,7 @@ static void MKUpdate(SBIconView *self) {
             if (!fCfg || !fCfg.folderIndicators) {
                 if (sDebugLog) RDLog(@"FICON-ABORT bid=%@ reason=folderIndicators-off", fBid);
                 UIView *lbl = MKGetCachedLabel(self);
-                if (lbl) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; }
+                if (lbl) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; MKAssocLabelBid(lbl, nil); }
                 UIView *fi = MKFindIndicator(fBid);
                 if (fi) MKRemoveIndicatorForBid(fBid);
                 return;
@@ -1866,7 +1880,7 @@ static void MKUpdate(SBIconView *self) {
             NSString *rep = MKFolderChosenBid(contained, fCfg.folderIndicatorMode, fixedColor);
             UIView *label = MKGetCachedLabel(self);
             if (sDebugLog) RDLog(@"FICON-LABEL bid=%@ label=%@ cls=%@ frame=%@", fBid, label ? @"YES" : @"NO", label ? NSStringFromClass([label class]) : @"-", label ? NSStringFromCGRect(label.frame) : @"-");
-            if (label) { label.hidden = YES; label.alpha = 0.0f; label.layer.opacity = 0.0f; label.opaque = NO; }
+            if (label) { label.hidden = YES; label.alpha = 0.0f; label.layer.opacity = 0.0f; label.opaque = NO; MKAssocLabelBid(label, fBid); }
             UIView *container = MKContainerForIconView((UIView *)self);
             UIView *overlay = MKOverlayForContainer(container);
             if (!overlay) {
@@ -1888,7 +1902,7 @@ static void MKUpdate(SBIconView *self) {
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:fBid];
                 if (sHiddenBids) [sHiddenBids addObject:fBid]; // v1.6.85: 文件夹合成 key 也要藏名
-                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.92: %@ rep=%@ mode=%ld fixed=%d container=%@ frame=%@", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor, fContainerCls, NSStringFromCGRect(indicatorFrame));
+                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.93: %@ rep=%@ mode=%ld fixed=%d container=%@ frame=%@", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor, fContainerCls, NSStringFromCGRect(indicatorFrame));
             } else {
                 if (indicator.superview != overlay) {
                     [indicator removeFromSuperview];
@@ -2023,6 +2037,7 @@ static void MKUpdate(SBIconView *self) {
                 label.alpha = 1.0f;
                 label.layer.opacity = 1.0f;
                 label.opaque = YES;
+                MKAssocLabelBid(label, nil);
             }
             MKRemovePending(bundleID);  // v1.5.6+: 清除 pending 状态
             MKRemoveFadingLabel(bundleID); // v1.5.8: 清除渐隐状态
@@ -2045,6 +2060,7 @@ static void MKUpdate(SBIconView *self) {
                 label.alpha = 0.0f;
                 label.layer.opacity = 0.0f;
                 label.opaque = NO;
+                MKAssocLabelBid(label, bundleID);
             }
             return;  // 不创建指示器，等300ms后 MKRefreshIconForBundleID 回调
         }
@@ -2052,12 +2068,13 @@ static void MKUpdate(SBIconView *self) {
         RDLogRunning(bundleID);
 
         // ── App 正在运行 → 隐藏名字，显示指示器 ──
-        if (label) {
-            label.hidden = YES;
-            label.alpha = 0.0f;
-            label.layer.opacity = 0.0f;
-            label.opaque = NO;
-        } else {
+            if (label) {
+                label.hidden = YES;
+                label.alpha = 0.0f;
+                label.layer.opacity = 0.0f;
+                label.opaque = NO;
+                MKAssocLabelBid(label, bundleID);
+            } else {
             // v1.5.5 诊断：App 在运行但找不到标签
             if (sDebugLog) RDLog(@"NO LABEL for running app: %@", bundleID);
         }
@@ -2104,7 +2121,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.92: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.93: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -2378,6 +2395,7 @@ static void MKFadeOutLabelForBundleID(NSString *bid) {
                                 // 渐隐完成 → 确保完全隐藏 + 清除渐隐标记
                                 label.hidden = YES;
                                 label.opaque = NO;
+                                MKAssocLabelBid(label, bid);
                                 MKRemoveFadingLabel(bid);
                             }];
                         }
@@ -2425,6 +2443,7 @@ static void MKRestoreLabelForBundleID(NSString *bid) {
                                 label.alpha = 1.0f;
                                 label.layer.opacity = 1.0f;
                                 label.opaque = YES;
+                                MKAssocLabelBid(label, nil);
                             }];
                         }
                     }
@@ -2618,6 +2637,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
                 label.alpha = 1.0f;
                 label.layer.opacity = 1.0f;
                 label.opaque = YES;
+                MKAssocLabelBid(label, nil);
             }
         }
         // 注意：保留 indicator（关联对象）+ kMKBidKey/kMKIconKey/kMKLabelKey 缓存
@@ -3122,7 +3142,7 @@ static void MKRefreshFolderIcons(void) {
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
     NSLog(@"[RunningDotIndicator] v1.6.30 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible");
-    RDLog(@"======== RDBUILD v1.6.92 (v1.6.92: label swizzle now hooks ONLY override classes + superclass-chain orig lookup + @try around orig()/unlock-timer; kills unlock safe-mode from corrupted orig map; source-level label hook (SBIconListLabel setHidden:/setAlpha: swizzle) supersedes layoutSubviews alpha=0 -> kills name+dot overlap race AND folder-close name flash; folder-icon indicator now prefers latest-msg app (MKTouchMsg+MKFolderChosenBid); previous: proactive label-hide in SBIconView layoutSubviews: unconditionally hide icon name when this bid has an indicator, placed right after %%orig before any branch/return, closing the race window that caused occasional name+dot overlap; v1.6.83 label-overlap fix: scroll-layout keeps any indicator-bearing icon's label hidden via indicator-present check, covering folder-container icons whose bid is not an app; SBIconView didMoveToWindow(nil) no longer restores label while an indicator exists, killing the in-folder app name flash on folder close; v1.6.81 perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped; v1.6.83 folder refresh-storm fix: FICON branch skips expensive recompute when sFolderContentGen unchanged (reuse kMKFIconGenKey), cheap reposition only); v1.6.90 CRASH-FIX: MKInstallLabelHook delayed-init dispatch_once now uses class_isSubclassOfClass() C runtime call instead of [sub isSubclassOfClass:c] selector send -> removes the ___forwarding___ hard-trap (SIGTRAP) safe-mode that fired ~15s after every reboot during delayed init (proven via rd_log(44) breadcrumb: last line before death was RDBREAD: once MKInstallLabelHook) ========");
+    RDLog(@"======== RDBUILD v1.6.93 (v1.6.93: label swizzle now hooks ONLY override classes + superclass-chain orig lookup + @try around orig()/unlock-timer; kills unlock safe-mode from corrupted orig map; source-level label hook (SBIconListLabel setHidden:/setAlpha: swizzle) supersedes layoutSubviews alpha=0 -> kills name+dot overlap race AND folder-close name flash; folder-icon indicator now prefers latest-msg app (MKTouchMsg+MKFolderChosenBid); previous: proactive label-hide in SBIconView layoutSubviews: unconditionally hide icon name when this bid has an indicator, placed right after %%orig before any branch/return, closing the race window that caused occasional name+dot overlap; v1.6.83 label-overlap fix: scroll-layout keeps any indicator-bearing icon's label hidden via indicator-present check, covering folder-container icons whose bid is not an app; SBIconView didMoveToWindow(nil) no longer restores label while an indicator exists, killing the in-folder app name flash on folder close; v1.6.81 perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped; v1.6.83 folder refresh-storm fix: FICON branch skips expensive recompute when sFolderContentGen unchanged (reuse kMKFIconGenKey), cheap reposition only); v1.6.90 CRASH-FIX: MKInstallLabelHook delayed-init dispatch_once now uses class_isSubclassOfClass() C runtime call instead of [sub isSubclassOfClass:c] selector send -> removes the ___forwarding___ hard-trap (SIGTRAP) safe-mode that fired ~15s after every reboot during delayed init (proven via rd_log(44) breadcrumb: last line before death was RDBREAD: once MKInstallLabelHook) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
