@@ -279,6 +279,12 @@ static UIView *MKFindIndicator(NSString *bid) {
     if (!bid || !sBidToIndicator) return nil;
     return [sBidToIndicator objectForKey:bid];
 }
+// v1.6.86: MKIsAppRunning/MKIsForeground 定义在文件后部(~1114/1130)。v1.6.86 在 MKRemoveIndicatorForBid
+// 提前调用了 MKIsAppRunning(下方 292 行) → 必须在使用点之前前置声明，否则隐式(非 static)声明与
+// 原 343 行 static 前向声明冲突 → -Werror 编译失败。
+static BOOL MKIsAppRunning(NSString *bundleID);   // App 是否运行中
+static BOOL MKIsForeground(NSString *bid);        // App 是否前台
+
 static void MKRemoveIndicatorForBid(NSString *bid) {
     if (!bid) return;
     UIView *ind = MKFindIndicator(bid);
@@ -338,10 +344,6 @@ static void MKRepositionIndicator(NSString *bid, SBIconView *iv, MKConfig *cfg) 
 
 // v1.6.75: 前向声明（MKFolderChosenBid 依赖，定义在文件后部）
 static NSString *MKGetCachedBid(SBIconView *iv);
-// v1.6.76: MKIsAppRunning/MKIsForeground 定义在 ~1013/1029，文件夹收集函数(373)先于定义调用，
-// 须在此前置声明（否则 390 行首次调用被视为隐式(非 static)声明，与 435 行 static 前向声明冲突 → -Werror 失败）。
-static BOOL       MKIsAppRunning(NSString *bundleID);                        // App 是否运行中
-static BOOL       MKIsForeground(NSString *bid);                            // App 是否前台
 // v1.6.76: 文件夹【图标】功能前向声明
 static BOOL       MKIsFolderIcon(SBIconView *iv);                              // 检测文件夹图标
 static NSArray<NSString*> *MKContainedRunningBids(SBIconView *fiv);          // 取文件夹内后台运行 App
