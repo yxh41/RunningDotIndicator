@@ -1621,7 +1621,7 @@ static void MKUpdate(SBIconView *self) {
                 [overlay addSubview:indicator];
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:fBid];
-                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.81: %@ rep=%@ mode=%ld fixed=%d", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor);
+                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.82: %@ rep=%@ mode=%ld fixed=%d", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor);
             } else {
                 if (indicator.superview != overlay) {
                     [indicator removeFromSuperview];
@@ -1837,7 +1837,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.81: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.82: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -2330,10 +2330,21 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         // 真正的图标回收（icon 指针变化）仍由 MKGetCachedBid 检测并清理，不影响正确性。
         UIView *label = MKGetCachedLabel(self);
         if (label) {
-            label.hidden = NO;
-            label.alpha = 1.0f;
-            label.layer.opacity = 1.0f;
-            label.opaque = YES;
+            // v1.6.82: 本 bid 当前仍有运行中指示器（名字本就被圆点替代）时，
+            // 不要在离屏时恢复名字——否则关文件夹动画期间 in-folder App 名字会闪一下。
+            // 图标再次出现在有效上下文（主屏运行中 / 重开文件夹）时由 MKUpdate 重新决断。
+            NSString *bid2 = MKGetCachedBid(self);
+            if (bid2 && MKFindIndicator(bid2)) {
+                label.hidden = YES;
+                label.alpha = 0.0f;
+                label.layer.opacity = 0.0f;
+                label.opaque = NO;
+            } else {
+                label.hidden = NO;
+                label.alpha = 1.0f;
+                label.layer.opacity = 1.0f;
+                label.opaque = YES;
+            }
         }
         // 注意：保留 indicator（关联对象）+ kMKBidKey/kMKIconKey/kMKLabelKey 缓存
         return;
@@ -2380,8 +2391,11 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
 
     // v1.6.67: 滚动期间不重定位/创建指示器（避免 churn），但必须保持 label 状态同步。
     // 若 App 后台运行且已有指示器，系统可能在滚动中恢复 label，导致"指示器与名称重叠"。
+    // v1.6.82: 通用不变量——只要本 bid 当前有指示器（圆点），名字必须隐藏，
+    // 否则滚动/转场布局把 label 复显会与圆点重叠。注意 folder 容器图标的 bid 是
+    // __folder__%p（非 App），MKIsAppRunning 恒为 NO，旧条件 running&&!fg 会漏藏它 → 改判 indicator。
     if (sScrolling) {
-        if (running && !isForeground && indicator) {
+        if (indicator) {
             UIView *label = MKGetCachedLabel(self);
             if (label && label.superview) {
                 label.hidden = YES;
@@ -2807,7 +2821,7 @@ static void MKRefreshFolderIcons(void) {
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
     NSLog(@"[RunningDotIndicator] v1.6.30 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible");
-    RDLog(@"======== RDBUILD v1.6.81 (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped) ========");
+    RDLog(@"======== RDBUILD v1.6.82 (label-overlap fix: scroll-layout keeps any indicator-bearing icon's label hidden via indicator-present check, covering folder-container icons whose bid is not an app; SBIconView didMoveToWindow(nil) no longer restores label while an indicator exists, killing the in-folder app name flash on folder close; v1.6.81 perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
