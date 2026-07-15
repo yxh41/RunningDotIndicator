@@ -360,8 +360,11 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
         bg.layer.shadowOffset  = CGSizeMake(0, 2.0f);
         bg.layer.shadowRadius  = 8.0f;
 
-        // 按 section 内位置决定圆角：首行只圆上角，末行只圆下角，中间行不圆角。
-        // 单行 group 则四角都圆。
+        // 按 section 内位置决定圆角：首行只圆上角，末行只圆下角，中间行不圆角，
+        // 这样多行分组的子设置拼成【同一张连续卡片】（整体性）。单行 group 则四角都圆。
+        // ⚠️ 旧代码此处有 `if (corners == 0) corners = UIRectCornerAllCorners;`
+        // 会把中间行也全圆角 → 中间行变成独立小卡片（如「文件夹图标」分组的中间分段控件），
+        // 与上下行断开、失去整体性。中间行 corners 必须保持 0（不圆角、与相邻行拼合）。
         UIRectCorner corners = 0;
         if (rows == 1 || isFirst) {
             corners |= UIRectCornerTopLeft | UIRectCornerTopRight;
@@ -369,7 +372,6 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
         if (rows == 1 || isLast) {
             corners |= UIRectCornerBottomLeft | UIRectCornerBottomRight;
         }
-        if (corners == 0) corners = UIRectCornerAllCorners;
 
         if (@available(iOS 11.0, *)) {
             bg.layer.maskedCorners = (CACornerMask)corners;
