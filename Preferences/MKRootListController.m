@@ -399,41 +399,8 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
         cell.textLabel.backgroundColor       = [UIColor clearColor];
         cell.detailTextLabel.backgroundColor = [UIColor clearColor];
 
-        // v1.6.75: 固定颜色模式下，文件夹显示方式行置灰（策略无意义）
-        @try {
-            if ([self respondsToSelector:@selector(specifierForIndexPath:)]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                id sp = [self performSelector:@selector(specifierForIndexPath:) withObject:indexPath];
-#pragma clang diagnostic pop
-                if (sp && [[sp propertyForKey:@"key"] isEqualToString:@"folderIndicatorMode"]) {
-                    NSInteger cm = [[self readValueForKey:@"colorMode" default:@0] integerValue];
-                    if (cm == 0) {
-                        cell.textLabel.alpha = 0.4f;
-                        if (cell.detailTextLabel) cell.detailTextLabel.alpha = 0.4f;
-                        cell.userInteractionEnabled = NO;
-                    }
-                }
-            }
-        } @catch (NSException *e) {}
+        // v1.6.80: folderIndicatorMode is now always selectable; fixed-color mode falls back to first-sorted internally.
     } @catch (NSException *e) {}
-}
-
-// v1.6.75: 固定颜色模式下，文件夹显示方式(segment)不可选
-- (BOOL)tableView:(UITableView *)tableView shouldHighlightRowAtIndexPath:(NSIndexPath *)indexPath {
-    @try {
-        if ([self respondsToSelector:@selector(specifierForIndexPath:)]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            id sp = [self performSelector:@selector(specifierForIndexPath:) withObject:indexPath];
-#pragma clang diagnostic pop
-            if (sp && [[sp propertyForKey:@"key"] isEqualToString:@"folderIndicatorMode"]) {
-                NSInteger cm = [[self readValueForKey:@"colorMode" default:@0] integerValue];
-                if (cm == 0) return NO;
-            }
-        }
-    } @catch (NSException *e) {}
-    return [super respondsToSelector:_cmd] ? [super tableView:tableView shouldHighlightRowAtIndexPath:indexPath] : YES;
 }
 
 #pragma mark - 拦截写值
@@ -457,19 +424,6 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
         CFNotificationCenterGetDarwinNotifyCenter(),
         (__bridge CFStringRef)kReloadNotification,
         NULL, NULL, TRUE);
-
-    // v1.6.75: 颜色模式变化 → 重刷文件夹显示方式行（固定色时置灰）
-    @try {
-        NSString *ck = [specifier propertyForKey:@"key"];
-        if ([ck isEqualToString:@"colorMode"]) {
-            for (PSSpecifier *s in self.specifiers) {
-                if ([[s propertyForKey:@"key"] isEqualToString:@"folderIndicatorMode"]) {
-                    [self reloadSpecifier:s animated:YES];
-                    break;
-                }
-            }
-        }
-    } @catch (NSException *e) {}
 
     // 设置变化 → 头图实时预览同步刷新
     [self refreshHero];

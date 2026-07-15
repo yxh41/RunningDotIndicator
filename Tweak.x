@@ -428,8 +428,13 @@ static void MKCollectRunningFromFolder(id folder, NSMutableArray<NSString*> *out
                 b = [sub performSelector:NSSelectorFromString(@"applicationBundleID")];
             else if ([sub respondsToSelector:NSSelectorFromString(@"applicationBundleIdentifier")])
                 b = [sub performSelector:NSSelectorFromString(@"applicationBundleIdentifier")];
-            if ([b isKindOfClass:[NSString class]] && b.length && MKIsAppRunning(b) && !MKIsForeground(b))
-                [out addObject:b];
+            BOOL run = [b isKindOfClass:[NSString class]] && b.length && MKIsAppRunning(b);
+            BOOL fg = run && MKIsForeground(b);
+            if (sDebugLog && [b isKindOfClass:[NSString class]] && b.length && (run || out.count == 0)) {
+                static int sFCILogs = 0;
+                if (sFCILogs < 100) { sFCILogs++; RDLog(@"FOLDERCOLLECT-ITEM bid=%@ running=%d fg=%d", b, (int)run, (int)fg); }
+            }
+            if (run && !fg) [out addObject:b];
         } else if (fCls && [sub isKindOfClass:fCls]) {
             id sf = nil; // 嵌套文件夹：递归
             if ([sub respondsToSelector:NSSelectorFromString(@"folder")])
@@ -1551,6 +1556,7 @@ static void MKUpdate(SBIconView *self) {
             if (sDebugLog) RDLog(@"FICON-ENTER bid=%@ cls=%@ folderIndicators=%d", fBid, NSStringFromClass([fIcon class]), (int)[MKConfig sharedConfig].folderIndicators);
             if (!fBid.length) return;
             NSArray<NSString*> *contained = MKContainedRunningBids((SBIconView *)self);
+            if (sDebugLog && contained.count > 0) RDLog(@"FICON-CONTAINED bid=%@ running-bids=%@", fBid, [contained componentsJoinedByString:@","]);
             if (contained.count == 0) {
                 if (sDebugLog) RDLog(@"FICON-ABORT bid=%@ reason=no-running-apps", fBid);
                 UIView *lbl = MKGetCachedLabel(self);
@@ -1572,6 +1578,7 @@ static void MKUpdate(SBIconView *self) {
             BOOL fixedColor = (fCfg.colorMode == MKColorModeFixed);
             NSString *rep = MKFolderChosenBid(contained, fCfg.folderIndicatorMode, fixedColor);
             UIView *label = MKGetCachedLabel(self);
+            if (sDebugLog) RDLog(@"FICON-LABEL bid=%@ label=%@ cls=%@ frame=%@", fBid, label ? @"YES" : @"NO", label ? NSStringFromClass([label class]) : @"-", label ? NSStringFromCGRect(label.frame) : @"-");
             if (label) { label.hidden = YES; label.alpha = 0.0f; label.layer.opacity = 0.0f; label.opaque = NO; }
             UIView *container = MKContainerForIconView((UIView *)self);
             UIView *overlay = MKOverlayForContainer(container);
@@ -1593,7 +1600,7 @@ static void MKUpdate(SBIconView *self) {
                 [overlay addSubview:indicator];
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:fBid];
-                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.79: %@ rep=%@ mode=%ld fixed=%d", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor);
+                if (sDebugLog) RDLog(@"FICON-CREATE v1.6.80: %@ rep=%@ mode=%ld fixed=%d", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor);
             } else {
                 if (indicator.superview != overlay) {
                     [indicator removeFromSuperview];
@@ -1807,7 +1814,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.79: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v1.6.80: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -1901,6 +1908,26 @@ static void MKRefreshSubviews(UIView *containerView) {
             RDLog(@"FOLDER REFRESH: refreshed %d icons inside container", refreshed);
         }
     });
+}
+
+// v1.6.80: clear pending/fading markers for in-folder running apps before refreshing.
+// This eliminates the visible "blank then appears" delay when opening a folder.
+static void MKClearPendingInView(UIView *root) {
+    if (!root) return;
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
+    while (stack.count > 0) {
+        UIView *v = [stack lastObject];
+        [stack removeLastObject];
+        if ([v isKindOfClass:MKSBIconViewClass()]) {
+            SBIconView *iv = (SBIconView *)v;
+            NSString *bid = MKGetCachedBid(iv);
+            if (bid && bid.length && MKIsAppRunning(bid) && !MKIsForeground(bid)) {
+                MKRemovePending(bid);
+                MKRemoveFadingLabel(bid);
+            }
+        }
+        [stack addObjectsFromArray:v.subviews];
+    }
 }
 
 // ====================================================================
@@ -2114,6 +2141,7 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
         // callback to clear -> visible "blank then appears". Clear pending/fading now and
         // refresh immediately (main-screen icons are FOLDER-GUARD skipped, safe);
         // in-folder running apps get their indicator on the next frame.
+        if (sDebugLog) RDLog(@"ONSTATE-FOLDER bid=%@ running=%d fg=%d", bid, (int)running, (int)foreground);
         MKRemovePending(bid);
         MKRemoveFadingLabel(bid);
         dispatch_async(dispatch_get_main_queue(), ^{ MKRefreshAllIcons(); });
@@ -2411,6 +2439,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
             __strong UIView *target = me;
             dispatch_async(dispatch_get_main_queue(), ^{
                 sFolderRefreshScheduled = NO;
+                MKClearPendingInView(target);
                 MKRefreshSubviews(target);
             });
             // v1.6.75: 开文件夹动画期间图标可能稍晚入树，补一轮延迟刷新兜底
@@ -2699,7 +2728,7 @@ static void MKRefreshFolderIcons(void) {
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
     NSLog(@"[RunningDotIndicator] v1.6.30 ctor: 1.6.1 baseline + dominant-color icon mode + fix icon capture (snapshot full-size) + remove respring + 2026 glass settings UI + settings list icon + Depends mobilesubstrate (reverted ellekit) + v1.6.26 perf: coalesce folder/scroll refresh (drop redundant SBFolderController/SBIconListPageView hooks, 0.4s open-dedupe, single 300ms pass); keep indicator across off-screen (no destroy/recreate on scroll); icon-color miss one-shot retry; v1.6.28 relaxed iOS guard (block iOS 15 and lower only) + layoutSubviews orphan self-heal (fix 'indicator vanishes, reappears after swipe'); v1.6.29 debug-log toggle moved to settings UI (PSSwitchCell key=debugLog, live via prefs callback; rd_debug file kept as fallback); v1.6.30 blacklisted apps (incl. jailbreak tools with home-screen icons like Sileo/Dopamine/Filza) skip MKOnStateChange entirely -> no name fade-out, name stays visible");
-    RDLog(@"======== RDBUILD v1.6.79 (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped) ========");
+    RDLog(@"======== RDBUILD v1.6.80 (perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped) ========");
 
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
