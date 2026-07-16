@@ -48,11 +48,56 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
         _prefs = @{};
     }
 
+    // v2.0.25: 固化「默认应为开」的缺省键（详见 _mk_materializeDefaultsIfNeeded）。
+    [self _mk_materializeDefaultsIfNeeded];
+
     NSLog(@"[RunningDotIndicator] MKConfig reload, keys: %lu, enabled=%@, shape=%@, color=%@",
           (unsigned long)[_prefs count],
           _prefs[@"enabled"],
           _prefs[@"shape"],
           _prefs[@"color"] ?: @"(default)");
+}
+
+#pragma mark - 缺省键固化（防设置面板物化成 0）
+
+// v2.0.25: 修复 rd_log(73) 实锤 bug ——
+//   现象：用户从没手动拨过「文件夹图标」开关，但一打开系统「设置」App，
+//         folderIndicators 就被翻成 0 且持续 ~66s，期间 off 路径(MKConfig getter 返回 0 →
+//         Tweak.x FICON-ABORT reason=folderIndicators-off 真调 MKRemoveIndicatorForBid)
+//         把所有文件夹圆点拆光。
+//   根因：该键「键缺失→默认开(YES)」是 getter 的兜底假象，磁盘上从未写出过 1。
+//         设置面板加载时偏好框架把缺省键物化写盘，落成了 0（而非 plist 的 <true/>），
+//         于是 getter 老老实实返回 0。enabled 同理——一旦被物化成 0，整个插件会被关掉（更炸）。
+//   修复：仅当键【确实不存在】时把默认值固化到磁盘(写入 + synchronize)。
+//         · 键存在(用户主动设过 0) → 跳过，尊重用户选择，绝不覆盖。
+//         · 键缺失(从未拨过) → 写出 1，设置面板打开前键已是 1，框架读到现有值不再物化成 0。
+//   只固化「默认 YES」的关键开关；colorMode/shape/dotSize 等默认 0/低位本就安全，无需固化。
+- (void)_mk_materializeDefaultsIfNeeded {
+    static NSDictionary<NSString *, NSNumber *> *defaults;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        defaults = @{
+            @"enabled":          @YES,
+            @"folderIndicators": @YES,
+        };
+    });
+    BOOL wrote = NO;
+    for (NSString *key in defaults) {
+        if (_prefs[key] != nil) continue;   // 用户已显式设过（含主动关 0）→ 不碰
+        CFPreferencesSetValue(
+            (__bridge CFStringRef)key,
+            (__bridge CFPropertyListRef)defaults[key],
+            (__bridge CFStringRef)kPrefsDomain,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesAnyHost);
+        wrote = YES;
+    }
+    if (wrote) {
+        CFPreferencesAppSynchronize((__bridge CFStringRef)kPrefsDomain);
+        if ([self debugLog]) {
+            NSLog(@"[RunningDotIndicator] _mk_materializeDefaultsIfNeeded: 固化缺省开关键 → enabled=YES, folderIndicators=YES (仅缺省缺失时写入, 不覆盖用户主动设的 0)");
+        }
+    }
 }
 
 #pragma mark - 读取字段(带默认值)
