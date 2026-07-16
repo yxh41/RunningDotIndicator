@@ -247,7 +247,7 @@ static BOOL MKIsIconInFolder(UIView *iv) {
     // → setHidden/MKLabelDidMoveToWindowHook 的藏名拦截漏掉它们 → 缩回末尾名字复显闪一下(第④点残留真凶)。
     // 故 FloatyFolder 容器无论 sFolderOpen 与否都直接识别为「在文件夹内」，其余容器维持原语义(需 sFolderOpen)。
     if ([cls isEqualToString:@"SBFloatyFolderScrollView"]) {
-        if (sDebugLog) RDLog(@"FOLDER-FLOATY: iv=%@ bid=%@", iv, MKGetCachedBid((SBIconView *)iv));
+        if (sDebugLog) RDLog(@"FOLDER-FLOATY: iv=%@ cls=%@", iv, cls);
         return YES;
     }
     return (sFolderOpen && container);
