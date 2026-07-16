@@ -1714,6 +1714,19 @@ static NSMutableDictionary *sOrigSetHiddenByClass = nil;
 static NSMutableDictionary *sOrigSetAlphaByClass  = nil;
 static NSMutableDictionary *sOrigDidMoveToWindowByClass = nil; // v2.0.7: didMoveToWindow: 原始 IMP（创建点拦截用）
 
+// v2.0.9: 关文件夹缩回动画进行中，内层 App 的 label 由原生接管（跟原生关闭一样，
+// 不再强制藏名），避免与每帧/10ms 强制藏名互搏形成频闪。仅当 label 所属 icon
+// 在文件夹内、且正在关闭时才放行；主页/后台 App 的 label 仍照常强制藏名。
+static BOOL MKLabelHostInFolder(UIView *label) {
+    if (!label) return NO;
+    Class ivc = MKSBIconViewClass();
+    UIView *sp = label.superview;
+    while (sp) {
+        if (ivc && [sp isKindOfClass:ivc]) { return MKIsIconInFolder((UIView *)sp); }
+        sp = sp.superview;
+    }
+    return NO;
+}
 static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
     @try {
         NSString *bid = MKLabelToBid((UIView *)self);
@@ -1731,7 +1744,7 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
         NSString *mapBid = (sHiddenLabelToBid ? [sHiddenLabelToBid objectForKey:(id)self] : nil);
         BOOL hasBid = (bid && sHiddenBids && [sHiddenBids containsObject:bid]);
         BOOL inMap  = (mapBid.length && sHiddenBids && [sHiddenBids containsObject:mapBid]);
-        if (hasBid || inMap) {
+        if ((hasBid || inMap) && !(sFolderClosing && MKLabelHostInFolder((UIView *)self))) {   // v2.0.9: 关闭动画窗口内让步原生——不再强制藏名，根治与原生互搏的闪烁（见 MKArmFolderCloseGuard）
             hidden = YES; // 有指示器 -> 名字必须隐藏，压制系统任何复显
             // v1.6.99: 写回直接关联键，使「该 label 属于需藏名 bid」的标记自持。
             // 关文件夹缩回动画途中(层级重组、label 被临时重父)MKLabelToBid 的
@@ -1781,7 +1794,7 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
         NSString *mapBid = (sHiddenLabelToBid ? [sHiddenLabelToBid objectForKey:(id)self] : nil);
         BOOL hasBid = (bid && sHiddenBids && [sHiddenBids containsObject:bid]);
         BOOL inMap  = (mapBid.length && sHiddenBids && [sHiddenBids containsObject:mapBid]);
-        if (hasBid || inMap) {
+        if ((hasBid || inMap) && !(sFolderClosing && MKLabelHostInFolder((UIView *)self))) {   // v2.0.9: 关闭动画窗口内让步原生——不再强制藏名，根治与原生互搏的闪烁（见 MKArmFolderCloseGuard）
             a = 0.0f; // 同上，压制 alpha 复显
             // v1.6.99: 同 MKSetHiddenHook —— 写回直接关联键，藏名标记自持，
             // 杜绝关文件夹缩回动画途中 label 被临时重父导致的名称闪现(第4点)。
@@ -1832,7 +1845,7 @@ static void MKLabelDidMoveToWindowHook(id self, SEL _cmd) {
     @try {
         UIView *lbl = (UIView *)self;
         // 只在「已进 window 且当前可见」时检查；移除(window=nil)不处理
-        if (lbl.window && !lbl.hidden && lbl.alpha > 0.0f) {
+        if (lbl.window && !lbl.hidden && lbl.alpha > 0.0f && !(sFolderClosing && MKLabelHostInFolder(lbl))) {   // v2.0.9: 关闭窗口内、label 所属 icon 在文件夹内时让步原生
             NSString *bid = MKLabelToBid(lbl); // v2.0.7: 含几何兜底，瞬态也能解出
             if (bid && sHiddenBids && [sHiddenBids containsObject:bid]) {
                 lbl.hidden = YES;
@@ -2106,7 +2119,7 @@ static void MKUpdate(SBIconView *self) {
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:fBid];
                 if (sHiddenBids) [sHiddenBids addObject:fBid]; // v1.6.85: 文件夹合成 key 也要藏名
-                if (sDebugLog) RDLog(@"FICON-CREATE v2.0.8: %@ rep=%@ mode=%ld fixed=%d container=%@ frame=%@", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor, fContainerCls, NSStringFromCGRect(indicatorFrame));
+                if (sDebugLog) RDLog(@"FICON-CREATE v2.0.9: %@ rep=%@ mode=%ld fixed=%d container=%@ frame=%@", fBid, rep, (long)fCfg.folderIndicatorMode, fixedColor, fContainerCls, NSStringFromCGRect(indicatorFrame));
             } else {
                 if (indicator.superview != overlay) {
                     [indicator removeFromSuperview];
@@ -2325,7 +2338,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.8: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.9: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -2941,7 +2954,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     // 与层级无关；只要本 bid 仍在 sHiddenBids（App 后台运行、名字须隐藏）即强制藏名。
     // 同时把 bid 种回 label 直接关联键，使源头级 setHidden: hook 稳定命中。
     BOOL mustHide = (indicator != nil) || (bid.length && sHiddenBids && [sHiddenBids containsObject:bid]);
-    if (mustHide) {
+    if (mustHide && !(sFolderClosing && MKIsIconInFolder((UIView *)self))) {   // v2.0.9: 关闭窗口内、且本 icon 在文件夹内时让步原生（不强制藏名），根除互搏闪烁；主页/后台 App 仍照常藏名
         // v2.0.8: 主路径仍藏缓存 label；额外 BFS 当前子树，藏任何 label-like 子视图——
         // 缩回动画中 SpringBoard 给内层 App 新建/重父的 label 是【新对象】，MKGetCachedLabel
         // 取不到、MKLabelToBid 也解不出，仅靠缓存 label 会漏藏→名称闪现。每帧 layout
@@ -3097,7 +3110,7 @@ static void MKArmFolderCloseGuard(void) {
                             if (ivCls2 && [cur isKindOfClass:ivCls2]) {
                                 SBIconView *iv = (SBIconView *)cur;
                                 NSString *b = MKGetCachedBid(iv);
-                                if (b.length && sHiddenBids && [sHiddenBids containsObject:b]) {
+                                if (b.length && sHiddenBids && [sHiddenBids containsObject:b] && !(sFolderClosing && MKIsIconInFolder((UIView *)iv))) {   // v2.0.9: 关闭窗口内、且 icon 在文件夹内时让步原生（不强制藏名），根除互搏闪烁
                                     UIView *lbl = MKGetCachedLabel(iv);
                                     // v2.0.5 探针 B：关文件夹窗口内，本该隐藏的 label 仍可见 = 泄漏。
                                     // 分两类报：① 缓存 label 可见（guard 抓到，至多晚 1 帧）→ via=guard；
