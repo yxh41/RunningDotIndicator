@@ -1781,7 +1781,7 @@ static void MKLabelDidMoveToWindowHook(id self, SEL _cmd) {
     Class c = object_getClass(self);
     while (c) {
         NSValue *v = sOrigDidMoveToWindowByClass ? [sOrigDidMoveToWindowByClass objectForKey:NSStringFromClass(c)] : nil;
-        if (v) { orig = (IMP)[v pointerValue]; break; }
+        if (v) { orig = (void(*)(id,SEL))[v pointerValue]; break; }
         c = class_getSuperclass(c);
     }
     if (orig) {
