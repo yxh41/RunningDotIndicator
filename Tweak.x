@@ -815,16 +815,18 @@ static void MKApplyBetaDot(UIView *iconView, MKBetaMode mode) {
         if (sDebugLog) RDLog(@"BETA-APPLY: HIDE bid=%@ cls=%@", MKGetCachedBid((SBIconView *)iconView), NSStringFromClass([acc class]));
     } else if (mode == MKBetaShowDetached) {
         // 保持可见：若仍在 label 子树内（label 会被我们藏名 → 连带藏 dot），脱离到 iconView
-        if (label && acc != label && [acc isDescendantOf:label]) {
+        BOOL mkDetached = NO;
+        if (label && acc != label && [acc isDescendantOfView:label]) {
             UIView *realSuper = acc.superview;
             CGRect f = [realSuper convertRect:acc.frame toView:iconView];
             objc_setAssociatedObject(acc, &kMKBetaOrigSuperKey, realSuper, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             [acc removeFromSuperview];
             [iconView addSubview:acc];
             acc.frame = f;
+            mkDetached = YES;
         }
         acc.hidden = NO;
-        if (sDebugLog) RDLog(@"BETA-APPLY: SHOW-DETACHED bid=%@ cls=%@ deep=%d", MKGetCachedBid((SBIconView *)iconView), NSStringFromClass([acc class]), (int)[acc isDescendantOf:label]);
+        if (sDebugLog) RDLog(@"BETA-APPLY: SHOW-DETACHED bid=%@ cls=%@ deep=%d", MKGetCachedBid((SBIconView *)iconView), NSStringFromClass([acc class]), (int)mkDetached);
     } else { // MKBetaRestore
         UIView *orig = objc_getAssociatedObject(acc, &kMKBetaOrigSuperKey);
         if (orig && acc.superview != orig) {
