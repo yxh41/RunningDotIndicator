@@ -129,6 +129,13 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
     return 0;
 }
 
+// v2.0.14: 运行中指示器显示时隐藏 TestFlight 小黄点（Beta dot）。默认 NO：保持系统原生显示。
+- (BOOL)hideBetaDot {
+    id v = _prefs[@"hideBetaDot"];
+    if ([v isKindOfClass:[NSNumber class]]) return [v boolValue];
+    return NO;
+}
+
 + (UIColor *)colorFromHex:(NSString *)hex {
     if (![hex isKindOfClass:[NSString class]] || ![hex length]) {
         return [UIColor systemGreenColor];
