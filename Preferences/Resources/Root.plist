@@ -10,7 +10,7 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>RunningDotIndicator 2.0.19</string>
+			<string>RunningDotIndicator 2.0.20</string>
 			<key>footerText</key>
 			<string>为运行中的 App 图标添加指示器。App 运行时自动替换图标下方的名称文字，退出后恢复原名称。支持系统：iOS 16.x（roothide / rootless）；iOS 15 及更低不挂钩。</string>
 		</dict>
@@ -385,31 +385,6 @@
 		<string>debugLog</string>
 		<key>label</key>
 		<string>启用详细日志</string>
-		<key>PostNotification</key>
-		<string>com.mk.runningdotindicator.reload</string>
-	</dict>
-
-	<!-- ===== TestFlight 小黄点 ===== -->
-	<dict>
-		<key>cell</key>
-		<string>PSGroupCell</string>
-		<key>label</key>
-		<string>TestFlight 小黄点</string>
-		<key>footerText</key>
-		<string>开启后，运行中 App 显示指示器时同时隐藏 TestFlight 下载 App 的黄色 Beta 点；App 退出/未运行时小黄点恢复显示。默认关闭。</string>
-	</dict>
-
-	<dict>
-		<key>cell</key>
-		<string>PSSwitchCell</string>
-		<key>default</key>
-		<false/>
-		<key>defaults</key>
-		<string>com.mk.runningdotindicatorprefs</string>
-		<key>key</key>
-		<string>hideBetaDot</string>
-		<key>label</key>
-		<string>指示器显示时隐藏小黄点</string>
 		<key>PostNotification</key>
 		<string>com.mk.runningdotindicator.reload</string>
 	</dict>
