@@ -1773,7 +1773,11 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
 // 重抓 (FICON-LABEL label=YES 重复 40 次) 与关合末尾闪现的根。先于系统任何显示路径生效。
 static void MKLabelDidMoveToWindowHook(id self, SEL _cmd) {
     // 先调原始实现，把 label 真正挂上 window
-    IMP orig = NULL;
+    // v2.0.7+CI-FIX: didMoveToWindow 无参，原始 IMP 签名为 (void(*)(id,SEL))。
+    // iOS14+ SDK 中 IMP typedef 为 void(*)(void)（声明 0 个参数），
+    // 若用 IMP 类型声明 orig 再 orig(self,_cmd) 调用会触发 -Werror
+    // 「too many arguments to function call, expected 0, have 2」。故显式声明函数指针类型。
+    void (*orig)(id, SEL) = NULL;
     Class c = object_getClass(self);
     while (c) {
         NSValue *v = sOrigDidMoveToWindowByClass ? [sOrigDidMoveToWindowByClass objectForKey:NSStringFromClass(c)] : nil;
