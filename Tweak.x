@@ -1724,19 +1724,9 @@ static NSMutableDictionary *sOrigSetHiddenByClass = nil;
 static NSMutableDictionary *sOrigSetAlphaByClass  = nil;
 static NSMutableDictionary *sOrigDidMoveToWindowByClass = nil; // v2.0.7: didMoveToWindow: 原始 IMP（创建点拦截用）
 
-// v2.0.9: 关文件夹缩回动画进行中，内层 App 的 label 由原生接管（跟原生关闭一样，
-// 不再强制藏名），避免与每帧/10ms 强制藏名互搏形成频闪。仅当 label 所属 icon
-// 在文件夹内、且正在关闭时才放行；主页/后台 App 的 label 仍照常强制藏名。
-static BOOL MKLabelHostInFolder(UIView *label) {
-    if (!label) return NO;
-    Class ivc = MKSBIconViewClass();
-    UIView *sp = label.superview;
-    while (sp) {
-        if (ivc && [sp isKindOfClass:ivc]) { return MKIsIconInFolder((UIView *)sp); }
-        sp = sp.superview;
-    }
-    return NO;
-}
+// v2.0.12: 原 MKLabelHostInFolder() 已删除——v2.0.9 用它实现「关合窗口内对文件夹内 label 让步原生」，
+// 而 v2.0.12 已撤销该让步(关合窗口内文件夹内 label 一律强藏,见 MKSetHiddenHook/MKSetAlphaHook/
+// MKLabelDidMoveToWindowHook/主路径 mustHide 四处撤销)。该函数已无调用点,留之则 -Werror unused-function 编不过,故删。
 static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
     @try {
         NSString *bid = MKLabelToBid((UIView *)self);
