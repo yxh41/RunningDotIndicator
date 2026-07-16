@@ -122,13 +122,6 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
     return YES;
 }
 
-// v1.6.75: 文件夹内显示方式，默认 0=排序靠前
-- (NSInteger)folderIndicatorMode {
-    id v = _prefs[@"folderIndicatorMode"];
-    if ([v isKindOfClass:[NSNumber class]]) return [v integerValue];
-    return 0;
-}
-
 + (UIColor *)colorFromHex:(NSString *)hex {
     if (![hex isKindOfClass:[NSString class]] || ![hex length]) {
         return [UIColor systemGreenColor];

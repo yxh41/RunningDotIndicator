@@ -401,7 +401,7 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
         cell.textLabel.backgroundColor       = [UIColor clearColor];
         cell.detailTextLabel.backgroundColor = [UIColor clearColor];
 
-        // v1.6.80: folderIndicatorMode is now always selectable; fixed-color mode falls back to first-sorted internally.
+        // v2.0.24: folderIndicatorMode 选择已移除，代表 App 固定为位置靠前活跃（原 mode 0）。
     } @catch (NSException *e) {}
 }
 

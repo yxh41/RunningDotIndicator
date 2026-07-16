@@ -34,7 +34,6 @@ typedef NS_ENUM(NSInteger, MKColorMode) {
 @property (nonatomic, readonly) CGFloat    opacity;        // 不透明度, 默认 1.0
 @property (nonatomic, readonly) BOOL       debugLog;       // 调试日志, 默认 NO；设置页「调试日志」开关(debugLog)优先，回退 /var/mobile/Documents/rd_debug 文件（临时兼容，稳定后移除）
 @property (nonatomic, readonly) BOOL       folderIndicators;   // 桌面文件夹是否显示指示器, 默认 YES
-@property (nonatomic, readonly) NSInteger  folderIndicatorMode; // 文件夹内取哪个 App 作代表: 0=位置靠前, 1=来信息最新, 默认 0
 
 // 把 #RRGGBB / #RGB 解析为 UIColor
 + (UIColor *)colorFromHex:(NSString *)hex;

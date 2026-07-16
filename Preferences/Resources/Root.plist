@@ -10,7 +10,7 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>RunningDotIndicator 2.0.23</string>
+			<string>RunningDotIndicator 2.0.24</string>
 			<key>footerText</key>
 			<string>为运行中的 App 图标添加指示器。App 运行时自动替换图标下方的名称文字，退出后恢复原名称。支持系统：iOS 16.x（roothide / rootless）；iOS 15 及更低不挂钩。</string>
 		</dict>
@@ -286,7 +286,7 @@
 		<key>label</key>
 		<string>文件夹图标</string>
 		<key>footerText</key>
-		<string>控制桌面/Dock 上的文件夹图标是否显示指示器：里面任意 App 在后台运行时，文件夹图标显示 1 个指示器（颜色按下方「文件夹内取哪个 App」挑选里面某个 App 的主色；固定颜色模式下该策略自动按位置靠前处理）。里面运行的 App 各自仍显示自己的指示器（主功能不变）。</string>
+		<string>控制桌面/Dock 上的文件夹图标是否显示指示器：里面任意 App 在后台运行时，文件夹图标显示 1 个指示器（代表 App 固定为文件夹内位置最靠前、且正在运行的 App，取它的主色；固定颜色模式下用全局固定色）。里面运行的 App 各自仍显示自己的指示器（主功能不变）。</string>
 	</dict>
 
 	<dict>
@@ -300,33 +300,6 @@
 		<string>folderIndicators</string>
 		<key>label</key>
 		<string>文件夹图标显示指示器</string>
-		<key>PostNotification</key>
-		<string>com.mk.runningdotindicator.reload</string>
-	</dict>
-
-	<dict>
-		<key>cell</key>
-		<string>PSSegmentCell</string>
-		<key>defaults</key>
-		<string>com.mk.runningdotindicatorprefs</string>
-		<key>key</key>
-		<string>folderIndicatorMode</string>
-		<key>default</key>
-		<integer>0</integer>
-		<key>validTitles</key>
-		<array>
-			<string>位置靠前</string>
-			<string>来信息最新</string>
-		</array>
-		<key>validValues</key>
-		<array>
-			<integer>0</integer>
-			<integer>1</integer>
-		</array>
-		<key>label</key>
-		<string>文件夹内取哪个 App</string>
-		<key>footerText</key>
-		<string>文件夹图标上的 1 个指示器代表文件夹内哪个运行中的 App：位置靠前=视觉上排最前的 App；来信息最新=最近收到消息/活动的 App。</string>
 		<key>PostNotification</key>
 		<string>com.mk.runningdotindicator.reload</string>
 	</dict>
