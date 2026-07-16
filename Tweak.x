@@ -163,7 +163,9 @@ static NSMapTable *sBidToIconView;
 // 解决 v1.6.63 两个结构性缺陷：(1) 图标滚出屏幕→指示器随被回收 view 消失；(2) 回收瞬间指示器作为子视图漂到别的 App 下（乱飞）。
 // 指示器按 bid 索引，挂在图标滚动容器(SBIconScrollView/Dock scroll)的 overlay 上；
 // 图标离屏时随容器自然移出视野（不销毁），滚回自动对齐。坐标用 convertRect:toView:overlay（transform/滚动偏移安全）。
-static NSMapTable *sBidToIndicator;     // bid(NSString) -> 指示器(UIView) 强引用，跨回收存活
+static NSMapTable *sBidToIndicator;
+static NSMapTable *sHiddenLabelToBid = nil;   // v2.0.7+GAP-FIX: label(weak key) -> bid(strong) map; records a label that must stay hidden
+     // bid(NSString) -> 指示器(UIView) 强引用，跨回收存活
 static NSMapTable *sContainerToOverlay; // 滚动容器(UIScrollView) -> overlay(UIView) 弱->强
 // v1.6.61: 文件夹是否处于打开态（由 SBFolderView -didMoveToWindow 维护）。
 // 仅当为 YES 时才允许把图标判定为"在文件夹内"，消除主屏图标被误判。
@@ -305,6 +307,16 @@ static void MKRemoveIndicatorForBid(NSString *bid) {
     // v1.6.86: 仅在 App 确实不再运行时才恢复名字。文件夹关闭时内层 App 的指示器视图被拆掉
     // （didMoveToWindow(nil)），但 App 仍在后台运行 → 名字必须继续隐藏，否则缩回动画里闪一下。
     if (sHiddenBids && !MKIsAppRunning(bid)) [sHiddenBids removeObject:bid];
+    // v2.0.7+GAP-FIX: 清掉该 bid 对应的 label 指针表项，使 App 退出后名字可正常复显
+    // （不漏清会令退出后的 label 仍被源级 hook 凭指针表强制藏住）。
+    if (sHiddenLabelToBid) {
+        NSArray *keys = [[sHiddenLabelToBid keyEnumerator] allObjects];
+        for (id k in keys) {
+            NSString *v = [sHiddenLabelToBid objectForKey:k];
+            if (v && [v isEqualToString:bid]) [sHiddenLabelToBid removeObjectForKey:k];
+        }
+    }
+
 }
 static void MKRemoveAllIndicators(void) {
     if (!sBidToIndicator) return;
@@ -312,6 +324,7 @@ static void MKRemoveAllIndicators(void) {
     for (UIView *ind in all) { if (ind) [ind removeFromSuperview]; }
     [sBidToIndicator removeAllObjects];
     if (sHiddenBids) [sHiddenBids removeAllObjects]; // v1.6.85: 全清
+    if (sHiddenLabelToBid) [sHiddenLabelToBid removeAllObjects]; // v2.0.7+GAP-FIX: 同步清空指针表
 }
 // v1.6.71: 改为隐藏/恢复所有 overlay（而非逐个 indicator）。
 // 锁屏时 overlay.hidden=YES 即隐藏其下全部指示器；解锁时 overlay.hidden=NO 立即全局恢复，
@@ -1611,8 +1624,19 @@ static UIView *MKIconViewForLabel(UIView *label) {
 static void MKAssocLabelBid(UIView *label, NSString *bid) {
     if (!label) return;
     // v1.6.93: 藏名时把 bid 写到 label 自身；MKLabelToBid 优先采信，
-    // 使藏名与视图层级无关（文件夹开/合动画重组层级时不再失效 → 名称不再闪现/重叠）。
+    // 使藏名与视图层级无关（文件夹开/合动画重组层级时不再失效 -> 名称不再闪现/重叠）。
     objc_setAssociatedObject(label, &kMKLabelBidKey, bid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // v2.0.7+GAP-FIX: 维护「label 指针 -> bid」弱键表（label 仍应藏名时）。
+    // 当系统对【同一 label 对象】再次 setHidden:NO / setAlpha:>0 而瞬态 MKLabelToBid
+    // 返回 nil（关联键/层级/几何全失效的那一帧）时，源级 hook 可凭此表强制藏名，
+    // 根除「名字与圆点偶尔重叠」race（第1点）。弱键 -> label 释放自动移除，不泄漏。
+    if (!sHiddenLabelToBid) sHiddenLabelToBid = [NSMapTable weakToStrongObjectsMapTable];
+    if (bid.length) {
+        if (sHiddenBids && [sHiddenBids containsObject:bid])
+            [sHiddenLabelToBid setObject:bid forKey:(id)label];
+    } else {
+        [sHiddenLabelToBid removeObjectForKey:(id)label];
+    }
 }
 
 static NSString *MKLabelToBid(UIView *label) {
@@ -1703,14 +1727,23 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
                       ((UIView *)self).superview ? NSStringFromClass([((UIView *)self).superview class]) : @"nil");
             }
         }
-        if (bid && sHiddenBids && [sHiddenBids containsObject:bid]) {
-            hidden = YES; // 有指示器 → 名字必须隐藏，压制系统任何复显
+        NSString *mapBid = (sHiddenLabelToBid ? [sHiddenLabelToBid objectForKey:(id)self] : nil);
+        BOOL hasBid = (bid && sHiddenBids && [sHiddenBids containsObject:bid]);
+        BOOL inMap  = (mapBid.length && sHiddenBids && [sHiddenBids containsObject:mapBid]);
+        if (hasBid || inMap) {
+            hidden = YES; // 有指示器 -> 名字必须隐藏，压制系统任何复显
             // v1.6.99: 写回直接关联键，使「该 label 属于需藏名 bid」的标记自持。
             // 关文件夹缩回动画途中(层级重组、label 被临时重父)MKLabelToBid 的
-            // 兄弟/祖先兜底查找会瞬时失效一帧 → 那一帧名称被系统复显即闪现(第4点)。
+            // 兄弟/祖先兜底查找会瞬时失效一帧 -> 那一帧名称被系统复显即闪现(第4点)。
             // 一旦此处强制过藏名，后续任何 setHidden:NO 即使兜底查找失效也能靠
-            // 直接关联键重新命中 → 动画全程压制复显，根除闪现。
-            MKAssocLabelBid((UIView *)self, bid);
+            // 直接关联键重新命中 -> 动画全程压制复显，根除闪现。
+            // v2.0.7+GAP-FIX: 额外凭「label 指针 -> bid」弱键表兜底 -- 当 MKLabelToBid 瞬态
+            // 返回 nil（关联键/层级/几何全失效的那一帧，正是第1点主屏偶发重叠根因）而该
+            // label 先前确被强制藏名过，凭指针表继续压住，根除偶发重叠 race。
+            NSString *useBid = hasBid ? bid : mapBid;
+            MKAssocLabelBid((UIView *)self, useBid);
+            if (sDebugLog && !hasBid && inMap)
+                RDLog(@"OVERLAP-GAP: caught via ptr-map cls=%@ bid=%@", object_getClass(self), useBid);
         }
     } @catch (NSException *e) {}
     void(*orig)(id,SEL,BOOL) = NULL;
@@ -1744,11 +1777,18 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
                       ((UIView *)self).superview ? NSStringFromClass([((UIView *)self).superview class]) : @"nil", (float)a);
             }
         }
-        if (bid && sHiddenBids && [sHiddenBids containsObject:bid]) {
+        NSString *mapBid = (sHiddenLabelToBid ? [sHiddenLabelToBid objectForKey:(id)self] : nil);
+        BOOL hasBid = (bid && sHiddenBids && [sHiddenBids containsObject:bid]);
+        BOOL inMap  = (mapBid.length && sHiddenBids && [sHiddenBids containsObject:mapBid]);
+        if (hasBid || inMap) {
             a = 0.0f; // 同上，压制 alpha 复显
             // v1.6.99: 同 MKSetHiddenHook —— 写回直接关联键，藏名标记自持，
             // 杜绝关文件夹缩回动画途中 label 被临时重父导致的名称闪现(第4点)。
-            MKAssocLabelBid((UIView *)self, bid);
+            // v2.0.7+GAP-FIX: 额外凭「label 指针 -> bid」弱键表兜底偶发重叠(第1点)，见 MKSetHiddenHook。
+            NSString *useBid = hasBid ? bid : mapBid;
+            MKAssocLabelBid((UIView *)self, useBid);
+            if (sDebugLog && !hasBid && inMap)
+                RDLog(@"OVERLAP-GAP: caught via ptr-map cls=%@ bid=%@", object_getClass(self), useBid);
         }
     } @catch (NSException *e) {}
     void(*orig)(id,SEL,CGFloat) = NULL;
