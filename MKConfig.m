@@ -122,6 +122,13 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
     return YES;
 }
 
+// v2.0.30: 「保留小黄点」开关，默认开（保留运行中 TF/beta App 的小黄点）
+- (BOOL)keepBetaDot {
+    id v = _prefs[@"keepBetaDot"];
+    if ([v isKindOfClass:[NSNumber class]]) return [v boolValue];
+    return YES;
+}
+
 + (UIColor *)colorFromHex:(NSString *)hex {
     if (![hex isKindOfClass:[NSString class]] || ![hex length]) {
         return [UIColor systemGreenColor];
