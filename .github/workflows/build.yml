@@ -21,6 +21,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Banner guard (catch bare '====' separator in Tweak.x)
+        run: |
+          echo "=== Banner sanity check (Tweak.x) ==="
+          if grep -nE '^[[:space:]]*={2,}[[:space:]]*$' Tweak.x; then
+            echo "::error::RDBUILD banner in Tweak.x has a BARE '====' separator line that is not wrapped in an RDLog() call. This is a version-bump-script bug and breaks -Werror compilation. Fix the bump script so it never emits a bare '=' line, then re-run."
+            exit 1
+          fi
+          echo "OK: no bare separator line in Tweak.x banner."
+
       - name: Install dependencies
         env:
           HOMEBREW_NO_REQUIRE_TAP_TRUST: 1

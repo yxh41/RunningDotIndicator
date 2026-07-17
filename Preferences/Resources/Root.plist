@@ -10,7 +10,7 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>RunningDotIndicator 2.0.28</string>
+			<string>RunningDotIndicator 2.0.29</string>
 			<key>footerText</key>
 			<string>为运行中的 App 图标添加指示器。App 运行时自动替换图标下方的名称文字，退出后恢复原名称。支持系统：iOS 16.x（roothide / rootless）；iOS 15 及更低不挂钩。</string>
 		</dict>
@@ -300,31 +300,6 @@
 		<string>folderIndicators</string>
 		<key>label</key>
 		<string>文件夹图标显示指示器</string>
-		<key>PostNotification</key>
-		<string>com.mk.runningdotindicator.reload</string>
-	</dict>
-
-	<!-- ===== 小黄点（TestFlight / beta） ===== -->
-	<dict>
-		<key>cell</key>
-		<string>PSGroupCell</string>
-		<key>label</key>
-		<string>小黄点</string>
-		<key>footerText</key>
-		<string>TestFlight / beta 版 App 图标名称左侧的小黄点。开：运行中藏名时仍保留小黄点（脱离 label 不被牵连）。关：退回旧行为，小黄点会被藏名一并隐藏。</string>
-	</dict>
-
-	<dict>
-		<key>cell</key>
-		<string>PSSwitchCell</string>
-		<key>default</key>
-		<true/>
-		<key>defaults</key>
-		<string>com.mk.runningdotindicatorprefs</string>
-		<key>key</key>
-		<string>keepBetaDot</string>
-		<key>label</key>
-		<string>保留小黄点</string>
 		<key>PostNotification</key>
 		<string>com.mk.runningdotindicator.reload</string>
 	</dict>
