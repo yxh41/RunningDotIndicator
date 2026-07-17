@@ -380,17 +380,39 @@ static void MKUnlockRestore(void) {
     NSInteger myToken = ++sUnlockToken;
     sLocked = NO;                                 // 立即标记已复原，后续触发源直接 return
     if (sUnlockTimer) { dispatch_source_cancel(sUnlockTimer); sUnlockTimer = NULL; }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)),
+
+    // ── v2.0.41 关键修复：先「同步」刷新并强制可见，作为正确性安全网 ──
+    // 旧版把 reveal 放进下方 dispatch_after(0.9s) 的延迟 block；该 block 依赖主队列
+    // dispatch timer 源，在「解锁 + 文件夹打开」过渡里 SpringBoard 主 runloop 长时间
+    // 处于非默认 CFRunLoopMode，timer 源不被 pump → block 被饿死/丢弃，指示器永久隐藏
+    // （rd_log(82) 实证：LOCK 后 UNLOCK(timer) delegated，但全程无 restored 日志、无异常）。
+    // 改为：① 同步 refresh（让解锁后重建的容器落位）② 同步强制 ov.hidden=NO;alpha=1，
+    // 保证「解锁即可见」不依赖任何延迟 block。③ 下方仍尝试一次平滑淡入（best-effort），
+    // 即便它被丢弃，①② 也已确保可见，不再出现「解锁后全消失」。
+    @try {
+        MKRefreshAllIcons();                       // 1) 同步刷新/重建（解锁后容器可能被重建，overlay 随之换新）
+    } @catch (NSException *e) {
+        RDLog(@"UNLOCK(refresh) EXCEPTION: %@", e.reason);
+    }
+    if (!sContainerToOverlay) return;
+    {
+        NSArray *all = [sContainerToOverlay.objectEnumerator.allObjects copy];  // 2) 刷新后再捕获 → 锚到当前容器
+        for (UIView *ov in all) { ov.hidden = NO; ov.alpha = 1.0f; }          // 同步立即可见（安全网，不再依赖延迟 block）
+    }
+    if (sDebugLog) RDLog(@"UNLOCK: revealed all indicators (sync safety-net)");
+
+    // 3) best-effort 平滑淡入：仅当块运行且未过期/未重锁，做一次 0→1 弹簧淡入。
+    //    从 alpha=1 先降到 0 再升回 1 会有极短微闪，但因 ② 已可见，最坏情况=无淡入（正确），可接受。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (myToken != sUnlockToken) return;      // 期间又来更新的解锁 → 旧 block 失效
         if (sLocked) return;                      // 期间又锁屏了（sLocked 被置回 YES）
         @try {
-            MKRefreshAllIcons();                  // 1) 先刷新/重建（解锁后容器可能被 SpringBoard 重建，overlay 容器随之换新）
             if (!sContainerToOverlay) return;
-            NSArray *all = [sContainerToOverlay.objectEnumerator.allObjects copy];  // 2) 刷新后再捕获 → 锚到当前容器
-            for (UIView *ov in all) { ov.hidden = NO; ov.alpha = 0.0f; }          // 刷新后再归零：避免锚到旧容器导致硬跳
+            NSArray *cur = [sContainerToOverlay.objectEnumerator.allObjects copy];
+            for (UIView *ov in cur) { ov.hidden = NO; ov.alpha = 0.0f; }
             [UIView animateWithDuration:0.5 delay:0.0 usingSpringWithDamping:0.7 initialSpringVelocity:0.4
-                options:0 animations:^{ for (UIView *ov in all) ov.alpha = 1.0f; }
+                options:0 animations:^{ for (UIView *ov in cur) ov.alpha = 1.0f; }
                 completion:nil];
             if (sDebugLog) RDLog(@"UNLOCK: restored all indicators with fade-in");
         } @catch (NSException *e) { RDLog(@"UNLOCK(fade) EXCEPTION: %@", e.reason); }
