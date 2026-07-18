@@ -2395,7 +2395,21 @@ static void MKUpdate(SBIconView *self) {
             UIView *mkOv = mkCont ? [sContainerToOverlay objectForKey:mkCont] : nil;
             if (mkOv) {
                 NSTimeInterval mkNow = [NSDate date].timeIntervalSince1970;
-                BOOL mkShouldHide = sLocked || (mkNow - sLockAt <= 0.7);
+                // v2.0.48: 关文件夹缩回「活闪」修复 —— 缩回动画【进行中】(sFolderClosing=YES,
+                // 由 SBFolderController -viewWillDisappear: 在关闭起始武装)且本图标位于文件夹内层
+                // (容器非主屏 SBIconScrollView / 非 Dock SBDock*)时，强制隐藏指示器，
+                // 避免它一路跟着迷你 app 图标缩回文件夹缩略图而闪现。
+                // scoped：仅当 sFolderClosing 且容器是文件夹类型才藏；主屏/Dock 图标(容器=SBIconScrollView/SBDock*)
+                // mkInFolderLive=NO 不受影响，文件夹图标本身(桌面/Dock 上的 SBFolderIcon)也不受影响。
+                // 复用上方已算出的 mkCont，零额外调用。sFolderClosing 仅在关文件夹~1.2s 窗内为 YES，平常零影响。
+                BOOL mkInFolderLive = NO;
+                if (sFolderClosing && mkCont) {
+                    NSString *mkContCls = NSStringFromClass([mkCont class]);
+                    BOOL mkIsHomeOrDock = [mkContCls isEqualToString:@"SBIconScrollView"]
+                                          || [mkContCls hasPrefix:@"SBDock"];
+                    mkInFolderLive = !mkIsHomeOrDock;
+                }
+                BOOL mkShouldHide = sLocked || (mkNow - sLockAt <= 0.7) || (sFolderClosing && mkInFolderLive);
                 if (mkOv.hidden != mkShouldHide) {
                     BOOL mkWasHidden = mkOv.hidden;
                     if (!mkShouldHide) {
@@ -2598,7 +2612,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.47: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.48: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
