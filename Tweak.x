@@ -2383,7 +2383,7 @@ static void MKUpdate(SBIconView *self) {
         BOOL running = MKIsAppRunning(bundleID);
         BOOL isForeground = MKIsForeground(bundleID);
         UIView *existingIndicator = MKFindIndicator(bundleID);
-        // v2.0.44: 逐帧 overlay(父) 可见性不变量 —— 锁屏/解锁桌面已有指示器
+        // v2.0.45: 逐帧 overlay(父) 可见性不变量 —— 锁屏/解锁桌面已有指示器（v2.0.44 引入；本版追加 PERFRAME-FIX 诊断日志）
         // 根治「解锁后指示器消失」（一次性复原定时器漏掉 recycle 出的新 overlay 即永久 hidden）。
         // 必须跑在下方 sLastState 去重 return(L2939) 之前：running 未变时去重会早退，
         // 而 MKSetAllIndicatorsHidden 只动 overlay(父)、普通路径只动 indicator(子)，
@@ -2396,7 +2396,15 @@ static void MKUpdate(SBIconView *self) {
             if (mkOv) {
                 NSTimeInterval mkNow = [NSDate date].timeIntervalSince1970;
                 BOOL mkShouldHide = sLocked || (mkNow - sLockAt <= 0.7);
-                if (mkOv.hidden != mkShouldHide) mkOv.hidden = mkShouldHide;
+                if (mkOv.hidden != mkShouldHide) {
+                    // v2.0.45: 诊断——仅当逐帧不变量「真的纠正了」某个 overlay 的 hidden 才打点
+                    // （gated by sDebugLog，release 零影响）。下次压测日志里 grep PERFRAME-FIX
+                    // 即可证明本修复确实触发过、救回了多少指示器。
+                    if (sDebugLog) RDLog(@"PERFRAME-FIX: bid=%@ ov.hidden %@->%@ sLocked=%d dt=%.2f",
+                                          bundleID, mkOv.hidden?@"YES":@"NO", mkShouldHide?@"YES":@"NO",
+                                          (int)sLocked, (float)(mkNow - sLockAt));
+                    mkOv.hidden = mkShouldHide;
+                }
             }
         }
         // v1.6.60 诊断：仅针对「后台运行中 App」的 MKUpdate 打点（不刷屏）。
@@ -2577,7 +2585,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.44: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.45: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
