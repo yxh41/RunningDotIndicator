@@ -1983,6 +1983,7 @@ static void MKLabelDidMoveToWindowHook(id self, SEL _cmd) {
 // 不恢复其 1.5s guard/全树 BFS/0.4s 扫描(那是当年撤回的 perf 重灾区)。
 // 与 MKSetAlphaHook 同判据(仅 sHiddenBids 成员) + 同款按继承链解析 orig(防类簇递归/坏 orig)。
 static NSMutableDictionary *sOrigSetIconLabelAlphaByClass = nil;
+static BOOL MKClassIsSubclass(Class sub, Class c); // 前向声明（定义于文件后部 ~2106；新增 MKHookSBIconViewAlpha 在 2030 行即用，须先声明以免 -Werror 隐式函数声明）
 static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
     @try {
         NSString *bid = MKGetCachedBid((SBIconView *)self);
