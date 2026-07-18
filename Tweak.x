@@ -587,9 +587,14 @@ static void MKScheduleUnlock(void) {
             NSTimeInterval now = [NSDate date].timeIntervalSince1970;
             if (now - sLockAt < 0.7) return;  // 又有更新的锁屏，等下一轮
             sLocked = NO;
-            MKSetAllIndicatorsHidden(NO);  // v1.6.75: 复原所有 overlay（之前只重建不 unhide，主屏/Dock 指示器解锁后永久不显）
+            // v2.0.47-fix: 不再直接 MKSetAllIndicatorsHidden(NO) 强制显——
+            // 它会跳过 per-frame 的 reveal 淡入分支、且不动 alpha，与 hide 分支的
+            // alpha=0 叠加成「解锁后隐形」(rd_log94: 552 条 ind(h=0 a=0.00))，
+            // 并令 per-frame 的 hidden!=shouldHide 永不成立→淡入从不触发(0 命中)。
+            // 改为仅触发 MKRefreshAllIcons，由 MKUpdate 逐帧不变量统一负责
+            // reveal + 一次性淡入(alpha 0->1 正确复位)；淡入与 reveal 同源不闪。
             MKRefreshAllIcons();
-            if (sDebugLog) RDLog(@"UNLOCK(timer): restored all indicators");
+            if (sDebugLog) RDLog(@"UNLOCK(timer): refreshed all icons (per-frame invariant owns reveal+fade)");
         } @catch (NSException *e) {
             RDLog(@"UNLOCK(timer) EXCEPTION: %@", e.reason);
         }
@@ -2593,7 +2598,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.46: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.47: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
