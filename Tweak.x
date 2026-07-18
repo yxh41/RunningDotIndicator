@@ -384,16 +384,13 @@ static void MKUnlockRestore(void) {
         if (myToken != sUnlockToken) return;   // 已被更新的解锁覆盖
         if (sLocked) return;                   // 期间又锁屏了
         @try {
-            // v2.0.44: 不再做 alpha 0→1 淡入复原。
-            // 逐帧 overlay.hidden 不变量（MKUpdate 内，跑在 sLastState 去重 return 之前）
-            // 已负责锁屏/解锁后 overlay 的显隐重推；此处仅做冗余安全：确保 overlay 不卡在
-            // hidden=YES（万一某 overlay 在复原时刻还不在 sContainerToOverlay 被漏掉）。
-            // 若仍保留 alpha 淡入，会与逐帧 reveal 的 0.7s 闸门时序打架造成闪跳。
-            NSArray *all = [sContainerToOverlay.objectEnumerator.allObjects copy];
-            for (UIView *ov in all) { ov.hidden = NO; if (ov.alpha != 1.0f) ov.alpha = 1.0f; }
-            MKRefreshAllIcons();  // 重建/重定位（单个指示器自带 0.2s 淡入，叠加更柔和）
-            if (sDebugLog) RDLog(@"UNLOCK(fade): restored all indicators (no alpha fade, per-frame invariant owns visibility)");
-        } @catch (NSException *e) { RDLog(@"UNLOCK(fade) EXCEPTION: %@", e.reason); }
+            // v2.0.46: 可见性(显隐+淡入) 完全交给 MKUpdate 逐帧不变量（gate-flip 触发一次性淡入）。
+            // 此处不再强制 ov.hidden=NO / ov.alpha=1（否则 0.45s 即提前显、与 0.7s 闸门冲突→早显/闪）。
+            // 仅触发全量 MKUpdate（MKRefreshAllIcons），让每个 overlay 都经逐帧不变量重新推导
+            // hidden+alpha；这同时是离屏未布局图标的安全网（被遍历到的图标都会跑逐帧逻辑）。
+            MKRefreshAllIcons();
+            if (sDebugLog) RDLog(@"UNLOCK: refreshed all icons (per-frame invariant owns reveal+fade)");
+        } @catch (NSException *e) { RDLog(@"UNLOCK EXCEPTION: %@", e.reason); }
     });
 }
 // v1.6.67: 计算某 bid 的指示器在 overlay 坐标系中的 frame（transform/滚动偏移安全）。
@@ -2383,13 +2380,11 @@ static void MKUpdate(SBIconView *self) {
         BOOL running = MKIsAppRunning(bundleID);
         BOOL isForeground = MKIsForeground(bundleID);
         UIView *existingIndicator = MKFindIndicator(bundleID);
-        // v2.0.45: 逐帧 overlay(父) 可见性不变量 —— 锁屏/解锁桌面已有指示器（v2.0.44 引入；本版追加 PERFRAME-FIX 诊断日志）
-        // 根治「解锁后指示器消失」（一次性复原定时器漏掉 recycle 出的新 overlay 即永久 hidden）。
-        // 必须跑在下方 sLastState 去重 return(L2939) 之前：running 未变时去重会早退，
-        // 而 MKSetAllIndicatorsHidden 只动 overlay(父)、普通路径只动 indicator(子)，
-        // overlay 一旦卡 hidden=YES 无人复位。此处每帧把 overlay.hidden 重推成 shouldHide，
-        // 与名字隐藏同机制。仅读「已存在」的 overlay（不懒建，避免非运行 App 被建空 overlay）；
-        // 仅在 hidden 不符时才写，零 CA churn。时序沿用 0.7s 闸门：锁屏/解锁动画(~0.5s)期间仍隐藏，>0.7s 才显，避免透出。
+        // v2.0.46: 逐帧 overlay(父) 可见性不变量 + 解锁 gate-flip 一次性淡入
+        // 根治「解锁后指示器消失」（recycle 竞态）；并在 0.7s 闸门翻 NO 的瞬间触发一次
+        // alpha 0→1 淡入，使解锁指示器柔和出现。关键：淡入与 reveal 同源（同一帧翻转触发），
+        // 无第二定时器竞态，故不闪。必须跑在 sLastState 去重 return(L2939) 之前。
+        // 仅读已存在 overlay（不懒建）；仅在 hidden 不符才写；reveal 时一次性 animate（绝不下每帧 animate，否则抖）。
         if (bundleID.length) {
             UIView *mkCont = MKContainerForIconView((UIView *)self);
             UIView *mkOv = mkCont ? [sContainerToOverlay objectForKey:mkCont] : nil;
@@ -2397,13 +2392,26 @@ static void MKUpdate(SBIconView *self) {
                 NSTimeInterval mkNow = [NSDate date].timeIntervalSince1970;
                 BOOL mkShouldHide = sLocked || (mkNow - sLockAt <= 0.7);
                 if (mkOv.hidden != mkShouldHide) {
-                    // v2.0.45: 诊断——仅当逐帧不变量「真的纠正了」某个 overlay 的 hidden 才打点
-                    // （gated by sDebugLog，release 零影响）。下次压测日志里 grep PERFRAME-FIX
-                    // 即可证明本修复确实触发过、救回了多少指示器。
-                    if (sDebugLog) RDLog(@"PERFRAME-FIX: bid=%@ ov.hidden %@->%@ sLocked=%d dt=%.2f",
-                                          bundleID, mkOv.hidden?@"YES":@"NO", mkShouldHide?@"YES":@"NO",
+                    BOOL mkWasHidden = mkOv.hidden;
+                    if (!mkShouldHide) {
+                        // reveal（0.7s 闸门翻 NO）：一次性淡入，alpha 从 0 起
+                        mkOv.hidden = NO;
+                        mkOv.alpha  = 0.0f;
+                        [UIView animateWithDuration:0.25 delay:0
+                            options:UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionAllowUserInteraction
+                            animations:^{ mkOv.alpha = 1.0f; } completion:nil];
+                    } else {
+                        // hide（锁屏）：瞬隐 + 复位 alpha，供下次淡入从 0 起
+                        mkOv.hidden = YES;
+                        mkOv.alpha  = 0.0f;
+                    }
+                    // 诊断——仅当逐帧不变量「真的纠正了」某个 overlay 才打点（gated by sDebugLog）。
+                    // reveal 行带 " fade(reveal)" 标记，grep PERFRAME-FIX 可证触发/救回数。
+                    if (sDebugLog) RDLog(@"PERFRAME-FIX: bid=%@ %@->%@%@ sLocked=%d dt=%.2f",
+                                          bundleID, mkWasHidden?@"YES":@"NO",
+                                          mkShouldHide?@"YES":@"NO",
+                                          mkShouldHide?@"":@" fade(reveal)",
                                           (int)sLocked, (float)(mkNow - sLockAt));
-                    mkOv.hidden = mkShouldHide;
                 }
             }
         }
@@ -2585,7 +2593,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.45: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.46: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
