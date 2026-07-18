@@ -384,13 +384,15 @@ static void MKUnlockRestore(void) {
         if (myToken != sUnlockToken) return;   // 已被更新的解锁覆盖
         if (sLocked) return;                   // 期间又锁屏了
         @try {
+            // v2.0.44: 不再做 alpha 0→1 淡入复原。
+            // 逐帧 overlay.hidden 不变量（MKUpdate 内，跑在 sLastState 去重 return 之前）
+            // 已负责锁屏/解锁后 overlay 的显隐重推；此处仅做冗余安全：确保 overlay 不卡在
+            // hidden=YES（万一某 overlay 在复原时刻还不在 sContainerToOverlay 被漏掉）。
+            // 若仍保留 alpha 淡入，会与逐帧 reveal 的 0.7s 闸门时序打架造成闪跳。
             NSArray *all = [sContainerToOverlay.objectEnumerator.allObjects copy];
-            for (UIView *ov in all) { ov.hidden = NO; ov.alpha = 0.0f; }
+            for (UIView *ov in all) { ov.hidden = NO; if (ov.alpha != 1.0f) ov.alpha = 1.0f; }
             MKRefreshAllIcons();  // 重建/重定位（单个指示器自带 0.2s 淡入，叠加更柔和）
-            [UIView animateWithDuration:0.3 delay:0.0 options:UIViewAnimationOptionCurveEaseOut
-                animations:^{ for (UIView *ov in all) ov.alpha = 1.0f; }
-                completion:nil];
-            if (sDebugLog) RDLog(@"UNLOCK(fade): restored all indicators with fade-in");
+            if (sDebugLog) RDLog(@"UNLOCK(fade): restored all indicators (no alpha fade, per-frame invariant owns visibility)");
         } @catch (NSException *e) { RDLog(@"UNLOCK(fade) EXCEPTION: %@", e.reason); }
     });
 }
@@ -2381,6 +2383,22 @@ static void MKUpdate(SBIconView *self) {
         BOOL running = MKIsAppRunning(bundleID);
         BOOL isForeground = MKIsForeground(bundleID);
         UIView *existingIndicator = MKFindIndicator(bundleID);
+        // v2.0.44: 逐帧 overlay(父) 可见性不变量 —— 锁屏/解锁桌面已有指示器
+        // 根治「解锁后指示器消失」（一次性复原定时器漏掉 recycle 出的新 overlay 即永久 hidden）。
+        // 必须跑在下方 sLastState 去重 return(L2939) 之前：running 未变时去重会早退，
+        // 而 MKSetAllIndicatorsHidden 只动 overlay(父)、普通路径只动 indicator(子)，
+        // overlay 一旦卡 hidden=YES 无人复位。此处每帧把 overlay.hidden 重推成 shouldHide，
+        // 与名字隐藏同机制。仅读「已存在」的 overlay（不懒建，避免非运行 App 被建空 overlay）；
+        // 仅在 hidden 不符时才写，零 CA churn。时序沿用 0.7s 闸门：锁屏/解锁动画(~0.5s)期间仍隐藏，>0.7s 才显，避免透出。
+        if (bundleID.length) {
+            UIView *mkCont = MKContainerForIconView((UIView *)self);
+            UIView *mkOv = mkCont ? [sContainerToOverlay objectForKey:mkCont] : nil;
+            if (mkOv) {
+                NSTimeInterval mkNow = [NSDate date].timeIntervalSince1970;
+                BOOL mkShouldHide = sLocked || (mkNow - sLockAt <= 0.7);
+                if (mkOv.hidden != mkShouldHide) mkOv.hidden = mkShouldHide;
+            }
+        }
         // v1.6.60 诊断：仅针对「后台运行中 App」的 MKUpdate 打点（不刷屏）。
         // 能看到：MKUpdate 是否真的被调到、当时 sScrolling/hasIndicator 状态、最终是否建出。
         // 若 REFRESH 命中却无本行 → MKUpdate 没被调（触发链断）；
@@ -2559,7 +2577,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.43: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.44: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
