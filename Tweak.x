@@ -3877,6 +3877,17 @@ static void MKArmFolderCloseGuard(void) {
 // 参考 iOS 16 运行时头文件：FBProcessState 有 running/taskState/foreground 属性
 // ====================================================================
 
+// v2.0.43-refactor(F1): 三个 SBApplication 状态 hook 共用的「set 更新 + 定向刷新」逻辑。
+// 原三份一字不差重复（MKSetForeground + add/remove 集合 + MKOnStateChange），统一此处，逻辑等价。
+// 语义：runningNow&&foreground → 加入集合；!runningNow → 移出集合；其余（alive 但后台）保留并刷新。
+static void MKApplyAppState(NSString *bid, BOOL runningNow, BOOL foreground) {
+    if (!bid.length) return;
+    MKSetForeground(bid, foreground);
+    if (runningNow && foreground)      MKAddToRunningSet(bid);
+    else if (!runningNow)            MKRemoveFromRunningSet(bid);
+    MKOnStateChange(bid, runningNow, foreground);
+}
+
 %hook SBApplication
 
 - (void)_noteProcess:(id)process didChangeToState:(id)state {
@@ -3895,7 +3906,6 @@ static void MKArmFolderCloseGuard(void) {
         BOOL isRunning = MKGetBoolFromState(state, @"isRunning");
         int taskState = MKGetIntFromState(state, @"taskState");
         BOOL isForeground = MKGetBoolFromState(state, @"isForeground");
-        MKSetForeground(bid, isForeground);
 
         if (sDebugLog) RDLog(@"SBApp._noteProcess: %@ → isRunning=%d taskState=%d foreground=%d",
               bid, isRunning, taskState, isForeground);
@@ -3907,15 +3917,8 @@ static void MKArmFolderCloseGuard(void) {
         // v1.6.31: 仅前台（用户打开/使用中）才进入 running set。
         // 纯后台被 iOS 拉起（日历同步等）foreground=0 → 不进集合 → 不显示指示器。
         // 注意：alive 但后台（用户退回后台的 App）走 else-if(!isRunningNow) 不命中 → 保留在集合（点保留）。
-        if (isRunningNow && isForeground) {
-            MKAddToRunningSet(bid);
-        } else if (!isRunningNow) {
-            MKRemoveFromRunningSet(bid);
-            isRunningNow = NO;
-        }
-
-        // v1.5.3: 定向+延迟刷新（替代 MKClearAllIndicators + MKRefreshAllIcons）
-        MKOnStateChange(bid, isRunningNow, isForeground);
+        // v2.0.43-refactor(F1): 三 hook 共用的「set 更新 + 刷新」逻辑抽进 MKApplyAppState，此处只取状态。
+        MKApplyAppState(bid, isRunningNow, isForeground);
     } @catch (NSException *e) {
         RDLog(@"_noteProcess EXCEPTION: %@", e.reason);
     }
@@ -3942,24 +3945,14 @@ static void MKArmFolderCloseGuard(void) {
         BOOL isRunning = MKGetBoolFromState(internalState, @"isRunning");
         int taskState = MKGetIntFromState(internalState, @"taskState");
         BOOL isForeground = MKGetBoolFromState(internalState, @"isForeground");
-        MKSetForeground(bid, isForeground);
 
         if (sDebugLog) RDLog(@"SBApp._setInternalProcState: %@ → isRunning=%d taskState=%d foreground=%d",
               bid, isRunning, taskState, isForeground);
 
         BOOL isRunningNow = (isRunning || taskState == 2 || taskState == 3);
-        // v1.6.31: 仅前台（用户打开/使用中）才进入 running set。
-        // 纯后台被 iOS 拉起（日历同步等）foreground=0 → 不进集合 → 不显示指示器。
-        // 注意：alive 但后台（用户退回后台的 App）走 else-if(!isRunningNow) 不命中 → 保留在集合（点保留）。
-        if (isRunningNow && isForeground) {
-            MKAddToRunningSet(bid);
-        } else if (!isRunningNow) {
-            MKRemoveFromRunningSet(bid);
-            isRunningNow = NO;
-        }
-
-        // v1.5.3: 定向+延迟刷新（替代 MKClearAllIndicators + MKRefreshAllIcons）
-        MKOnStateChange(bid, isRunningNow, isForeground);
+        // v1.6.31: 仅前台（用户打开/使用中）才进入 running set；纯后台被 iOS 拉起 foreground=0 不进集合。
+        // v2.0.43-refactor(F1): 共用 MKApplyAppState（见 hook 1）。
+        MKApplyAppState(bid, isRunningNow, isForeground);
     } @catch (NSException *e) {
         RDLog(@"_setInternalProcState EXCEPTION: %@", e.reason);
     }
@@ -3985,20 +3978,11 @@ static void MKArmFolderCloseGuard(void) {
 
         if (sDebugLog) RDLog(@"SBApp._setActivationState: %@ → state=%d", bid, state);
 
-        MKSetForeground(bid, state == 2);
-
+        BOOL isForeground = (state == 2);
         BOOL isRunningNow = (state >= 1);
         // v1.6.31: 仅前台（state==2）才进入 running set；纯后台（state==1）不进。
-        if (isRunningNow && state == 2) {
-            MKAddToRunningSet(bid);
-        } else if (!isRunningNow) {
-            MKRemoveFromRunningSet(bid);
-            isRunningNow = NO;
-        }
-
-        // v1.5.3: 定向+延迟刷新（替代 MKClearAllIndicators + MKRefreshAllIcons）
-        BOOL isFg = (state == 2);
-        MKOnStateChange(bid, isRunningNow, isFg);
+        // v2.0.43-refactor(F1): 共用 MKApplyAppState（见 hook 1）。
+        MKApplyAppState(bid, isRunningNow, isForeground);
     } @catch (NSException *e) {
         RDLog(@"_setActivationState EXCEPTION: %@", e.reason);
     }
