@@ -749,13 +749,13 @@ static UIView *MKGetCachedLabel(SBIconView *iv) {
 // "Accessory"，原宽匹配会误判成 TestFlight 小黄点（rd_log(77) 铁证：3 条
 // BETA-RESTORE-VIS bid=(null) cls=SBIconRecentlyUpdatedLabelAccessoryView）。
 // 真·小黄点无论子版本叫什么（只要含 Accessory/Beta）仍被命中，不回归 v2.0.30。
+// v2.0.49: 零分配版 —— 用 class_getName()+strstr 替代 NSStringFromClass+rangeOfString，
+// 避免「每帧 layout BFS 对子视图保 beta 点」场景下反复分配 NSString（原写法有性能退化）。
 static BOOL MKBetaClass(UIView *v) {
     if (!v) return NO;
-    NSString *cls = NSStringFromClass([v class]);
-    // 排除最近更新蓝点（同含 "Accessory"）
-    if ([cls rangeOfString:@"RecentlyUpdated" options:NSCaseInsensitiveSearch].location != NSNotFound) return NO;
-    return [cls rangeOfString:@"Accessory" options:NSCaseInsensitiveSearch].location != NSNotFound
-        || [cls rangeOfString:@"Beta"     options:NSCaseInsensitiveSearch].location != NSNotFound;
+    const char *n = class_getName([v class]);
+    if (strstr(n, "RecentlyUpdated")) return NO; // 排除最近更新蓝点（同含 "Accessory"）
+    return strstr(n, "Accessory") || strstr(n, "Beta");
 }
 // 在 label 子树里 BFS 找小黄点（label → SBUILegibilityContainerView → 更内层，故整棵搜）
 static UIView *MKFindBetaInLabel(UIView *label) {
@@ -2413,12 +2413,19 @@ static void MKUpdate(SBIconView *self) {
                 if (mkOv.hidden != mkShouldHide) {
                     BOOL mkWasHidden = mkOv.hidden;
                     if (!mkShouldHide) {
-                        // reveal（0.7s 闸门翻 NO）：一次性淡入，alpha 从 0 起
+                        // v2.0.49: reveal（0.7s 闸门翻 NO）一次性淡入。
+                        // 关键：原 animateWithDuration: 写在 layoutSubviews 内，CA 事务被布局上下文吞掉
+                        // → 淡入不渲染（"啪"地出现）。现先把 overlay 同步置 visible+alpha0（立即可见但透明），
+                        // 再把动画 block 经 dispatch_async 主队列延到布局事务外提交 → CA 事务正常提交、淡入可见。
+                        // 由外层 mkOv.hidden!=mkShouldHide 守卫：一次 reveal 只 dispatch 一次，不堆叠、不每帧跑。
                         mkOv.hidden = NO;
                         mkOv.alpha  = 0.0f;
-                        [UIView animateWithDuration:0.25 delay:0
-                            options:UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionAllowUserInteraction
-                            animations:^{ mkOv.alpha = 1.0f; } completion:nil];
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            if (mkOv.hidden) return; // 期间又被锁屏隐藏则放弃淡入
+                            [UIView animateWithDuration:0.25 delay:0
+                                options:UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionAllowUserInteraction
+                                animations:^{ mkOv.alpha = 1.0f; } completion:nil];
+                        });
                     } else {
                         // hide（锁屏）：瞬隐 + 复位 alpha，供下次淡入从 0 起
                         mkOv.hidden = YES;
@@ -2612,7 +2619,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.48: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.49: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -3251,13 +3258,16 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
             label.opaque = NO;
             if (bid.length) MKAssocLabelBid(label, bid);
         }
+        // v2.0.49: keepBetaDot 提到循环外（每帧省一次 sharedConfig 取单例）；MKBetaClass 已改零分配版。
+        BOOL mkKeepBeta = [MKConfig sharedConfig].keepBetaDot;
         NSMutableArray *mkSub = [NSMutableArray arrayWithArray:(NSArray *)[(UIView *)self subviews]];
         while (mkSub.count > 0) {
             UIView *mkS = [mkSub lastObject]; [mkSub removeLastObject];
+            // v2.0.22: 类名判定统一用 class_getName()+strstr（零分配），见 MKIsFolderIcon 同款。
             BOOL mkIsL = [mkS isKindOfClass:[UILabel class]] ||
                 (strstr(class_getName([mkS class]), "Label") != NULL);
             if (mkIsL) {
-                if ([MKConfig sharedConfig].keepBetaDot && MKBetaClass(mkS)) {
+                if (mkKeepBeta && MKBetaClass(mkS)) {
                     // v2.0.34: keepBetaDot ON -> force re-show hidden beta (fix OFF->ON permanent vanish)
                     if (mkS.hidden || mkS.alpha <= 0.0f) {
                         mkS.hidden = NO; mkS.alpha = 1.0f; mkS.layer.opacity = 1.0f; mkS.opaque = NO;
@@ -3266,6 +3276,15 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
                 } else if (!mkS.hidden && mkS.alpha > 0.0f) {
                     mkS.hidden = YES; mkS.alpha = 0.0f; mkS.layer.opacity = 0.0f; mkS.opaque = NO;
                     if (bid.length) MKAssocLabelBid(mkS, bid);
+                }
+            } else if (mkKeepBeta && MKBetaClass(mkS)) {
+                // v2.0.49: 非 Label 子视图（如 TestFlight 小黄点 SBIconBetaAccessoryView）每帧兜底复显。
+                // 旧逻辑只在 mkIsL 分支处理，够不到这种「label 兄弟节点」→ 只能等滑屏触发的
+                // MKBetaReconcile 才救回（即「滑屏才出来」根因）。现每帧保住，任何时刻可见。
+                // 性能：MKBetaClass 已改零分配；本分支仅 mkKeepBeta(默认开) 且 !mkIsL 子视图(通常 badge/accessory 等少数) 判定 → 与 v2.0.48 基线功耗一致。
+                if (mkS.hidden || mkS.alpha <= 0.0f) {
+                    mkS.hidden = NO; mkS.alpha = 1.0f; mkS.layer.opacity = 1.0f; mkS.opaque = NO;
+                    if (sDebugLog) RDLog(@"BETA-RESTORE-VIS bid=%@ cls=%@", MKGetCachedBid((SBIconView *)self), NSStringFromClass([mkS class]));
                 }
             }
             [mkSub addObjectsFromArray:mkS.subviews];
