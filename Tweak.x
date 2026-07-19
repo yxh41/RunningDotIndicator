@@ -376,6 +376,29 @@ static NSInteger sUnlockToken = 0;
 // (323 行) 之前声明，因为 MKUnlockRestore 内调用了它，否则新版 clang -Werror 报
 // implicit-function-declaration（v2.0.1 回归：前向声明原在 531 行、晚于调用点）。
 static void MKRefreshAllIcons(void);
+// v2.0.51: 解锁确定性 overlay 淡入（唯一可靠入口，抽到 helper 共用）。
+// 本机解锁 100% 走 MKScheduleUnlock(1.0s 兜底, 解锁动画早已结束、CA 上下文稳定)，
+// 仅少数设备走 MKUnlockRestore(lockstate "0" 通知)。两处都调本 helper，避免复制+漂移。
+// 不依赖逐帧不变量在 overlay 上做淡入（该路径在解锁过渡 CA 上下文里实测不渲染 → 「瞬现无过渡」）。
+// sUnlockFading 抑制紧随其后的 MKRefreshAllIcons 里逐帧不变量重复叠淡入（防重抖/双淡入）。
+static void MKUnlockFadeInOverlays(void) {
+    if (!sContainerToOverlay) return;
+    sUnlockFading = YES;
+    @try {
+        NSArray *ovs = [[sContainerToOverlay objectEnumerator].allObjects copy];
+        for (UIView *ov in ovs) {
+            if (!ov) continue;
+            ov.hidden = NO;
+            ov.alpha  = 0.0f;
+            [UIView animateWithDuration:0.3 delay:0
+                        options:UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionAllowUserInteraction
+                     animations:^{ ov.alpha = 1.0f; } completion:nil];
+            if (sDebugLog) RDLog(@"UNLOCK-FADE-IN: ov=%@ (alpha 0->1)", NSStringFromClass([ov class]));
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ sUnlockFading = NO; });
+    } @catch (NSException *e) { RDLog(@"UNLOCK-FADE-IN EXCEPTION: %@", e.reason); }
+}
 static void MKUnlockRestore(void) {
     if (!sContainerToOverlay) return;
     NSInteger myToken = ++sUnlockToken;
@@ -385,26 +408,9 @@ static void MKUnlockRestore(void) {
         if (myToken != sUnlockToken) return;   // 已被更新的解锁覆盖
         if (sLocked) return;                   // 期间又锁屏了
         @try {
-            // v2.0.50: 解锁淡入改由此处【显式、确定性】遍历所有 overlay 负责——
-            // 不再依赖 MKUpdate 逐帧不变量在 overlay 上做淡入（该路径在解锁过渡的 CA
-            // 上下文里实测不渲染，导致「瞬现无过渡」）。此处直接 ov.alpha=0 再
-            // animateWithDuration 0->1（与 L2634 创建淡入同款确定性 animate，不依赖布局/不变量）。
-            // sUnlockFading 抑制紧随其后的 MKRefreshAllIcons 里逐帧不变量重复叠淡入（防重抖/双淡入）。
-            sUnlockFading = YES;
-            NSArray *ovs = [[sContainerToOverlay objectEnumerator].allObjects copy];
-            for (UIView *ov in ovs) {
-                if (!ov) continue;
-                ov.hidden = NO;
-                ov.alpha  = 0.0f;
-                [UIView animateWithDuration:0.3 delay:0
-                            options:UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionAllowUserInteraction
-                         animations:^{ ov.alpha = 1.0f; } completion:nil];
-                if (sDebugLog) RDLog(@"UNLOCK-FADE-IN: ov=%@ (alpha 0->1)", NSStringFromClass([ov class]));
-            }
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ sUnlockFading = NO; });
-            // 仍触发全量刷新：让每个图标经逐帧不变量重推 hidden/alpha（此刻只解隐、不叠动画），
-            // 同时是离屏未布局图标的安全网（被遍历到的图标都会跑逐帧逻辑）。
+            MKUnlockFadeInOverlays();   // v2.0.51: 确定性淡入抽到 helper（MKScheduleUnlock 也调，本机走那条）
+            // 仍触发全量刷新：让每个图标经逐帧不变量重推 hidden/alpha（此刻只解隐、不叠动画，
+            // 因 sUnlockFading=YES 抑制逐帧淡入；同时是离屏未布局图标的安全网）。
             MKRefreshAllIcons();
             if (sDebugLog) RDLog(@"UNLOCK: explicit fade-in all overlays + refreshed icons");
         } @catch (NSException *e) { RDLog(@"UNLOCK EXCEPTION: %@", e.reason); }
@@ -604,14 +610,13 @@ static void MKScheduleUnlock(void) {
             NSTimeInterval now = [NSDate date].timeIntervalSince1970;
             if (now - sLockAt < 0.7) return;  // 又有更新的锁屏，等下一轮
             sLocked = NO;
-            // v2.0.47-fix: 不再直接 MKSetAllIndicatorsHidden(NO) 强制显——
-            // 它会跳过 per-frame 的 reveal 淡入分支、且不动 alpha，与 hide 分支的
-            // alpha=0 叠加成「解锁后隐形」(rd_log94: 552 条 ind(h=0 a=0.00))，
-            // 并令 per-frame 的 hidden!=shouldHide 永不成立→淡入从不触发(0 命中)。
-            // 改为仅触发 MKRefreshAllIcons，由 MKUpdate 逐帧不变量统一负责
-            // reveal + 一次性淡入(alpha 0->1 正确复位)；淡入与 reveal 同源不闪。
+            // v2.0.51: 本机解锁 100% 走此 1.0s 兜底路径（lockstate "0" 通知不派发）。
+            // 在此做确定性 overlay 淡入（解锁动画早已结束、CA 上下文稳定 → 淡入必渲染），
+            // 不再单靠逐帧不变量（过渡期 CA 上下文里淡入不渲染 → 「瞬现无过渡」）。
+            // sUnlockFading 抑制其后 MKRefreshAllIcons 的逐帧淡入（防重抖/双淡入）。
+            MKUnlockFadeInOverlays();
             MKRefreshAllIcons();
-            if (sDebugLog) RDLog(@"UNLOCK(timer): refreshed all icons (per-frame invariant owns reveal+fade)");
+            if (sDebugLog) RDLog(@"UNLOCK(timer): explicit fade-in overlays + refreshed all icons");
         } @catch (NSException *e) {
             RDLog(@"UNLOCK(timer) EXCEPTION: %@", e.reason);
         }
@@ -2652,7 +2657,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.50: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.51: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
 
@@ -3301,10 +3306,14 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
                 (strstr(class_getName([mkS class]), "Label") != NULL);
             if (mkIsL) {
                 if (mkKeepBeta && MKBetaClass(mkS)) {
-                    // v2.0.34: keepBetaDot ON -> force re-show hidden beta (fix OFF->ON permanent vanish)
-                    if (mkS.hidden || mkS.alpha <= 0.0f) {
+                    // v2.0.51: beta 点(Label 类)若仍嵌套在被藏 name-label 内（非 iconView 直接子视图）
+                    // → 脱离到 iconView，而非仅 force-show（隐藏父遮挡子，force-show 无效 → 旧「滑屏才出来」根因）。
+                    UIView *mkSp = mkS.superview;
+                    if (mkSp && mkSp != (UIView *)self) {
+                        MKEnsureBetaOnIconView((UIView *)self, mkS);
+                    } else if (mkS.hidden || mkS.alpha <= 0.0f) {
                         mkS.hidden = NO; mkS.alpha = 1.0f; mkS.layer.opacity = 1.0f; mkS.opaque = NO;
-                        if (sDebugLog) RDLog(@"BETA-RESTORE-VIS bid=%@ cls=%@", MKGetCachedBid((SBIconView *)self), NSStringFromClass([mkS class]));
+                        if (sDebugLog) RDLog(@"BETA-KEEP bid=%@ cls=%@", MKGetCachedBid((SBIconView *)self), NSStringFromClass([mkS class]));
                     }
                 } else if (!mkS.hidden && mkS.alpha > 0.0f) {
                     mkS.hidden = YES; mkS.alpha = 0.0f; mkS.layer.opacity = 0.0f; mkS.opaque = NO;
