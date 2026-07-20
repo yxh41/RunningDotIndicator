@@ -3827,7 +3827,7 @@ static void MKArmFolderCloseGuard(NSSet *pinViews) {
     if (sFolderOpen) {
         if (sProbeLog) RDLog(@"FOLDER-CLOSE-ARM on=1 (vc)");
         // v2.0.68: 方案 D —— 此刻文件夹尚在窗口、子树有效，枚举其内部迷你图标 SBIconView 指针收进瞬态集合(关窗期 hook 查归属)。
-        NSSet *mkPinSet = MKMkFolderClosePinSet((UIView *)self.view);
+        NSSet *mkPinSet = MKMkFolderClosePinSet([(UIViewController *)self view]);  // v2.0.68: SBFolderController 是 forward class，不能用 .view 点属性；cast 到完整 UIViewController* 取 view（编译器可见）
         MKArmFolderCloseGuard(mkPinSet);
     }
 }
