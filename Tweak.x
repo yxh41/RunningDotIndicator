@@ -696,16 +696,10 @@ static NSString *MKGetCachedBid(SBIconView *iv) {
         // v2.0.66.2: 回收复用清掉残留 iOS 原生 beta 小黄点(SBIconBetaLabelAccessoryView，
         // 名称 label 的兄弟节点直挂 SBIconView)。旧 App 是 beta 时该点被留下(本意保黄点)，
         // icon 换成非 beta App 后 iOS 不自动清 → 残留在普通 App 名称旁("到处出现/捉迷藏"，用户 rd_log135 实锤)。
-        // 仅当【新 App 非 beta】才清(避免误删新 beta App 自己的黄点)；运行 beta App 未换 icon 不受影响。
-        BOOL mkNewIsBeta = NO;
-        if ([icon respondsToSelector:@selector(labelAccessoryType)]) {
-            id mkLat = [icon labelAccessoryType];
-            if (mkLat && [[[mkLat description] lowercaseString] rangeOfString:@"beta"].location != NSNotFound) mkNewIsBeta = YES;
-        }
-        if (!mkNewIsBeta) {
-            for (UIView *sv in [iv.subviews copy]) {
-                if (MKBetaClass(sv)) [sv removeFromSuperview];
-            }
+        // 仅在【换图标(本分支)】时清：iOS 会在布局时按新 App 是否真 beta 自行决定要不要重建该点，
+        // 故无条件清旧点不会误删真 beta App 的黄点(它会被 iOS 重建)；只清掉残留的"上一任"点。
+        for (UIView *sv in [iv.subviews copy]) {
+            if (MKBetaClass(sv)) [sv removeFromSuperview];
         }
     }
     objc_setAssociatedObject(iv, &kMKIconKey, icon, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
