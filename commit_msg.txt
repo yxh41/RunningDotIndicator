@@ -1,0 +1,21 @@
+v2.0.79 ① 根治关窗文件夹缩略图名称闪 + 清死代码
+
+【① 真因与修法】
+rd_log(127) 实证: REVEAL-ATTEMPT=308, 其中 pinned=0 漏网 138 条 —— 这正是「关窗缩略图 ~1s 名称闪」。
+漏网真因: 闪的是【桌面/Dock 文件夹图标缩略图】(SBFolderIconView/SBFolderIconImageView 子树)里的迷你 label,
+其祖先是文件夹图标, 非打开态 SBFolderView。旧两法均漏抓:
+  - MKIsInsideFolderThumb 依赖 [icon] 类判定, 关窗期 icon 重建致失效;
+  - MKIconInClosingFolderView 只认 SBFolderView/SBFloatyFolderScrollView(打开内部)。
+新函数 MKIconInFolderIconImage 沿 superview 链认类名含 "FolderIcon"(class_getName+strstr, 零分配、抗重建),
+补进 MKSetIconLabelAlphaHook 的 mkPin OR 链, 关窗揭示瞬间即钉 alpha=0, 灭 138 漏网。
+安全闸: 仅 sFolderClosing 窗口内生效; home/Dock(祖先 SBIconScrollView/SBDock*)不命中→正常藏名;
+打开态 sFolderClosing=NO→② 不受影响; 完全不碰指示器(用户已确认指示器正常)。
+
+【死代码清理(净删 Tweak.x 111 行)】
+- OPENFIX 瞎探针: 删 MKOpenFixProbe 函数体 + 4 处调用 + 2 个前向声明(②探针已无用)。
+- SNAP-PRE=0 死探针: 删 MKSafeSnapshotProbe 函数体 + 2 处调用 + 前向声明(rd_log119 实证恒为 0)。
+- 2.0.75 已证无效的 born 标记: 删 kMKBornInCloseFolderKey 声明 + 诞生期 set 块 + mkPin 读块 + 收尾 clear 循环
+  (其意图由 MKIconInFolderIconImage 更稳地覆盖)。
+- 同步清理两处引用已删函数的陈旧注释。
+
+版本戳四处同步 2.0.79 (control / Root.plist / Indicator CREATE / RDBUILD 横幅)。
