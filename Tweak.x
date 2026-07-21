@@ -2196,7 +2196,7 @@ static BOOL MKIsInsideFolderThumb(SBIconView *iv) {
         anc = [anc superview];
         up++;
     }
-    return NO            return NO;
+    return NO;
     }
 
 // v2.0.78 ①: 关窗时判定 self(SBIconView/label) 是否位于【正在缩回的打开态文件夹】(SBFolderView / SBFloatyFolderScrollView) 内。
