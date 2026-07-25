@@ -2168,6 +2168,8 @@ static UIView *MKFindDockView(void) {
     return nil;
 }
 
+// 前向声明: MKCountVisibleNameLabels / MKCollectVisibleLabels 在 MKIsIconNameLabel 定义之前调用它
+static BOOL MKIsIconNameLabel(UIView *v);
 // v2.0.66.17: 递归数视图子树内可见的图标名 label 数(仅计入 SBIconLegibilityLabelView 等, 排除角标 UILabel)
 static NSInteger MKCountVisibleNameLabels(UIView *view) {
     if (!view) return 0;
