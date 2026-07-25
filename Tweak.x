@@ -2154,21 +2154,20 @@ static NSString *MKBidOfIconView(SBIconView *iv) {
     return bid;
 }
 
-// v2.0.66.12: 在 key window 里找 Dock 视图(几何重叠兜底)
+// v2.0.66.12: 在 key window 里找 Dock 视图(几何重叠兜底; 迭代 DFS 取代递归 block, 规避 -Warc-retain-cycles)
 static UIView *MKFindDockView(void) {
     UIWindow *kw = nil;
     @try { kw = [UIApplication sharedApplication].keyWindow; } @catch (NSException *e) {}
     if (!kw) return nil;
-    __block UIView *found = nil;
-    __block void (^recurse)(UIView *);
-    recurse = ^(UIView *v) {
-        if (found) return;
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:kw];
+    while ([stack count]) {
+        UIView *v = [stack lastObject];
+        [stack removeLastObject];
         NSString *cn = NSStringFromClass([v class]);
-        if ([cn rangeOfString:@"Dock"].location != NSNotFound) { found = v; return; }
-        for (UIView *sv in v.subviews) recurse(sv);
-    };
-    recurse(kw);
-    return found;
+        if ([cn rangeOfString:@"Dock"].location != NSNotFound) return v;
+        for (UIView *sv in v.subviews) [stack addObject:sv];
+    }
+    return nil;
 }
 
 // v2.0.66.12: 沿 superview 链取 SBIconListView(负一屏几何重叠兜底用)
