@@ -2117,6 +2117,7 @@ static BOOL MKLabelOffscreenOrRecycled(UIView *v) {
 
 // v2.0.66.13: 递归读 label 可见文字 —— SBIconLegibilityLabelView 文字可能在深层非 UILabel 节点(attributedText/子层),
 // 故递归下钻整棵子树, 优先 -text, 退而 -attributedText.string, 兜底任意子视图文字; 取代 v2.0.66.12 单层下钻(读不到 → 全 nil)。
+// v2.0.66.15: 原 v2.0.66.13 的 wrapper MKLabelVisibleText 已废 —— 直接用 MKFindTextDeep
 static NSString *MKFindTextDeep(UIView *v) {
     if (!v) return nil;
     NSString *t = nil;
@@ -2146,11 +2147,6 @@ static NSString *MKFindTextDeep(UIView *v) {
         if (st && [st length]) return st;
     }
     return nil;
-}
-
-static NSString *MKLabelVisibleText(UIView *label) {
-    if (!label) return nil;
-    return MKFindTextDeep(label);
 }
 
 // v2.0.66.13: MKBidOfIconView 废弃 —— 改用工程统一 MKGetCachedBid(走缓存+icon 取值+文件夹过滤, 比自写 [iv icon] 可靠, 修 parentBid 全 nil); 见 MKStrayNameProbe。
