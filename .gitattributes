@@ -1,0 +1,7 @@
+# 统一源码行尾为 LF（CI 在 macOS 上跑，BSD grep 的 banner-guard 对 CRLF 敏感）
+*.x text eol=lf
+*.m text eol=lf
+*.h text eol=lf
+*.plist text eol=lf
+Makefile text eol=lf
+control text eol=lf
