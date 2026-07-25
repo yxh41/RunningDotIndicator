@@ -2200,7 +2200,7 @@ static void MKStrayNameProbe(UIView *label) {
         // v2.0.66.13: 读 label 可见文字 + 属主图标 displayName, 用于「文字不符」判据(关联键在回收窗口被清时仍可靠)
         NSString *txt = MKLabelVisibleText(label);
         NSString *ownerName = nil;
-        @try { id oicon = [owner icon]; if (oicon && [oicon respondsToSelector:@selector(displayName)]) ownerName = [oicon displayName]; } @catch (NSException *e) {}
+        @try { id oicon = [(SBIconView *)owner icon]; if (oicon && [oicon respondsToSelector:@selector(displayName)]) ownerName = [oicon displayName]; } @catch (NSException *e) {}
         // 错附: label 当前真父 != SpringBoard 指派属主(根因信号)
         BOOL misAttached = (intendedIV && intendedIV != owner);
         // bid 不匹配: 父图标 app != 指派属主 app
