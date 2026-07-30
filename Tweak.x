@@ -2087,34 +2087,7 @@ static NSString *MKForeignContainerCtx(UIView *label) {
     return nil;
 }
 
-// v2.0.66.12: 几何串名探针 —— 可见 label 落入「非标准容器」(祖先链) 或「几何严重偏离属主图标」(名字画离图标) 即记录;
-// 并附 label 祖先链类名。祖先链探针对「几何重叠型」串名(主屏层级内 frame 压到 Dock/负一屏)结构性抓不到, 故改几何优先。
-// Dock 运行中 app 名本就显示(跳过)。常开(无 debug 门控)。
-// v2.0.66.12: 沿 superview 链取最近 SBIconView(真父, 不依赖几何反解); 取代 v2.0.66.12 的 MKIconViewForLabel 几何反解, 根除文件夹密集网格错主误报
-static UIView *MKTrueParentIconView(UIView *label) {
-    if (!label) return nil;
-    Class ivCls = MKSBIconViewClass();
-    UIView *p = label.superview;
-    while (p) {
-        if (ivCls && [p isKindOfClass:ivCls]) return p;
-        p = p.superview;
-    }
-    return nil;
-}
 
-// v2.0.66.12: 排除离屏/回收池/非 key window —— 这些 label 不可见, 几何 frame 是垃圾值, 必误报(rd_log(143) 扫到 SBRecycledViewsContainer 风暴)
-static BOOL MKLabelOffscreenOrRecycled(UIView *v) {
-    if (!v) return YES;
-    UIView *p = v;
-    while (p) {
-        if ([NSStringFromClass([p class]) isEqualToString:@"SBRecycledViewsContainer"]) return YES;
-        p = p.superview;
-    }
-    UIWindow *w = v.window;
-    if (!w) return YES;
-    @try { if (w != [UIApplication sharedApplication].keyWindow) return YES; } @catch (NSException *e) {}
-    return NO;
-}
 
 // v2.0.66.13: 递归读 label 可见文字 —— SBIconLegibilityLabelView 文字可能在深层非 UILabel 节点(attributedText/子层),
 // 故递归下钻整棵子树, 优先 -text, 退而 -attributedText.string, 兜底任意子视图文字; 取代 v2.0.66.12 单层下钻(读不到 → 全 nil)。
@@ -2150,101 +2123,16 @@ static NSString *MKFindTextDeep(UIView *v) {
     return nil;
 }
 
-// v2.0.66.24: 健壮读图标名 label 文本 —— SBIconLegibilityLabelView 不实现 -text/-attributedText(文本存于 legibilitySettings.text),
-// 旧 MKFindTextDeep 读不到 → STRAY-NAME 落 labelText=? 抓不到真串名(用户反馈 dock 显示的是主屏其他 app 名, 但旧 log 全是 ?)。
-// 故 -text/attributedText 失败后兜底读 legibilitySettings.text。
-static NSString *MKLabelTextRobust(UIView *v) {
-    NSString *t = MKFindTextDeep(v);
-    if (t && [t length]) return t;
-    @try {
-        SEL selLS = NSSelectorFromString(@"legibilitySettings");
-        if (selLS && [v respondsToSelector:selLS]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            id ls = [v performSelector:selLS];
-#pragma clang diagnostic pop
-            SEL selText = NSSelectorFromString(@"text");
-            if (ls && selText && [ls respondsToSelector:selText]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                id lt = [ls performSelector:selText];
-#pragma clang diagnostic pop
-                if (lt && [lt isKindOfClass:[NSString class]] && [lt length]) return (NSString *)lt;
-            }
-        }
-    } @catch (NSException *e) {}
-    return nil;
-}
 
 // v2.0.66.13: MKBidOfIconView 废弃 —— 改用工程统一 MKGetCachedBid(走缓存+icon 取值+文件夹过滤, 比自写 [iv icon] 可靠, 修 parentBid 全 nil); 见 MKStrayNameProbe。
 
 
-// v2.0.66.12: 在 key window 里找 Dock 视图(几何重叠兜底; 迭代 DFS 取代递归 block, 规避 -Warc-retain-cycles)
-static UIView *MKFindDockView(void) {
-    UIWindow *kw = nil;
-    @try { kw = [UIApplication sharedApplication].keyWindow; } @catch (NSException *e) {}
-    if (!kw) return nil;
-    NSMutableArray *stack = [NSMutableArray arrayWithObject:kw];
-    while ([stack count]) {
-        UIView *v = [stack lastObject];
-        [stack removeLastObject];
-        NSString *cn = NSStringFromClass([v class]);
-        if ([cn rangeOfString:@"Dock"].location != NSNotFound) return v;
-        for (UIView *sv in v.subviews) [stack addObject:sv];
-    }
-    return nil;
-}
 
 // 前向声明(定义见 MKInstallLabelHook 附近)
 static BOOL MKClassIsSubclass(Class sub, Class c);
 
-// v2.0.66.17: 严格判定「图标名 label」—— 仅 SBIconLegibilityLabelView / SBIconListLabel / SBIconLabelView 及其子类。
-// 排除其他越狱插件的角标 UILabel / 任意含 "Label" 的视图, 避免 dock 串名判据把正常带角标 dock app 误判为串名(用户澄清 dock 不显示名字 + 角标由另一插件绘制)。
-static BOOL MKIsIconNameLabel(UIView *v) {
-    if (!v || v.hidden || v.alpha <= 0.01f || CGRectIsEmpty(v.bounds)) return NO;
-    Class c = [v class];
-    if (!c) return NO;
-    static Class sLeg = nil, sList = nil, sIcon = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        sLeg  = NSClassFromString(@"SBIconLegibilityLabelView");
-        sList = NSClassFromString(@"SBIconListLabel");
-        sIcon = NSClassFromString(@"SBIconLabelView");
-    });
-    if ((sLeg  && MKClassIsSubclass(c, sLeg))  ||
-        (sList && MKClassIsSubclass(c, sList)) ||
-        (sIcon && MKClassIsSubclass(c, sIcon))) return YES;
-    return NO;
-}
 
-// v2.0.66.18: 负一屏/widget 容器内"任意可见 UILabel"（排除状态栏文本 + 排除 SBIconLegibilityLabelView 三兄弟已由 MKIsIconNameLabel 覆盖）。
-// 目的：抓到负一屏 widget 下方"显示成其他 App 名称"的 UILabel —— 这类 label 是 widget 框架自渲染(非 SBIconLegibilityLabelView 子类),
-// 此前 MKIsIconNameLabel 第一层严格匹配就把它丢了, 导致 v2.0.66.10~17 在负一屏真串名上始终 0 命中(只抓到状态栏 widget 假阳性)。
-// 仅当祖先链命中 SBDock/SBToday/SBWidget/SBDashboard/TodayView 且非状态栏时返回 YES; 主屏/状态栏保持严格 MKIsIconNameLabel 不动(保护 dock 判据 + 避免状态栏噪声)。
-static BOOL MKIsWidgetLabel(UIView *v) {
-    if (!v || v.hidden || v.alpha <= 0.01f || CGRectIsEmpty(v.bounds)) return NO;
-    if (![v isKindOfClass:[UILabel class]]) return NO;
-    UIView *p = v.superview;
-    while (p) {
-        NSString *cn = NSStringFromClass([p class]);
-        if ([cn containsString:@"StatusBar"]) return NO; // 状态栏文本排除(避免 rd_log148 的 8 条 NON-HOME 假阳性)
-        if ([cn hasPrefix:@"SBDock"] || [cn hasPrefix:@"SBToday"] || [cn hasPrefix:@"SBWidget"] || [cn hasPrefix:@"SBDashboard"] || [cn containsString:@"TodayView"]) return YES;
-        p = p.superview;
-    }
-    return NO;
-}
 
-// v2.0.66.12: 沿 superview 链取 SBIconListView(负一屏几何重叠兜底用)
-static UIView *MKTrueParentListView(UIView *v) {
-    if (!v) return nil;
-    Class lvCls = NSClassFromString(@"SBIconListView");
-    UIView *p = v.superview;
-    while (p) {
-        if (lvCls && [p isKindOfClass:lvCls]) return p;
-        p = p.superview;
-    }
-    return nil;
-}
 
 // v2.0.66.14: 判断 name label 是否处于「主屏图标网格」—— 祖先链含 SBIconListView 且该 list 在 SBHomeScreenView/SBFolder 之下。
 // 用于揭示「负一屏/widget/App 资源库」等非法位置(这些位置无 SBIconListView 或 list 不在主屏层级), 让探针能抓到此前漏掉的负一屏串名(rd_log(145) 实测 0 命中)。
