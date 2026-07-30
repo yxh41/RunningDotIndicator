@@ -2161,6 +2161,7 @@ static CFMutableDictionaryRef sOrigSetHiddenByClassCF = NULL;
 static CFMutableDictionaryRef sOrigSetAlphaByClassCF = NULL;
 static CFMutableDictionaryRef sOrigDidMoveToWindowByClassCF = NULL;
 static CFMutableDictionaryRef sOrigDidMoveToSuperviewByClassCF = NULL;
+static CFMutableDictionaryRef sOrigSetIconLabelAlphaByClassCF = NULL; // v2.0.66.34-perf: 第 5 个 hook(setIconLabelAlpha:) 的零分配镜像
 
 // v2.0.12: 原 MKLabelHostInFolder() 已删除——v2.0.9 用它实现「关合窗口内对文件夹内 label 让步原生」，
 // 而 v2.0.12 已撤销该让步(关合窗口内文件夹内 label 一律强藏,见 MKSetHiddenHook/MKSetAlphaHook/
@@ -2558,6 +2559,7 @@ static void MKHookSBIconViewAlpha(void) {
         if (m && m != supM && method_getImplementation(m) != (IMP)MKSetIconLabelAlphaHook) {
             IMP orig = method_getImplementation(m);
             [sOrigSetIconLabelAlphaByClass setObject:[NSValue valueWithPointer:(void *)orig] forKey:k];
+            if (sOrigSetIconLabelAlphaByClassCF) CFDictionarySetValue(sOrigSetIconLabelAlphaByClassCF, (const void *)cls, (const void *)orig);
             method_setImplementation(m, (IMP)MKSetIconLabelAlphaHook);
         }
     }
@@ -2576,6 +2578,7 @@ static void MKHookOneLabelClass(Class cls) {
         sOrigSetAlphaByClassCF  = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
         sOrigDidMoveToWindowByClassCF = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
         sOrigDidMoveToSuperviewByClassCF = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+        sOrigSetIconLabelAlphaByClassCF = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
     }
     if ([sOrigSetHiddenByClass objectForKey:k]) return; // 已钩，幂等
     // v1.6.87: 仅当本类「真正重写」setHidden:/setAlpha: 才替换 IMP。
@@ -2851,7 +2854,7 @@ static void MKUpdate(SBIconView *self) {
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:fBid];
                 if (sHiddenBids) [sHiddenBids addObject:fBid]; // v1.6.85: 文件夹合成 key 也要藏名
-                if (sDebugLog) RDLog(@"FICON-CREATE v2.0.66.12: %@ rep=%@ fixed=%d container=%@ frame=%@", fBid, rep, fixedColor, fContainerCls, NSStringFromCGRect(indicatorFrame));
+                if (sDebugLog) RDLog(@"FICON-CREATE v2.0.66.12: %@ rep=%@ fixed=%d container=%s frame=%@", fBid, rep, fixedColor, fContainerCls, NSStringFromCGRect(indicatorFrame));
                 MKFadeInFolderIndicatorIfClosing(indicator); // v2.0.43: 关窗期淡入, 消除缩略图点瞬现
             } else {
                 if (indicator.superview != overlay) {
