@@ -2089,40 +2089,6 @@ static NSString *MKForeignContainerCtx(UIView *label) {
 
 
 
-// v2.0.66.13: 递归读 label 可见文字 —— SBIconLegibilityLabelView 文字可能在深层非 UILabel 节点(attributedText/子层),
-// 故递归下钻整棵子树, 优先 -text, 退而 -attributedText.string, 兜底任意子视图文字; 取代 v2.0.66.12 单层下钻(读不到 → 全 nil)。
-// v2.0.66.15: 原 v2.0.66.13 的 wrapper MKLabelVisibleText 已废 —— 直接用 MKFindTextDeep
-static NSString *MKFindTextDeep(UIView *v) {
-    if (!v) return nil;
-    NSString *t = nil;
-    @try {
-        if ([v respondsToSelector:@selector(text)]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            t = [v performSelector:@selector(text)];
-#pragma clang diagnostic pop
-        }
-        if ((!t || [t length] == 0) && [v respondsToSelector:@selector(attributedText)]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            id attr = [v performSelector:@selector(attributedText)];
-#pragma clang diagnostic pop
-            if (attr && [attr respondsToSelector:@selector(string)]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                t = [attr performSelector:@selector(string)];
-#pragma clang diagnostic pop
-            }
-        }
-    } @catch (NSException *e) {}
-    if (t && [t length]) return t;
-    for (UIView *sv in v.subviews) {
-        NSString *st = MKFindTextDeep(sv);
-        if (st && [st length]) return st;
-    }
-    return nil;
-}
-
 
 // v2.0.66.13: MKBidOfIconView 废弃 —— 改用工程统一 MKGetCachedBid(走缓存+icon 取值+文件夹过滤, 比自写 [iv icon] 可靠, 修 parentBid 全 nil); 见 MKStrayNameProbe。
 
