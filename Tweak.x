@@ -2066,10 +2066,6 @@ static NSString *MKLabelToBid(UIView *label) {
 // sHiddenBids(即未运行→Dock 中本不应显示任何名称)却仍有可见名称 label → 即串名 bug, 落日志。
 // 节流: 同槽 ≥30s 至多 1 条, 防刷屏; 纯只读 + 记日志, 零行为变化。
 // ====================================================================
-static NSTimeInterval sLastStrayLog = 0;
-static __unsafe_unretained UIView *sLastStrayLabel = nil;
-static NSMutableArray *sStrayScanBuf = nil;   // v2.0.66.12: 几何扫描收集缓冲
-static NSTimer *sStrayScanTimer = nil;        // v2.0.66.12: 周期几何扫描定时器
 
 // v2.0.66.12: 判定 label 父链是否落在「已知非标准图标槽」容器；命中返回 ctx 串(否则 nil)。
 // 覆盖 Dock 与负一屏 Today/Widget 宿主；主屏标准图标槽(SBIconListView 等)不在其列，本就显示名称不可误报。
@@ -2282,133 +2278,6 @@ static BOOL MKLabelInDock(UIView *label) {
     return NO;
 }
 
-static void MKStrayNameProbe(UIView *label) {
-    if (!label) return;
-    @try {
-        if (label.hidden || label.alpha <= 0.01f) return;          // 仅查可见 label
-        if (MKLabelOffscreenOrRecycled(label)) return;             // 排除回收池/离屏/非 key window
-        // v2.0.66.18: 负一屏/widget 容器内"非图标名 UILabel"走独立诊断分支 ——
-        // 抓"widget 下方显示成其他 App 名称"的 UILabel 真实类名+父链, 确认机制(a=widget 自渲染取错名)/(b=SBIconView 回收复用)。
-        // 不进现有 dockStray/nonHomeStray 判据(避免重复记 + 避免误把 widget 合法 UILabel 当串名)。
-        NSString *fctx = MKForeignContainerCtx(label);
-        if (fctx && !MKIsIconNameLabel(label)) {
-            return; // widget 容器内非图标名 label 不进现有 dock/nonHome 判据
-        }
-        // v2.0.66.15: 不再因「真父非 SBIconView」直接 bail —— 负一屏 widget 配置视图里 iOS 16 回收复用主屏 SBIconView 重画,
-        // 但 widget host 包装的 owner 不在祖先链暴露 SBIconView, 故 owner=nil 也要继续到 ORPHAN 判据(修 rd_log(145)/(147) 实测 0 命中)。
-        UIView *owner = MKTrueParentIconView(label);               // 真父 SBIconView(链, 非几何)
-        NSString *parentBid = nil;
-        NSString *ownerName = nil;
-        if (owner) {
-            parentBid = MKGetCachedBid((SBIconView *)owner);
-            @try { id oicon = [(SBIconView *)owner icon]; if (oicon && [oicon respondsToSelector:@selector(displayName)]) ownerName = [oicon displayName]; } @catch (NSException *e) {}
-        }
-        UIView *intendedIV = objc_getAssociatedObject(label, &kMKLabelIconKey); // SpringBoard 指派属主
-        NSString *intendedBid = (intendedIV && intendedIV != owner && parentBid) ? MKGetCachedBid((SBIconView *)intendedIV) : parentBid;
-        NSString *ctx = MKForeignContainerCtx(label);              // SBDock/SBToday/SBWidget/SBDashboard
-        // v2.0.66.24: 隐藏前先读真实文本(含 legibilitySettings.text 兜底) —— SBIconLegibilityLabelView 不实现 -text, 旧 MKFindTextDeep 读不到 → 落 labelText=?。
-        // 用户反馈 dock 上显示的是主屏其他 app 名, 故必须读到真串名文本才能定位(回答"dock 上出现的叫什么")。
-        NSString *txt = MKLabelTextRobust(label);
-        // v2.0.66.20: 负一屏/dock 容器内出现「图标名 label」= 必然串名(这些位置本不显示名称; 用户已确认负一屏不显示名称, dock 同理)。
-        // 故图标名 label 落在 foreign container(ctx!=nil) 直接强制藏名。比 v2.0.66.19 的 inIconTree 窄条件更准: 图标名 label 走本路径,
-        // 根本不会进上方 NEG-WIDGET-LABEL 分支, 故 v2.0.66.19 的修复对真实串名实际不触发。
-        // 安全: fctx 仅匹配 DOCK/TODAY/WIDGET/DASHBOARD(均不显示图标名); App 资源库/App 切换器(显示名称)类名不匹配 → 不误伤。
-        // v2.0.66.24: capture-first-then-hide —— 隐藏前先记 CTX-HIDE(真实文本+链), 回答"dock/负一屏到底显示了哪个 app 名"。
-        if (ctx) {
-            @try {
-                NSMutableString *hchain = [NSMutableString string];
-                UIView *hc = label.superview; NSInteger hl = 0;
-                while (hc && hl < 12) { if (hl>0) [hchain appendString:@" > "]; [hchain appendString:NSStringFromClass([hc class])]; hc = hc.superview; hl++; }
-                RDLog(@"CTX-HIDE: ctx=%@ cls=%@ text=%@ lblBid=%@ chain=%@",
-                      ctx, NSStringFromClass([label class]), (txt?txt:@"?"), (MKLabelToBid(label)?MKLabelToBid(label):@"?"), hchain);
-                label.hidden = YES; [label.layer removeAllAnimations]; if (parentBid) MKAssocLabelBid(label, parentBid);
-            } @catch (NSException *e) {}
-        }
-        CGRect lf = [label convertRect:label.bounds toView:nil];
-        // v2.0.66.13: 读 label 可见文字 + 属主图标 displayName, 用于「文字不符」判据(关联键在回收窗口被清时仍可靠)
-        // v2.0.66.24: txt 已在隐藏前由 MKLabelTextRobust 读取(见上方), 此处不再重复声明。
-        // 错附: label 当前真父 != SpringBoard 指派属主(根因信号)
-        BOOL misAttached = (intendedIV && intendedIV != owner);
-        // bid 不匹配: 父图标 app != 指派属主 app
-        BOOL bidMismatch = (parentBid && intendedBid && ![parentBid isEqualToString:intendedBid]);
-        // 文字不符: label 可见文字 != 属主图标 displayName(兜底关联键被清的回收窗口真串名)
-        BOOL textMismatch = (txt && ownerName && ![txt isEqualToString:ownerName]);
-        // v2.0.66.17: dock 设计上【根本不显示任何 name label】(藏名 + 指示器)。故 dock 串名根因 = 主屏运行中 app B 的 SBIconView
-        // 被 iOS 回收复用去显示 dock 槽 A, B 的 name label 跟着被带过去显示(本机 dock 槽本不该有名字)。
-        // 因此: dock 槽内出现【任意一个】图标名 label 即属非法(正常 dock = 0 个 name label)。判定简化为 ownerInDock —— 不再依赖读 bid/文字(此前不可靠)。
-        // 用户澄清「dock 上的 app 本来就不显示名字」直接推翻了 v2.0.66.16 的「>1 个 label 才算串名」阈值(dock 连 1 个合法名都没有, 串名=1 个 → 旧阈值漏抓)。
-        NSString *lblBid = MKLabelToBid(label);   // 仅用于日志输出, 不再作为判据
-        BOOL ownerInDock = NO;
-        UIView *dock = MKFindDockView();
-        if (dock && owner) { UIView *ap = owner; while (ap) { if (ap == dock) { ownerInDock = YES; break; } ap = ap.superview; } }
-        // 任意图标名 label 落在 dock 容器内 = 串名(正常 dock 无 name label)。不读文字/不比 bid, 鲁棒; 角标 UILabel 已被 MKIsIconNameLabel 排除。
-        BOOL dockStray = (owner && ownerInDock);
-        // 负一屏几何重叠兜底: label 在屏上而其属主图标列表整体离屏(视觉上被挪到负一屏)
-        BOOL negOverlap = NO;
-        UIView *list = MKTrueParentListView(label);
-        if (list && !ctx && owner) {
-            CGRect screen = [UIScreen mainScreen].bounds;
-            CGRect listScreen = [list convertRect:list.bounds toView:nil];
-            if (CGRectIntersectsRect(lf, screen) && !CGRectIntersectsRect(listScreen, screen)) negOverlap = YES;
-        }
-        // foreign 容器内串名: 仅当该 label 确非此容器原生(错附/bid不符/文字不符)才记, 避免正常 Dock/Today label 误报
-        BOOL foreignStray = (ctx && (misAttached || bidMismatch || textMismatch));
-        // v2.0.66.14: 负一屏/widget/App 资源库等非主屏位置 —— 可见 icon-name label 既不在主屏网格(SBHomeScreenView/SBFolder 下 SBIconListView)也不在 Dock,
-        // 即属非法位置, 直接怀疑并记录(揭示真实祖先链, 供后续写精准修复); 此前 v2.0.66.13 因容器类名猜错 + 仅靠几何/foreign 判定而漏抓(rd_log(145) 实测 0 命中)。
-        BOOL inHome = MKLabelInHomeGrid(label);
-        BOOL inDock = MKLabelInDock(label);
-        BOOL nonHomeStray = (!inHome && !inDock);
-        // v2.0.66.15: ORPHAN-NAME —— label 无 SBIconView 真父, 但祖先链「同时」命中「负一屏/搜索/widget 宿主」+「SpringBoard 内部类(SBIcon/SBLegibility/SBTouch/SBFolder)」,
-        //   即 iOS 16 回收复用把主屏 SBIconView 复用到负一屏 widget 配置视图的根因指纹(widget host 自画图标 + 名, 但链中夹着 SBIcon 类, 暴露了回收源头)。
-        // 仅命中 today 宿主但无 SBIcon 内部类 → 正常 widget label 不抓; 反之亦然。
-        BOOL orphanStray = NO;
-        NSString *todayHostHit = nil, *sbInternalHit = nil;
-        if (!owner) {
-            UIView *pp = label.superview;
-            while (pp) {
-                NSString *pcn = NSStringFromClass([pp class]);
-                if (!todayHostHit && ([pcn hasPrefix:@"SBToday"] || [pcn hasPrefix:@"SBSearch"] || [pcn hasPrefix:@"SBWidget"] || [pcn hasPrefix:@"SBDashboard"] || [pcn containsString:@"TodayView"])) {
-                    todayHostHit = pcn;
-                }
-                if (!sbInternalHit && ([pcn hasPrefix:@"SBIcon"] || [pcn hasPrefix:@"SBLegibility"] || [pcn hasPrefix:@"SBTouch"] || [pcn hasPrefix:@"SBFolder"])) {
-                    sbInternalHit = pcn;
-                }
-                pp = pp.superview;
-            }
-            orphanStray = (todayHostHit != nil) && (sbInternalHit != nil);
-        }
-        if (!foreignStray && !dockStray && !negOverlap && !misAttached && !bidMismatch && !textMismatch && !nonHomeStray && !orphanStray) return;
-        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-        if (label == sLastStrayLabel && now - sLastStrayLog < 30.0) return; // 同 label 节流
-        sLastStrayLog = now; sLastStrayLabel = label;
-        NSMutableString *chain = [NSMutableString string];
-        UIView *p = label.superview; NSInteger lvl = 0;
-        while (p && lvl < 10) {
-            if (lvl > 0) [chain appendString:@" > "];
-            [chain appendString:NSStringFromClass([p class])];
-            p = p.superview; lvl++;
-        }
-        NSString *finalCtx = nil;
-        if (foreignStray) finalCtx = ctx;
-        else if (dockStray) finalCtx = @"DOCK-STRAY";
-        else if (orphanStray) finalCtx = @"ORPHAN-NAME";
-        else if (nonHomeStray) finalCtx = @"NON-HOME";
-        else if (negOverlap) finalCtx = @"NEG-OVL";
-        else if (misAttached) finalCtx = @"MISATTACH";
-        else if (bidMismatch) finalCtx = @"BIDMISMATCH";
-        else finalCtx = @"TEXTMISMATCH";
-        RDLog(@"STRAY-NAME: ctx=%@ parentBid=%@ intendedBid=%@ labelText=%@ lblBid=%@ chain=%@ labelF=(%.0f,%.0f,%.0f,%.0f) todayHost=%@ sbInternal=%@",
-              finalCtx,
-              (parentBid ? parentBid : @"?"),
-              (intendedBid ? intendedBid : @"?"),
-              (txt ? txt : @"?"),
-              (lblBid ? lblBid : @"?"),
-              chain,
-              lf.origin.x, lf.origin.y, lf.size.width, lf.size.height,
-              (todayHostHit ? todayHostHit : @"none"),
-              (sbInternalHit ? sbInternalHit : @"none"));
-    } @catch (NSException *e) {}
-}
 
 // v2.0.66.21: 暴力 dump —— 不再猜负一屏容器类名(SBDock/SBToday/SBWidget/SBDashboard/TodayView), 改结构判定:
 
@@ -2422,29 +2291,6 @@ static void MKStrayNameProbe(UIView *label) {
 
 
 
-// v2.0.66.12: 周期几何扫描 —— 兜底「label 经 setFrame 重定位(不触发 setHidden/setAlpha)」的串台路径。
-// 每 1s 遍历所有窗口, 收集可见 name label, 逐个走 MKStrayNameProbe(几何 + 容器双判定)。
-static void MKCollectVisibleLabels(UIView *view, NSMutableArray *out) {
-    if (!view || !out) return;
-    if (MKIsIconNameLabel(view) || MKIsWidgetLabel(view)) [out addObject:view]; // v2.0.66.18: 负一屏/widget 容器内任意可见 UILabel 也进探针(放宽收集, 抓"显示成其他 App 名称"的 widget UILabel)
-    for (UIView *sv in view.subviews) {
-        MKCollectVisibleLabels(sv, out);
-    }
-}
-
-static void MKScanStrayGeom(void) {
-    @try {
-        if (!sStrayScanBuf) sStrayScanBuf = [NSMutableArray array];
-        [sStrayScanBuf removeAllObjects];
-        NSArray *windows = [[UIApplication sharedApplication] windows];
-        for (UIWindow *w in windows) {
-            if (w) MKCollectVisibleLabels(w, sStrayScanBuf);
-        }
-        for (UIView *lbl in sStrayScanBuf) {
-            MKStrayNameProbe(lbl);
-        }
-    } @catch (NSException *e) {}
-}
 
 // v1.6.86: 源头级强制隐藏核心 —— 每类独立保存原始 IMP（用类名做 key，避免多类共享同一指针）。
 // 关键修复：iOS 16.4.1 图标名字标签的真实类是 SBIconLegibilityLabelView
@@ -2469,7 +2315,6 @@ static BOOL MKViewInFolderThumb(UIView *v);
 static NSString *MKFolderThumbBid(UIView *v);
 // v2.0.66.10: 泛化外来源容器串名探针（定义见 MKLabelToBid 之后）
 static NSString *MKForeignContainerCtx(UIView *label);
-static void MKStrayNameProbe(UIView *label);
 
 // v2.0.52: 抽自四个 label hook 的「沿继承链解析原始 IMP」重复（防类簇递归/坏 orig）。
 // 返回解析到的原始 IMP（void* 桥接，调用方按自身签名转型）；byClass 为 nil 时返回 NULL。
@@ -2521,7 +2366,6 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
                       ((UIView *)self).superview ? NSStringFromClass([((UIView *)self).superview class]) : @"nil");
             }
         }
-        if (!hidden) MKStrayNameProbe((UIView *)self); // v2.0.66.12: 几何串名探针(含负一屏)
         NSString *useBid = nil; BOOL mapOnly = NO;
         if ((useBid = MKShouldHideLabel((UIView *)self, bid, &mapOnly))) {   // v2.0.9 的「关闭动画窗口内让步原生」已在 v2.0.12 撤销：关合窗口内文件夹内 label 也强制藏名(不让步原生)，根治 sub-16ms settle 单帧闪现(第④点残留真凶)。证据 rd_log(63): FOLDER-CLOSE-VISIBLE=0 表明无 strobe 互搏，去掉安全。
             hidden = YES; // 有指示器 -> 名字必须隐藏，压制系统任何复显
@@ -2561,7 +2405,6 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
                       ((UIView *)self).superview ? NSStringFromClass([((UIView *)self).superview class]) : @"nil", (float)a);
             }
         }
-        if (a > 0.0f) MKStrayNameProbe((UIView *)self); // v2.0.66.12: 几何串名探针(含负一屏)
         NSString *useBid = nil; BOOL mapOnly = NO;
         if ((useBid = MKShouldHideLabel((UIView *)self, bid, &mapOnly))) {   // v2.0.12: 撤销 v2.0.9 关合窗口内让步原生(label 在文件夹内也强制藏名), 根治 sub-16ms settle 单帧闪现。详见 MKSetHiddenHook 同款注释。
             CGFloat inA = a; // v2.0.41: 留存传入值(下面会覆写)供 REVEAL-ATTEMPT 判据
@@ -2774,6 +2617,18 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
                 [lbl.layer removeAllAnimations];
                 lbl.hidden = YES;
                 MKAssocLabelBid(lbl, bid);
+            }
+        } else {
+            // v2.0.66.31: dock 上下文钉 alpha=0 —— 覆盖「随机名(非运行中 app)经 setIconLabelAlpha: 补回可见」的复用回弹(创建点钩子漏掉的瞬态)。
+            // 仅当本 SBIconView 在 dock 容器内生效; 主屏/文件夹走原 hasBid 逻辑, 不受影响。
+            if (MKLabelInDock((UIView *)self)) {
+                a = 0.0f;
+                UIView *dlbl = MKGetCachedLabel((SBIconView *)self);
+                if (dlbl) {
+                    [dlbl.layer removeAllAnimations];
+                    dlbl.hidden = YES;
+                    if (bid.length) MKAssocLabelBid(dlbl, bid);
+                }
             }
         }
     } @catch (NSException *e) {}
@@ -3867,14 +3722,6 @@ static void MKDelayedInit() {
     MKUpdateDebugFlag(); // v1.6.26: 初始化完成后读取调试开关
     RDLog(@"DELAYED INIT: done. sInitDone=YES");
 
-    // ─── v2.0.66.12: 启动周期几何扫描(兜底 setFrame 重定位型串名) ──────
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (!sStrayScanTimer) {
-            sStrayScanTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
-                                                               repeats:YES
-                                                                 block:^(NSTimer * __unused t){ MKScanStrayGeom(); }];
-        }
-    });
 
     // ─── 首次刷新所有图标 ──────
     MKRefreshAllIcons();
@@ -3954,6 +3801,21 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
 - (void)layoutSubviews {
     %orig;
     if (!sInitDone) return;
+
+    // v2.0.66.31: dock 上下文每帧强制藏名 —— 根治 dock 随机串名(主屏 SBIconView 回收复用渲染 dock 槽, 把任意旧名带进来; 名字随机=回收哪个图标随机)。
+    // 不依赖 sHiddenBids(随机名可能非运行中 app), 也不依赖创建点钩子(复用后原地改可见性不触发 moveToWindow/superview)。
+    // 仅当本 SBIconView 在 dock 容器内时每帧把 name label 归零; dock 仅 ~4 图标开销可忽略; 主屏/文件夹 MKLabelInDock 返回 NO 即跳过, 不误伤。
+    if (MKLabelInDock((UIView *)self)) {
+        UIView *dlbl = MKGetCachedLabel((SBIconView *)self);
+        if (dlbl && !dlbl.hidden && dlbl.alpha > 0.0f) {  // 仅仍可见才强制归零, 避免无谓 layer 重绘
+            dlbl.hidden = YES;
+            dlbl.alpha = 0.0f;
+            dlbl.layer.opacity = 0.0f;
+            dlbl.opaque = NO;
+            [dlbl.layer removeAllAnimations];
+        }
+        return;  // dock 不走下方主屏/文件夹逻辑(其 name label 本就不该显); 指示器几何由 MKUpdate 全局管理
+    }
 
     // v1.6.70: 移除"文件夹打开期间一律显示名称并 return"的压制。
     // 现在文件夹内运行中 App 也要显示指示器（与主屏一致），故交下方
@@ -4822,10 +4684,12 @@ static void MKRefreshFolderIcons(void) {
     %init;
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
-    RDLog(@"======== RDBUILD v2.0.66.30 (NEG-CAPTURE: SBFFocusIsolationView 事件驱动扫整棵负一屏子树(含 widget 兄弟节点)抓随机 App 名 UILabel 真身; EVENT-DUMP: MKNegEventDump 事件驱动NEG-EVT亚秒级瞬态捕获(绕1s轮询盲区); DEBUG-DUMP: MKDebugDumpBetaLabel 枚举「运行 App」label 子树(取消 MKBetaClass 门控, 含 bid+mkBetaClassHit), 为「只藏文本保留 beta」修复取证; NEG-SCREEN FIX v2.0.66.20(纠正v19): v19 的 inIconTree 窄条件对图标名label实际不触发(图标名label走另一路径); v20 改在图标名label路径对 foreign container(ctx=DOCK/TODAY/WIDGET/DASHBOARD,均不显示名称)强制藏名,治负一屏/dock回收复用串名; BETA-DOT FIX v2.0.59: 删 MKDetachBetaOnce !label.superview 早退 + 补 layoutSubviews BFS 两处空壳 MKEnsureBetaOnIconView 脱离调用 + 坐标转换 nil 安全退化; 根治解锁后小黄点消失/滑屏才出; BETA-DOT REVERT v2.0.50/51->v2.0.43: 删 MKEnsureBetaOnIconView 在 BFS 两处强制脱离调用 + MKDetachBetaOnce 恢复 !label.superview 早退 + dot.center=c 定位(撤 v2.0.55 autoresizing 锚点 hack); 修 TF/beta 小黄点(SBIconBetaLabelAccessoryView) 锁屏解锁消失/偏上/错位; 原 PIN-FIX(rd_log186)失败;  MKEnsureBetaOnIconView 脱离后不再用绝对 dot.center 钉死, 改相对 iconView 定位 + autoresizing 钉左上角跟随图标几何, 修 TF/beta App(im.solos.letter) 小黄点(SBIconBetaLabelAccessoryView) 锁屏解锁后消失/错位 — rd_log(185) 实锤走 if(mkIsL) 静默脱离路径; FLASH-PROBE: guard 升级 0.016s×50(0.8s)->0.008s×150(1.2s) 每帧重藏前先打 FLASH-PROBE(带毫秒)抓 sub-16ms 单帧复显; 四 hook 加 REVEAL-ATTEMPT 复显日志 gate 1.2s 窗; PERF: layoutSubviews BFS + snapshot-probe 类名判断改 class_getName()+strstr 零分配(对齐 MKIsFolderIcon L263); MKSyncFromSBAppCtrl 内 NSClassFromString(SBApplication) 提 static dispatch_once; 注释卫生; 行为零变化; BETA-DOT RESTORED: MKDetachBetaOnce+MKRestoreBetaOrphan+keepBetaDot switch default ON; FOLDER-CLOSE-REGRESS-2.0.5: 撤 2.0.6+ 增强(1.5s guard/全树 BFS/0.4s 扫描/setIconLabelAlpha hook) 回到 2.0.3/4 轻量基础(kMKLabelIconKey+sHiddenBids 每帧藏缓存 label+0.8s guard); FOLDER-SETTING-SIMPLIFY — 设置项「文件夹内取哪个 App」二选一移除, 行为固定为位置靠前活跃(原 mode 0, MKFolderChosenBid 只取视觉序第一个=contained.firstObject); 删除 MKConfig.folderIndicatorMode 属性+getter + plist PSSegmentCell + 调用处 mode 参数; 仅留 folderIndicators 单一启用开关; prior v2.0.23 was REVERT beta-dot — 运行指示器不再对小黄点做任何处理; prior v2.0.21 was BETA-DOT FIX — 真因(rd_log(72)): 小黄点是名称 label 子树后代, 核心藏名整张 label.hidden=YES 连带藏掉, 与之前删的 hideBetaDot 开关无关; 改用 MKDetachBetaOnce 仅当小黄点仍在 label 内时脱离挂到 SBIconView(脱离后跳过不每帧抖), 退出 MKRestoreBetaOrphan 移除孤儿点由系统自建; 完全不碰 Bug A 藏名不变量 + GEOMETRIC FALLBACK; prior v2.0.6 was RESIDUAL-FLASH FIX — v2.0.5 diagnostic build proved sFolderClosing DOES arm and the cached label is always hidden at every 0.016s sample, so the point-4 flash is a sub-16ms frame at the shrink-animation settle (icon snaps back to grid) that lands AFTER the old 0.8s guard window; v2.0.6 fixes it by (a) guard interval 0.016s->0.010s and length 50->150 ticks (~1.5s) to cover the settle, (b) guard label hunt now a full-subtree BFS that force-hides + re-associates any freshly-created nested visible label, (c) one-shot 0.4s delayed full-window-tree scan after the guard ends to nail the settle re-show; probes FOLDER-CLOSE-ARM + FOLDER-CLOSE-VISIBLE retained for confirmation; v2.0.3: NEW folder-close fix - label holds a hierarchy-independent direct pointer to its SBIconView (kMKLabelIconKey) so MKLabelToBid resolves bid even when iOS reparents/recreates the label during the shrink animation; sFolderCloseGuard now per-frame (0.016s, ~0.8s) instead of 0.05s x10; unlock fallback timer routed through MKUnlockRestore for consistent fade-in; v2.0.1: BUILD-FIX — MKRefreshAllIcons forward declaration moved from 531 to before MKUnlockRestore (323) because the 334 call created an implicit non-static decl under clang -Werror implicit-function-declaration; v2.0.0: FIRST CLEAN RELEASE — removed all RDBREAD runtime breadcrumb logs (the 7 debug RDLog calls buried in dispatch_once init blocks + the unlock-timer fired log) so the tweak no longer prints crash-tracing breadcrumbs; this is the stable release after the 1.6.x dev/debug series; v1.6.99: FIX swipe-page name-dropout + harden folder-close flash; (A) MKGetCachedBid recycle branch now clears the stale kMKLabelBidKey on the old label so a recycled SBIconView cannot leak a previous running-app's bid onto a new non-running app's label -> setHidden: no longer mis-hides it (the 'app name randomly vanishes while swiping pages' bug); (B) MKSetHiddenHook/MKSetAlphaHook now write the bid back onto the label's own kMKLabelBidKey on every forced-hide, so the 'this label belongs to a hidable bid' mark self-sustains through folder-close shrink animation reparenting where MKLabelToBid's sibling/ancestor fallback lookup transiently fails for one frame -> kills the residual in-folder app name flash at end of folder close (point 4); v1.6.98: SBIconView didMoveToWindow(nil) keeps in-folder app label hidden while app still running-in-background, not only when indicator object exists -> kills in-folder app name flash at end of folder-close shrink (point 4); v1.6.97: label swizzle now hooks ONLY override classes + superclass-chain orig lookup + @try around orig()/unlock-timer; kills unlock safe-mode from corrupted orig map; source-level label hook (SBIconListLabel setHidden:/setAlpha: swizzle) supersedes layoutSubviews alpha=0 -> kills name+dot overlap race AND folder-close name flash; folder-icon indicator now prefers latest-msg app (MKTouchMsg+MKFolderChosenBid); previous: proactive label-hide in SBIconView layoutSubviews: unconditionally hide icon name when this bid has an indicator, placed right after %%orig before any branch/return, closing the race window that caused occasional name+dot overlap; v1.6.83 label-overlap fix: scroll-layout keeps any indicator-bearing icon's label hidden via indicator-present check, covering folder-container icons whose bid is not an app; SBIconView didMoveToWindow(nil) no longer restores label while an indicator exists, killing the in-folder app name flash on folder close; v1.6.81 perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped; v1.6.83 folder refresh-storm fix: FICON branch skips expensive recompute when sFolderContentGen unchanged (reuse kMKFIconGenKey), cheap reposition only); v1.6.90 CRASH-FIX: MKInstallLabelHook delayed-init dispatch_once now uses class_isSubclassOfClass() C runtime call instead of [sub isSubclassOfClass:c] selector send -> removes the ___forwarding___ hard-trap (SIGTRAP) safe-mode that fired ~15s after every reboot during delayed init (proven via rd_log(44) breadcrumb: last line before death was RDBREAD: once MKInstallLabelHook) ========");
-    RDLog(@"======== RDBUILD v2.0.66.30 (NEG-CAPTURE: SBFFocusIsolationView 事件驱动扫整棵负一屏子树(含 widget 兄弟节点)抓随机 App 名 UILabel 真身; EVENT-DUMP: MKNegEventDump 事件驱动NEG-EVT亚秒级瞬态捕获(绕1s轮询盲区); DEBUG-DUMP: MKDebugDumpBetaLabel 枚举「运行 App」label 子树(取消 MKBetaClass 门控, 含 bid+mkBetaClassHit), 为「只藏文本保留 beta」修复取证; BETA-DOT RESTORED: MKDetachBetaOnce+MKRestoreBetaOrphan+keepBetaDot switch default ON; perf: MKIsFolderIcon 用 class_getName 零分配 + MKDetachBetaOnce 每帧 BFS 短路(无 beta 标记); prior v2.0.21 was BETA-DOT FIX — 真因(rd_log(72)): 小黄点是名称 label 子树后代, 核心藏名整张 label.hidden=YES 连带藏掉, 与之前删的 hideBetaDot 开关无关; 改用 MKDetachBetaOnce 仅当小黄点仍在 label 内时脱离挂到 SBIconView(脱离后跳过不每帧抖), 退出 MKRestoreBetaOrphan 移除孤儿点由系统自建; 完全不碰 Bug A 藏名不变量 + GEOMETRIC FALLBACK; prior v2.0.6 was RESIDUAL-FLASH FIX — v2.0.5 diagnostic build proved sFolderClosing DOES arm and the cached label is always hidden at every 0.016s sample, so the point-4 flash is a sub-16ms frame at the shrink-animation settle (icon snaps back to grid) that lands AFTER the old 0.8s guard window; v2.0.6 fixes it by (a) guard interval 0.016s->0.010s and length 50->150 ticks (~1.5s) to cover the settle, (b) guard label hunt now a full-subtree BFS that force-hides + re-associates any freshly-created nested visible label, (c) one-shot 0.4s delayed full-window-tree scan after the guard ends to nail the settle re-show; probes FOLDER-CLOSE-ARM + FOLDER-CLOSE-VISIBLE retained for confirmation; v2.0.3: NEW folder-close fix - label holds a hierarchy-independent direct pointer to its SBIconView (kMKLabelIconKey) so MKLabelToBid resolves bid even when iOS reparents/recreates the label during the shrink animation; sFolderCloseGuard now per-frame (0.016s, ~0.8s) instead of 0.05s x10; unlock fallback timer routed through MKUnlockRestore for consistent fade-in; v2.0.1: BUILD-FIX — MKRefreshAllIcons forward declaration moved from 531 to before MKUnlockRestore (323) because the 334 call created an implicit non-static decl under clang -Werror implicit-function-declaration; v2.0.0: FIRST CLEAN RELEASE — removed all RDBREAD runtime breadcrumb logs (the 7 debug RDLog calls buried in dispatch_once init blocks + the unlock-timer fired log) so the tweak no longer prints crash-tracing breadcrumbs; this is the stable release after the 1.6.x dev/debug series; v1.6.99: FIX swipe-page name-dropout + harden folder-close flash; (A) MKGetCachedBid recycle branch now clears the stale kMKLabelBidKey on the old label so a recycled SBIconView cannot leak a previous running-app's bid onto a new non-running app's label -> setHidden: no longer mis-hides it (the 'app name randomly vanishes while swiping pages' bug); (B) MKSetHiddenHook/MKSetAlphaHook now write the bid back onto the label's own kMKLabelBidKey on every forced-hide, so the 'this label belongs to a hidable bid' mark self-sustains through folder-close shrink animation reparenting where MKLabelToBid's sibling/ancestor fallback lookup transiently fails for one frame -> kills the residual in-folder app name flash at end of folder close (point 4); v1.6.98: SBIconView didMoveToWindow(nil) keeps in-folder app label hidden while app still running-in-background, not only when indicator object exists -> kills in-folder app name flash at end of folder-close shrink (point 4); v1.6.97: label swizzle now hooks ONLY override classes + superclass-chain orig lookup + @try around orig()/unlock-timer; kills unlock safe-mode from corrupted orig map; source-level label hook (SBIconListLabel setHidden:/setAlpha: swizzle) supersedes layoutSubviews alpha=0 -> kills name+dot overlap race AND folder-close name flash; folder-icon indicator now prefers latest-msg app (MKTouchMsg+MKFolderChosenBid); previous: proactive label-hide in SBIconView layoutSubviews: unconditionally hide icon name when this bid has an indicator, placed right after %%orig before any branch/return, closing the race window that caused occasional name+dot overlap; v1.6.83 label-overlap fix: scroll-layout keeps any indicator-bearing icon's label hidden via indicator-present check, covering folder-container icons whose bid is not an app; SBIconView didMoveToWindow(nil) no longer restores label while an indicator exists, killing the in-folder app name flash on folder close; v1.6.81 perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped; v1.6.83 folder refresh-storm fix: FICON branch skips expensive recompute when sFolderContentGen unchanged (reuse kMKFIconGenKey), cheap reposition only); v1.6.90 CRASH-FIX: MKInstallLabelHook delayed-init dispatch_once now uses class_isSubclassOfClass() C runtime call instead of [sub isSubclassOfClass:c] selector send -> removes the ___forwarding___ hard-trap (SIGTRAP) safe-mode that fired ~15s after every reboot during delayed init (proven via rd_log(44) breadcrumb: last line before death was RDBREAD: once MKInstallLabelHook) ========");
+    RDLog(@"======== RDBUILD v2.0.66.31 (NEG-CAPTURE: SBFFocusIsolationView 事件驱动扫整棵负一屏子树(含 widget 兄弟节点)抓随机 App 名 UILabel 真身; EVENT-DUMP: MKNegEventDump 事件驱动NEG-EVT亚秒级瞬态捕获(绕1s轮询盲区); DEBUG-DUMP: MKDebugDumpBetaLabel 枚举「运行 App」label 子树(取消 MKBetaClass 门控, 含 bid+mkBetaClassHit), 为「只藏文本保留 beta」修复取证; NEG-SCREEN FIX v2.0.66.20(纠正v19): v19 的 inIconTree 窄条件对图标名label实际不触发(图标名label走另一路径); v20 改在图标名label路径对 foreign container(ctx=DOCK/TODAY/WIDGET/DASHBOARD,均不显示名称)强制藏名,治负一屏/dock回收复用串名; BETA-DOT FIX v2.0.59: 删 MKDetachBetaOnce !label.superview 早退 + 补 layoutSubviews BFS 两处空壳 MKEnsureBetaOnIconView 脱离调用 + 坐标转换 nil 安全退化; 根治解锁后小黄点消失/滑屏才出; BETA-DOT REVERT v2.0.50/51->v2.0.43: 删 MKEnsureBetaOnIconView 在 BFS 两处强制脱离调用 + MKDetachBetaOnce 恢复 !label.superview 早退 + dot.center=c 定位(撤 v2.0.55 autoresizing 锚点 hack); 修 TF/beta 小黄点(SBIconBetaLabelAccessoryView) 锁屏解锁消失/偏上/错位; 原 PIN-FIX(rd_log186)失败;  MKEnsureBetaOnIconView 脱离后不再用绝对 dot.center 钉死, 改相对 iconView 定位 + autoresizing 钉左上角跟随图标几何, 修 TF/beta App(im.solos.letter) 小黄点(SBIconBetaLabelAccessoryView) 锁屏解锁后消失/错位 — rd_log(185) 实锤走 if(mkIsL) 静默脱离路径; FLASH-PROBE: guard 升级 0.016s×50(0.8s)->0.008s×150(1.2s) 每帧重藏前先打 FLASH-PROBE(带毫秒)抓 sub-16ms 单帧复显; 四 hook 加 REVEAL-ATTEMPT 复显日志 gate 1.2s 窗; PERF: layoutSubviews BFS + snapshot-probe 类名判断改 class_getName()+strstr 零分配(对齐 MKIsFolderIcon L263); MKSyncFromSBAppCtrl 内 NSClassFromString(SBApplication) 提 static dispatch_once; 注释卫生; 行为零变化; BETA-DOT RESTORED: MKDetachBetaOnce+MKRestoreBetaOrphan+keepBetaDot switch default ON; FOLDER-CLOSE-REGRESS-2.0.5: 撤 2.0.6+ 增强(1.5s guard/全树 BFS/0.4s 扫描/setIconLabelAlpha hook) 回到 2.0.3/4 轻量基础(kMKLabelIconKey+sHiddenBids 每帧藏缓存 label+0.8s guard); FOLDER-SETTING-SIMPLIFY — 设置项「文件夹内取哪个 App」二选一移除, 行为固定为位置靠前活跃(原 mode 0, MKFolderChosenBid 只取视觉序第一个=contained.firstObject); 删除 MKConfig.folderIndicatorMode 属性+getter + plist PSSegmentCell + 调用处 mode 参数; 仅留 folderIndicators 单一启用开关; prior v2.0.23 was REVERT beta-dot — 运行指示器不再对小黄点做任何处理; prior v2.0.21 was BETA-DOT FIX — 真因(rd_log(72)): 小黄点是名称 label 子树后代, 核心藏名整张 label.hidden=YES 连带藏掉, 与之前删的 hideBetaDot 开关无关; 改用 MKDetachBetaOnce 仅当小黄点仍在 label 内时脱离挂到 SBIconView(脱离后跳过不每帧抖), 退出 MKRestoreBetaOrphan 移除孤儿点由系统自建; 完全不碰 Bug A 藏名不变量 + GEOMETRIC FALLBACK; prior v2.0.6 was RESIDUAL-FLASH FIX — v2.0.5 diagnostic build proved sFolderClosing DOES arm and the cached label is always hidden at every 0.016s sample, so the point-4 flash is a sub-16ms frame at the shrink-animation settle (icon snaps back to grid) that lands AFTER the old 0.8s guard window; v2.0.6 fixes it by (a) guard interval 0.016s->0.010s and length 50->150 ticks (~1.5s) to cover the settle, (b) guard label hunt now a full-subtree BFS that force-hides + re-associates any freshly-created nested visible label, (c) one-shot 0.4s delayed full-window-tree scan after the guard ends to nail the settle re-show; probes FOLDER-CLOSE-ARM + FOLDER-CLOSE-VISIBLE retained for confirmation; v2.0.3: NEW folder-close fix - label holds a hierarchy-independent direct pointer to its SBIconView (kMKLabelIconKey) so MKLabelToBid resolves bid even when iOS reparents/recreates the label during the shrink animation; sFolderCloseGuard now per-frame (0.016s, ~0.8s) instead of 0.05s x10; unlock fallback timer routed through MKUnlockRestore for consistent fade-in; v2.0.1: BUILD-FIX — MKRefreshAllIcons forward declaration moved from 531 to before MKUnlockRestore (323) because the 334 call created an implicit non-static decl under clang -Werror implicit-function-declaration; v2.0.0: FIRST CLEAN RELEASE — removed all RDBREAD runtime breadcrumb logs (the 7 debug RDLog calls buried in dispatch_once init blocks + the unlock-timer fired log) so the tweak no longer prints crash-tracing breadcrumbs; this is the stable release after the 1.6.x dev/debug series; v1.6.99: FIX swipe-page name-dropout + harden folder-close flash; (A) MKGetCachedBid recycle branch now clears the stale kMKLabelBidKey on the old label so a recycled SBIconView cannot leak a previous running-app's bid onto a new non-running app's label -> setHidden: no longer mis-hides it (the 'app name randomly vanishes while swiping pages' bug); (B) MKSetHiddenHook/MKSetAlphaHook now write the bid back onto the label's own kMKLabelBidKey on every forced-hide, so the 'this label belongs to a hidable bid' mark self-sustains through folder-close shrink animation reparenting where MKLabelToBid's sibling/ancestor fallback lookup transiently fails for one frame -> kills the residual in-folder app name flash at end of folder close (point 4); v1.6.98: SBIconView didMoveToWindow(nil) keeps in-folder app label hidden while app still running-in-background, not only when indicator object exists -> kills in-folder app name flash at end of folder-close shrink (point 4); v1.6.97: label swizzle now hooks ONLY override classes + superclass-chain orig lookup + @try around orig()/unlock-timer; kills unlock safe-mode from corrupted orig map; source-level label hook (SBIconListLabel setHidden:/setAlpha: swizzle) supersedes layoutSubviews alpha=0 -> kills name+dot overlap race AND folder-close name flash; folder-icon indicator now prefers latest-msg app (MKTouchMsg+MKFolderChosenBid); previous: proactive label-hide in SBIconView layoutSubviews: unconditionally hide icon name when this bid has an indicator, placed right after %%orig before any branch/return, closing the race window that caused occasional name+dot overlap; v1.6.83 label-overlap fix: scroll-layout keeps any indicator-bearing icon's label hidden via indicator-present check, covering folder-container icons whose bid is not an app; SBIconView didMoveToWindow(nil) no longer restores label while an indicator exists, killing the in-folder app name flash on folder close; v1.6.81 perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped; v1.6.83 folder refresh-storm fix: FICON branch skips expensive recompute when sFolderContentGen unchanged (reuse kMKFIconGenKey), cheap reposition only); v1.6.90 CRASH-FIX: MKInstallLabelHook delayed-init dispatch_once now uses class_isSubclassOfClass() C runtime call instead of [sub isSubclassOfClass:c] selector send -> removes the ___forwarding___ hard-trap (SIGTRAP) safe-mode that fired ~15s after every reboot during delayed init (proven via rd_log(44) breadcrumb: last line before death was RDBREAD: once MKInstallLabelHook) ========");
+    RDLog(@"======== RDBUILD v2.0.66.31 (NEG-CAPTURE: SBFFocusIsolationView 事件驱动扫整棵负一屏子树(含 widget 兄弟节点)抓随机 App 名 UILabel 真身; EVENT-DUMP: MKNegEventDump 事件驱动NEG-EVT亚秒级瞬态捕获(绕1s轮询盲区); DEBUG-DUMP: MKDebugDumpBetaLabel 枚举「运行 App」label 子树(取消 MKBetaClass 门控, 含 bid+mkBetaClassHit), 为「只藏文本保留 beta」修复取证; BETA-DOT RESTORED: MKDetachBetaOnce+MKRestoreBetaOrphan+keepBetaDot switch default ON; perf: MKIsFolderIcon 用 class_getName 零分配 + MKDetachBetaOnce 每帧 BFS 短路(无 beta 标记); prior v2.0.21 was BETA-DOT FIX — 真因(rd_log(72)): 小黄点是名称 label 子树后代, 核心藏名整张 label.hidden=YES 连带藏掉, 与之前删的 hideBetaDot 开关无关; 改用 MKDetachBetaOnce 仅当小黄点仍在 label 内时脱离挂到 SBIconView(脱离后跳过不每帧抖), 退出 MKRestoreBetaOrphan 移除孤儿点由系统自建; 完全不碰 Bug A 藏名不变量 + GEOMETRIC FALLBACK; prior v2.0.6 was RESIDUAL-FLASH FIX — v2.0.5 diagnostic build proved sFolderClosing DOES arm and the cached label is always hidden at every 0.016s sample, so the point-4 flash is a sub-16ms frame at the shrink-animation settle (icon snaps back to grid) that lands AFTER the old 0.8s guard window; v2.0.6 fixes it by (a) guard interval 0.016s->0.010s and length 50->150 ticks (~1.5s) to cover the settle, (b) guard label hunt now a full-subtree BFS that force-hides + re-associates any freshly-created nested visible label, (c) one-shot 0.4s delayed full-window-tree scan after the guard ends to nail the settle re-show; probes FOLDER-CLOSE-ARM + FOLDER-CLOSE-VISIBLE retained for confirmation; v2.0.3: NEW folder-close fix - label holds a hierarchy-independent direct pointer to its SBIconView (kMKLabelIconKey) so MKLabelToBid resolves bid even when iOS reparents/recreates the label during the shrink animation; sFolderCloseGuard now per-frame (0.016s, ~0.8s) instead of 0.05s x10; unlock fallback timer routed through MKUnlockRestore for consistent fade-in; v2.0.1: BUILD-FIX — MKRefreshAllIcons forward declaration moved from 531 to before MKUnlockRestore (323) because the 334 call created an implicit non-static decl under clang -Werror implicit-function-declaration; v2.0.0: FIRST CLEAN RELEASE — removed all RDBREAD runtime breadcrumb logs (the 7 debug RDLog calls buried in dispatch_once init blocks + the unlock-timer fired log) so the tweak no longer prints crash-tracing breadcrumbs; this is the stable release after the 1.6.x dev/debug series; v1.6.99: FIX swipe-page name-dropout + harden folder-close flash; (A) MKGetCachedBid recycle branch now clears the stale kMKLabelBidKey on the old label so a recycled SBIconView cannot leak a previous running-app's bid onto a new non-running app's label -> setHidden: no longer mis-hides it (the 'app name randomly vanishes while swiping pages' bug); (B) MKSetHiddenHook/MKSetAlphaHook now write the bid back onto the label's own kMKLabelBidKey on every forced-hide, so the 'this label belongs to a hidable bid' mark self-sustains through folder-close shrink animation reparenting where MKLabelToBid's sibling/ancestor fallback lookup transiently fails for one frame -> kills the residual in-folder app name flash at end of folder close (point 4); v1.6.98: SBIconView didMoveToWindow(nil) keeps in-folder app label hidden while app still running-in-background, not only when indicator object exists -> kills in-folder app name flash at end of folder-close shrink (point 4); v1.6.97: label swizzle now hooks ONLY override classes + superclass-chain orig lookup + @try around orig()/unlock-timer; kills unlock safe-mode from corrupted orig map; source-level label hook (SBIconListLabel setHidden:/setAlpha: swizzle) supersedes layoutSubviews alpha=0 -> kills name+dot overlap race AND folder-close name flash; folder-icon indicator now prefers latest-msg app (MKTouchMsg+MKFolderChosenBid); previous: proactive label-hide in SBIconView layoutSubviews: unconditionally hide icon name when this bid has an indicator, placed right after %%orig before any branch/return, closing the race window that caused occasional name+dot overlap; v1.6.83 label-overlap fix: scroll-layout keeps any indicator-bearing icon's label hidden via indicator-present check, covering folder-container icons whose bid is not an app; SBIconView didMoveToWindow(nil) no longer restores label while an indicator exists, killing the in-folder app name flash on folder close; v1.6.81 perf: folder/scroll refresh coalesced; indicator reused across off-screen; icon-color miss self-heals next runloop; relaxed iOS guard: block <iOS16 only; layoutSubviews orphan self-heal; debug log toggleable in Settings UI live via prefs callback, rd_debug kept as fallback; v1.6.31 blacklisted apps skip state-change -> name never fades; running-set now gated on foreground (pure-background iOS launches like Calendar sync no longer show indicator); MKGetCachedBid + refresh loops use static Class lookups; folder-open now refreshes async to prevent label-overlap; v1.6.54 MKFindLabelView Strategy2 geometry-pins label (horizontal-center + below-icon) to fix folder overlap + WeChat/Phone no-label; fallback now hosts on list-view via convertRect so dot is never clipped; v1.6.83 folder refresh-storm fix: FICON branch skips expensive recompute when sFolderContentGen unchanged (reuse kMKFIconGenKey), cheap reposition only); v1.6.90 CRASH-FIX: MKInstallLabelHook delayed-init dispatch_once now uses class_isSubclassOfClass() C runtime call instead of [sub isSubclassOfClass:c] selector send -> removes the ___forwarding___ hard-trap (SIGTRAP) safe-mode that fired ~15s after every reboot during delayed init (proven via rd_log(44) breadcrumb: last line before death was RDBREAD: once MKInstallLabelHook) ========");
 
     RDLog(@"======== RDBUILD-NOTE v2.0.66.30: NEG-SETTEXT 最终捕获版(彻底无门控) —— v2.0.66.28 仍残留 window 非空检查(唯一可能漏掉可见瞬态的隐患); 本版删除该检查, 只要 MKLabelInNegScreen(祖先链含 SBFFocusIsolationView/SBTodayView/SBDashboard) 命中即落 NEG-SETTEXT(类名+文本+isApp标记+完整祖先链), 任意 setText:/setAttributedText: 必现形; 去重(同 cls+text 只打一次)+上限2000行封顶; 纯观察零行为变化; 若本版仍 0 命中则确证随机名非 SpringBoard 侧 UILabel(扩展进程渲染/CATextLayer/drawRect), SpringBoard 够不到, 停诊并改兜底(接受 或 隐藏整个负一屏标题区) ========");
+
+    RDLog(@"======== RDBUILD-NOTE v2.0.66.31: DOCK-RANDOM-FIX —— 根治 dock 随机串名(主屏 SBIconView 回收复用渲染 dock 槽, 把任意旧名带进来; 名字随机=回收哪个图标随机): 1) SBIconView.layoutSubviews 加入 dock 上下文每帧强制藏名(MKLabelInDock 命中即归零 name label, 仅仍可见才写避免无谓重绘, 命中即 return 不误伤主屏/文件夹); 2) MKSetIconLabelAlphaHook 扩展 dock 上下文钉 alpha=0(覆盖非运行中 app 经 setter 补回可见的复用回弹); 3) 彻底移除 dock 串名诊断链路(MKStrayNameProbe + MKCollectVisibleLabels + MKScanStrayGeom + 1s 周期扫描定时器 sStrayScanTimer + 相关全局/前向声明/调用点 + CTX-HIDE/STRAY-NAME 裸奔打印) —— 该 1s 定时器是真实 CPU 唤醒源, 移除后功耗与 v2.0.66.30 持平且更干净; 行为零变化(仅 dock name label 结构性不可见); 无新增定时/轮询 ========");
 
     if (MKIsDisabled()) {
         RDLog(@"======== RDBUILD-NOTE v2.0.66.25: NEG-CONTAINER 容器级捕获(route A dump-only) + CTX-HIDE(强制藏名前先读真实文本) —— %%hook WGWidgetWrapperView/WGWidgetListFooterView/WGPlatterHeaderContentView/SBTodayView 的 didMoveToWindow+layoutSubviews 扫整棵子树打 NEG-CONTAINER(类+文本+frame+祖先链+isIconName); v2.0.66.24 新增 MKLabelTextRobust(legibilitySettings.text 兜底, 修 dock 串名落 labelText=?) + 在 if(ctx) 藏名前打 CTX-HIDE(真实文本+链), 直接回答 dock/负一屏上显示的是哪个 app 名; 接 v2.0.66.22 的 label 级 NEG-EVT, 覆盖双盲区, 终于抓到负一屏随机名真实类名; v2.0.66.25: MKForeignContainerCtx 增补 SBFFocusIsolationView->TODAY + MKLabelInHomeGrid 守卫, didMoveToWindow/didMoveToSuperview 创建点 proactive 强制藏名(灭亚秒级闪现) ========");
