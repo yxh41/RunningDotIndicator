@@ -2147,6 +2147,29 @@ static BOOL MKLabelInDock(UIView *label) {
     return NO;
 }
 
+// v2.0.66.38: 物理位置判定补刀 —— 治「主屏 name label 漂到 dock 位置显示(祖先链/owner 仍指向主屏)」
+// 这类 dock 串名靠祖先含 Dock 类名(MKLabelInDock/MKForeignContainerCtx)与关联 owner 跨图标(didMoveToSuperview)全不命中,
+// 现有判定维度(类名祖先链)覆盖不到, 故改按「label 实际 window 坐标是否落在 dock 容器区域」判定。
+// dock 容器(SBDockIconListView/SBDockView) frame 缓存于 sDockFrame, 仅在为空/刷新时现找(低频), 热路径只做 convertRect+比较。
+static CGRect sDockFrame = {{0,0},{0,0}}; // 编译期常量初始化(不能用 CGRectZero: 它是 extern const, 非编译期常量)
+static void MKUpdateDockFrame(void) {
+    @try {
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            UIView *dock = MKFindDescendantView(w, @"SBDockIconListView");
+            if (!dock) dock = MKFindDescendantView(w, @"SBDockView");
+            if (dock) { sDockFrame = [dock convertRect:dock.bounds toView:nil]; return; }
+        }
+    } @catch (NSException *e) {}
+}
+static BOOL MKLabelPhysicallyInDock(UIView *label) {
+    if (CGRectIsEmpty(sDockFrame)) MKUpdateDockFrame();
+    if (CGRectIsEmpty(sDockFrame)) return NO;
+    if (!label.window) return NO;
+    CGRect r = [label convertRect:label.bounds toView:label.window];
+    CGFloat midY = CGRectGetMidY(r);
+    return midY >= CGRectGetMinY(sDockFrame) && midY <= CGRectGetMaxY(sDockFrame);
+}
+
 
 // v2.0.66.21: 暴力 dump —— 不再猜负一屏容器类名(SBDock/SBToday/SBWidget/SBDashboard/TodayView), 改结构判定:
 
@@ -2271,9 +2294,10 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
                 MKAssocLabelBid((UIView *)self, fb);
                 [((UIView *)self).layer removeAllAnimations];
             }
-        } else if (MKForeignContainerCtx((UIView *)self)) {
+        } else if (MKForeignContainerCtx((UIView *)self) || MKLabelPhysicallyInDock((UIView *)self)) {
             // v2.0.66.37: fctx 强制藏名补刀——foreign 容器(dock/负一屏/widget)名经 setHidden:NO 复显
             // (同窗口同 superview, didMoveToWindow/didMoveToSuperview 不触发)时在此压住; 零分配判定, 主屏/文件夹不受影响。
+            // v2.0.66.38: 另补物理位置判定(MKLabelPhysicallyInDock)覆盖「主屏 label 漂到 dock 位置显示(祖先链仍主屏)」的串名。
             hidden = YES;
             [((UIView *)self).layer removeAllAnimations];
         }
@@ -2318,9 +2342,10 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
                 MKAssocLabelBid((UIView *)self, fb);
                 [((UIView *)self).layer removeAllAnimations];
             }
-        } else if (MKForeignContainerCtx((UIView *)self)) {
+        } else if (MKForeignContainerCtx((UIView *)self) || MKLabelPhysicallyInDock((UIView *)self)) {
             // v2.0.66.37: fctx 强制藏名补刀——foreign 容器(dock/负一屏/widget)名经 setAlpha:>0 复显
             // (同窗口同 superview, didMoveToWindow/didMoveToSuperview 不触发)时在此压住; 零分配判定, 主屏/文件夹不受影响。
+            // v2.0.66.38: 另补物理位置判定(MKLabelPhysicallyInDock)覆盖「主屏 label 漂到 dock 位置显示(祖先链仍主屏)」的串名。
             a = 0.0f;
             [((UIView *)self).layer removeAllAnimations];
         }
@@ -2424,11 +2449,12 @@ static void MKLabelDidMoveToSuperviewHook(id self, SEL _cmd) {
         // 覆盖「仅换父、window 不变」的显形路径(与 didMoveToWindow 双保险, 灭亚秒级闪现);
         // 守卫在 MKForeignContainerCtx 内(MKLabelInHomeGrid)确保主屏网格名不被误杀。
         NSString *fctx = MKForeignContainerCtx(lbl);
-        if (fctx) {
+        if (fctx || MKLabelPhysicallyInDock(lbl)) {
             lbl.hidden = YES;
             lbl.alpha = 0.0f;
             lbl.layer.opacity = 0.0f;
             [lbl.layer removeAllAnimations];
+            if (sDebugLog && !fctx) RDLog(@"DOCK-PHYS-HIDE: cls=%@ physInDock=YES (ancestor-chain miss)", NSStringFromClass([lbl class]));
         }
     } @catch (NSException *e) {}
 }
@@ -3322,6 +3348,7 @@ static void MKClearPendingInView(UIView *root) {
 static void MKRefreshAllIcons() {
     MKSafe(^{
         if (!sInitDone) return;
+        MKUpdateDockFrame(); // v2.0.66.38: 刷新时同步 dock 容器 window frame 缓存(供物理位置判定)
         // v1.6.78: folder-open watchdog — if sFolderOpen=YES but no SBFolderView in window,
         // reset it so main-screen icons are no longer skipped.
         if (sFolderOpen) {
@@ -4600,9 +4627,9 @@ static void MKRefreshFolderIcons(void) {
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
     // v2.0.66.37: 启动日志精简 —— 始终打印单行版本戳(确认 tweak 激活+版本); 多行改动清单全部收进 sDebugLog, 生产环境(诊断关)安静。
-    RDLog(@"======== RunningDotIndicator v2.0.66.37 loaded ========");
+    RDLog(@"======== RunningDotIndicator v2.0.66.38 loaded ========");
     if (sDebugLog) {
-        RDLog(@"======== RDBUILD v2.0.66.37: dock 串名盲区修复(fctx 强制藏名补进 setHidden/setAlpha 热路径) + 启动/EXIT/BLACKLIST 日志收进 sDebugLog(生产安静); 行为零变化 ========");
+        RDLog(@"======== RDBUILD v2.0.66.38: 物理位置判定补刀(MKLabelPhysicallyInDock)治「主屏 label 漂到 dock 位置显示(祖先链仍主屏)」的串名(前版 fctx 仅靠类名祖先链覆盖不到); + 收进 sDebugLog(生产安静); 行为零变化 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.30: NEG-SETTEXT 最终捕获版(彻底无门控) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.31: DOCK-RANDOM-FIX 根治 dock 随机串名 + 移除 1s 扫描定时器 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.32: UNLOCK-NATIVE-CARRY 解锁即时 un-hide 原生携带 ========");
