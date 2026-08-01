@@ -10,3 +10,13 @@ packages/
 *.swp
 *~
 .vscode/
+
+# 旧版本构建产物与历史安装包（不应入版本库）
+build_*/
+*.deb
+
+# 诊断 / 审计文档（自动化生成，非源码）
+AUDIT*.md
+code_review*.md
+folder_color_diagnosis*.md
+OVERVIEW.md
