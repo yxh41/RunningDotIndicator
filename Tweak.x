@@ -4637,6 +4637,7 @@ static void MKRefreshFolderIcons(void) {
         RDLog(@"======== RDBUILD-NOTE v2.0.66.34: CLEANUP 撤方案B 无效代码 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.35: PERF-ZERO-ALLOC 热路径零分配 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.36: 方案C 解锁精准救回个别指示器 ========");
+        RDLog(@"======== RDBUILD-NOTE v2.0.66.40: 旋转/尺寸变更失效 sDockFrame 缓存(防 dock 串名旋转后复发 + 过渡期误藏主屏标签) ========");
     }
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
@@ -4694,6 +4695,17 @@ static void MKRefreshFolderIcons(void) {
                 MKUnlockRestore();
                 if (sDebugLog) RDLog(@"UNLOCK(active): instant reveal restore");
             } @catch (NSException *e) {}
+        }];
+
+    // ─── 屏幕旋转/尺寸变更失效 dock frame 缓存（v2.0.66.39）──────────
+    // sDockFrame 缓存 dock 容器 window frame, 仅供 MKLabelPhysicallyInDock 物理位置判定。
+    // 旋转/窗口尺寸变化后 dock 位置改变, 旧缓存帧失效 → 既可能让 dock 串名在旋转后复发,
+    // 也可能在过渡期误藏主屏标签。监听旋转通知把缓存清空, 下次物理判定惰性重算正确帧。
+    // (MKRefreshAllIcons 也会周期刷新, 但旋转不一定立即触发它, 故显式失效更稳。)
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIDeviceOrientationDidChangeNotification object:nil queue:[NSOperationQueue mainQueue]
+        usingBlock:^(NSNotification *note){
+            @try { sDockFrame = CGRectZero; } @catch (NSException *e) {}
         }];
 
     // ─── 生命周期通知（只保留 exit，iOS 16 上只有 exit 有效）──────────
