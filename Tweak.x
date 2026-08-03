@@ -1398,7 +1398,7 @@ static UIColor *MKCachedIconColorForBundleID(NSString *bid) {
     if (result) {
         sIconColorCache[bid] = result;
         MKSaveColorCacheToDisk();
-        RDLog(@"IconColor: %@ → %@", bid, result);
+        if (sDebugLog) RDLog(@"IconColor: %@ → %@", bid, result);
         return result;
     }
     // v1.6.11: 取不到图标 → 返回固定色用于即时显示，但【不缓存】
@@ -4638,6 +4638,7 @@ static void MKRefreshFolderIcons(void) {
         RDLog(@"======== RDBUILD-NOTE v2.0.66.35: PERF-ZERO-ALLOC 热路径零分配 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.36: 方案C 解锁精准救回个别指示器 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.40: 旋转/尺寸变更失效 sDockFrame 缓存(防 dock 串名旋转后复发 + 过渡期误藏主屏标签) ========");
+        RDLog(@"======== RDBUILD-NOTE v2.0.66.41: IconColor 主色解析日志收进 sDebugLog 门控(诊断关时 rd_log.txt 不再漏记新 App 取色行) ========");
     }
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
