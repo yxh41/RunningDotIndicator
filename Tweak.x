@@ -1525,7 +1525,7 @@ static BOOL MKIsForeground(NSString *bid) {
 
 // ─── NSFileManager 扫描构建 bundleID↔executablePath 映射 ────
 static void MKBuildPathCache() {
-    RDLog(@"PathCache: starting NSFileManager scan...");
+    if (sDebugLog) RDLog(@"PathCache: starting NSFileManager scan...");
     if (!sBidToExePath) sBidToExePath = [NSMutableDictionary dictionary];
     if (!sPathToBundleID) sPathToBundleID = [NSMutableDictionary dictionary];
 
@@ -1590,7 +1590,7 @@ static void MKBuildPathCache() {
         }
     }
 
-    RDLog(@"PathCache: cached %d apps", added);
+    if (sDebugLog) RDLog(@"PathCache: cached %d apps", added);
 }
 
 // ─── SBApplicationController.runningApplications 初始同步 ────
@@ -1598,13 +1598,13 @@ static void MKSyncFromSBAppCtrl() {
     @try {
         id appCtrl = [SBApplicationController sharedInstance];
         if (!appCtrl) {
-            RDLog(@"SBAppCtrl: sharedInstance is nil");
+            if (sDebugLog) RDLog(@"SBAppCtrl: sharedInstance is nil");
             return;
         }
 
         SEL runningSel = NSSelectorFromString(@"runningApplications");
         if (![appCtrl respondsToSelector:runningSel]) {
-            RDLog(@"SBAppCtrl: does not respond to runningApplications");
+            if (sDebugLog) RDLog(@"SBAppCtrl: does not respond to runningApplications");
             return;
         }
 
@@ -1614,7 +1614,7 @@ static void MKSyncFromSBAppCtrl() {
 #pragma clang diagnostic pop
 
         if (!runningApps) {
-            RDLog(@"SBAppCtrl: runningApplications returned nil");
+            if (sDebugLog) RDLog(@"SBAppCtrl: runningApplications returned nil");
             return;
         }
 
@@ -1637,7 +1637,7 @@ static void MKSyncFromSBAppCtrl() {
                 count++;
             }
         }
-        RDLog(@"SBAppCtrl: synced %d running apps (total=%lu)", count, (unsigned long)runningApps.count);
+        if (sDebugLog) RDLog(@"SBAppCtrl: synced %d running apps (total=%lu)", count, (unsigned long)runningApps.count);
 
     } @catch (NSException *e) {
         RDLog(@"SBAppCtrl EXCEPTION: %@", e.reason);
@@ -3724,7 +3724,7 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
 // ====================================================================
 
 static void MKDelayedInit() {
-    RDLog(@"DELAYED INIT: starting heavy work...");
+    if (sDebugLog) RDLog(@"DELAYED INIT: starting heavy work...");
 
     // ─── 步骤 1：系统黑名单 ──────
     MKInitBlacklist();
@@ -3743,13 +3743,13 @@ static void MKDelayedInit() {
     // ─── 步骤 4：进程枚举辅助 ──────
     MKComputeRunningSetFromProc();
 
-    RDLog(@"DELAYED INIT: runningSet has %lu items", (unsigned long)sRunningSet.count);
-    RDLog(@"runningSet: %@", [[sRunningSet allObjects] componentsJoinedByString:@", "]);
+    if (sDebugLog) RDLog(@"DELAYED INIT: runningSet has %lu items", (unsigned long)sRunningSet.count);
+    if (sDebugLog) RDLog(@"runningSet: %@", [[sRunningSet allObjects] componentsJoinedByString:@", "]);
 
     // ─── 标记初始化完成 ──────
     sInitDone = YES;
     MKUpdateDebugFlag(); // v1.6.26: 初始化完成后读取调试开关
-    RDLog(@"DELAYED INIT: done. sInitDone=YES");
+    if (sDebugLog) RDLog(@"DELAYED INIT: done. sInitDone=YES");
 
 
     // ─── 首次刷新所有图标 ──────
@@ -4752,7 +4752,7 @@ static void MKRefreshFolderIcons(void) {
 
     // v2.0.66.39: 启动日志彻底精简 —— 单行版本戳也收进 sDebugLog(诊断关时彻底零输出, 仅 @catch 异常仍可见); 多行改动清单同收进 sDebugLog。
     if (sDebugLog) {
-        RDLog(@"======== RunningDotIndicator v2.0.66.39 loaded ========");
+        RDLog(@"======== RunningDotIndicator v2.0.66.44 loaded ========");
         RDLog(@"======== RDBUILD v2.0.66.38: 物理位置判定补刀(MKLabelPhysicallyInDock)治「主屏 label 漂到 dock 位置显示(祖先链仍主屏)」的串名(前版 fctx 仅靠类名祖先链覆盖不到); + 收进 sDebugLog(生产安静); 行为零变化 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.30: NEG-SETTEXT 最终捕获版(彻底无门控) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.31: DOCK-RANDOM-FIX 根治 dock 随机串名 + 移除 1s 扫描定时器 ========");
@@ -4763,7 +4763,7 @@ static void MKRefreshFolderIcons(void) {
         RDLog(@"======== RDBUILD-NOTE v2.0.66.36: 方案C 解锁精准救回个别指示器 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.40: 旋转/尺寸变更失效 sDockFrame 缓存(防 dock 串名旋转后复发 + 过渡期误藏主屏标签) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.41: IconColor 主色解析日志收进 sDebugLog 门控(诊断关时 rd_log.txt 不再漏记新 App 取色行) ========");
-        RDLog(@"======== RDBUILD-NOTE v2.0.66.43: 关窗守卫 SBFolderIcon 分支从『只诊断』升级为『也藏名』—— MKHideFolderThumbLabels 每 tick(8ms) 扫缩略图子树对运行中 App label 强制藏名, 补 CAAnimation(render server) 路径复显(iOS 不走 setHidden/setAlpha → 三 hook 全不触发 → 原漏藏); 复用 MKViewInFolderThumb+MKFolderThumbBid, 零分配, 仅关窗 1.2s 内生效, 不影响待机 ========");
+        RDLog(@"======== RDBUILD-NOTE v2.0.66.44: MKBuildPathCache/MKSyncFromSBAppCtrl/MKDelayedInit 共 10 处启动日志收进 sDebugLog 门控(诊断关时 rd_log.txt 彻底零输出, 仅 @catch 异常仍可见); 启动版本戳更新为 v2.0.66.44; 行为零变化 ========");
     }
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
