@@ -4131,6 +4131,42 @@ static void MKSafeSnapshotProbe(UIView *snapView) {
     } @catch (NSException *e) {}
 }
 
+// v2.0.66.43: 关窗守卫遇到 SBFolderIcon 时, 遍历子树对运行中 App 的 label 强制藏名。
+// 补 MKProbeFolderThumb(纯诊断, 门控 sDebugLog) 不藏名的缺口: 缩略图迷你图标不是 SBIconView,
+// 关窗守卫原只对 SBIconView 藏名 → 缩略图子树完全不在藏名范围 → iOS 经 CAAnimation(render server)
+// 复显 label 时不走 setHidden/setAlpha/setIconLabelAlpha → 三个 hook 全不触发 → 漏藏。
+// 此函数每 tick(8ms) 扫一遍缩略图子树, 覆盖 CAAnimation 路径的复显(盲区从"整个关窗期"缩到 8ms)。
+// 复用 MKViewInFolderThumb(精确匹配 SBFolderIconImageView, 不误伤文件夹自身名) + MKFolderThumbBid(解析 bid)。
+// 仅关窗 1.2s 内生效(sFolderCloseGuard 运行期), 零分配, 不影响待机。
+static void MKHideFolderThumbLabels(UIView *folderIcon) {
+    if (!folderIcon || !sHiddenBids || sHiddenBids.count == 0) return;
+    @try {
+        NSMutableArray *ts = [NSMutableArray arrayWithArray:folderIcon.subviews];
+        int tdepth = 0;
+        while (ts.count > 0 && tdepth < 8) {
+            NSMutableArray *nxt = [NSMutableArray array];
+            for (UIView *tv in ts) {
+                const char *tn = class_getName(object_getClass(tv));
+                BOOL isLabel = [tv isKindOfClass:[UILabel class]] || (strstr(tn, "Label") != NULL);
+                if (isLabel && (!tv.hidden || tv.alpha > 0.0f || tv.layer.opacity > 0.0f)) {
+                    if (MKViewInFolderThumb(tv)) {
+                        NSString *fb = MKFolderThumbBid(tv);
+                        if (fb.length && [sHiddenBids containsObject:fb]) {
+                            tv.hidden = YES;
+                            tv.alpha = 0.0f;
+                            tv.layer.opacity = 0.0f;
+                            [tv.layer removeAllAnimations];
+                            MKAssocLabelBid(tv, fb);
+                        }
+                    }
+                }
+                [nxt addObjectsFromArray:tv.subviews];
+            }
+            ts = nxt; tdepth++;
+        }
+    } @catch (NSException *e) {}
+}
+
 // 现抽成独立函数，由 SBFolderController -viewWillDisappear:（关闭起始，sFolderOpen 仍 YES）与
 // didMoveToWindow(nil)（结束兜底）共调用，使 0.016s 基础强制藏（每帧对缓存 label 藏名）在缩回动画进行中即运行；不再全树 BFS（回归 2.0.5 方式）。
 // v2.0.41: 关窗内 iOS 经任一 hook 试图复显运行 App label 时记一笔(无论 bid 能否解析),定位「末拍闪一下」走哪条 setter。
@@ -4222,6 +4258,7 @@ static void MKArmFolderCloseGuard(void) {
                             const char *curName = class_getName(object_getClass(cur));
                             BOOL isFolderIcon = (strcmp(curName, "SBFolderIcon") == 0 || strcmp(curName, "SBIconFolderIcon") == 0);
                             if (isFolderIcon) {
+                                MKHideFolderThumbLabels(cur); // v2.0.66.43: 每 tick 对缩略图子树运行中 App label 强制藏名(补 CAAnimation 路径, 缩略图迷你图标非 SBIconView 原不覆盖)
                                 MKProbeFolderThumb(cur); // v2.0.42: 抓缩略图迷你图标(名/指示器)闪现
                             } else if (ivCls2 && [cur isKindOfClass:ivCls2]) {
                                 SBIconView *iv = (SBIconView *)cur;
@@ -4726,7 +4763,7 @@ static void MKRefreshFolderIcons(void) {
         RDLog(@"======== RDBUILD-NOTE v2.0.66.36: 方案C 解锁精准救回个别指示器 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.40: 旋转/尺寸变更失效 sDockFrame 缓存(防 dock 串名旋转后复发 + 过渡期误藏主屏标签) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.41: IconColor 主色解析日志收进 sDebugLog 门控(诊断关时 rd_log.txt 不再漏记新 App 取色行) ========");
-        RDLog(@"======== RDBUILD-NOTE v2.0.66.42: 位移即时校验 hook(setFrame:/setCenter:) 堵『先 setHidden:NO 复显、后 setFrame 搬到 dock』纯位移漏藏缺口; 仅可见 label 做 dock 纵带校验, 零分配早退, 开销可忽略; 诊断关零输出 ========");
+        RDLog(@"======== RDBUILD-NOTE v2.0.66.43: 关窗守卫 SBFolderIcon 分支从『只诊断』升级为『也藏名』—— MKHideFolderThumbLabels 每 tick(8ms) 扫缩略图子树对运行中 App label 强制藏名, 补 CAAnimation(render server) 路径复显(iOS 不走 setHidden/setAlpha → 三 hook 全不触发 → 原漏藏); 复用 MKViewInFolderThumb+MKFolderThumbBid, 零分配, 仅关窗 1.2s 内生效, 不影响待机 ========");
     }
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
