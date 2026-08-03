@@ -2202,6 +2202,11 @@ static CFMutableDictionaryRef sOrigSetAlphaByClassCF = NULL;
 static CFMutableDictionaryRef sOrigDidMoveToWindowByClassCF = NULL;
 static CFMutableDictionaryRef sOrigDidMoveToSuperviewByClassCF = NULL;
 static CFMutableDictionaryRef sOrigSetIconLabelAlphaByClassCF = NULL; // v2.0.66.34-perf: 第 5 个 hook(setIconLabelAlpha:) 的零分配镜像
+// v2.0.66.42: 第 6/7 个 hook(setFrame:/setCenter:) 的原始 IMP + 零分配镜像——位移即时校验用(堵「先 setHidden:NO 复显、后 setFrame:/setCenter: 搬到 dock」的纯位移漏藏缺口)
+static NSMutableDictionary *sOrigSetFrameByClass = nil;
+static NSMutableDictionary *sOrigSetCenterByClass = nil;
+static CFMutableDictionaryRef sOrigSetFrameByClassCF = NULL;
+static CFMutableDictionaryRef sOrigSetCenterByClassCF = NULL;
 
 // v2.0.12: 原 MKLabelHostInFolder() 已删除——v2.0.9 用它实现「关合窗口内对文件夹内 label 让步原生」，
 // 而 v2.0.12 已撤销该让步(关合窗口内文件夹内 label 一律强藏,见 MKSetHiddenHook/MKSetAlphaHook/
@@ -2356,6 +2361,47 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
         @try { orig(self, _cmd, a); }
         @catch (NSException *e) { RDLog(@"MKSetAlphaHook orig EXCEPTION: %@", e.reason); }
     }
+}
+
+// v2.0.66.42: 位移即时校验 hook —— 见 MKHookOneLabelClass 内 setFrame:/setCenter: 安装注释。
+// 系统先 setHidden:NO 复显 label(此刻 frame 仍主屏, 物理判定 NO 放行), 之后 setFrame:/setCenter: 把位置搬到 dock;
+// 既有 setHidden/setAlpha/didMoveToSuperview 三 hook 不钩位移 → 漏藏。此处在每次位移后即时校验 dock 纵带, 命中即藏名。
+// 仅 label 当前可见(alpha>0 且非 hidden)才做 convertRect(window 坐标 midY 比 dock 纵带), 零分配早退, 滚动/动画期开销可忽略。
+static void MKSetFrameHook(id self, SEL _cmd, CGRect f) {
+    void(*orig)(id,SEL,CGRect) = (void(*)(id,SEL,CGRect))MKResolveOrigIMP(sOrigSetFrameByClass, sOrigSetFrameByClassCF, self);
+    if (orig && orig != (void(*)(id,SEL,CGRect))MKSetFrameHook) {
+        @try { orig(self, _cmd, f); }
+        @catch (NSException *e) { RDLog(@"MKSetFrameHook orig EXCEPTION: %@", e.reason); }
+    }
+    @try {
+        UIView *lbl = (UIView *)self;
+        if (lbl.hidden || lbl.alpha <= 0.01f) return; // 已藏/不可见 → 零分配早退
+        if (MKLabelPhysicallyInDock(lbl)) {
+            lbl.hidden = YES;
+            lbl.alpha = 0.0f;
+            lbl.layer.opacity = 0.0f;
+            [lbl.layer removeAllAnimations];
+            if (sDebugLog) RDLog(@"DOCK-FRAME-HIDE: cls=%@ setFrame physInDock=YES", NSStringFromClass([lbl class]));
+        }
+    } @catch (NSException *e) { RDLog(@"MKSetFrameHook EXCEPTION: %@", e.reason); }
+}
+static void MKSetCenterHook(id self, SEL _cmd, CGPoint c) {
+    void(*orig)(id,SEL,CGPoint) = (void(*)(id,SEL,CGPoint))MKResolveOrigIMP(sOrigSetCenterByClass, sOrigSetCenterByClassCF, self);
+    if (orig && orig != (void(*)(id,SEL,CGPoint))MKSetCenterHook) {
+        @try { orig(self, _cmd, c); }
+        @catch (NSException *e) { RDLog(@"MKSetCenterHook orig EXCEPTION: %@", e.reason); }
+    }
+    @try {
+        UIView *lbl = (UIView *)self;
+        if (lbl.hidden || lbl.alpha <= 0.01f) return;
+        if (MKLabelPhysicallyInDock(lbl)) {
+            lbl.hidden = YES;
+            lbl.alpha = 0.0f;
+            lbl.layer.opacity = 0.0f;
+            [lbl.layer removeAllAnimations];
+            if (sDebugLog) RDLog(@"DOCK-FRAME-HIDE: cls=%@ setCenter physInDock=YES", NSStringFromClass([lbl class]));
+        }
+    } @catch (NSException *e) { RDLog(@"MKSetCenterHook EXCEPTION: %@", e.reason); }
 }
 
 // v2.0.7: 创建点拦截 —— label 一旦进入 window（新建/重父/动画层迁入）即刻检查归属，
@@ -2624,6 +2670,8 @@ static void MKHookOneLabelClass(Class cls) {
     if (!sOrigSetHiddenByClass) {
         sOrigSetHiddenByClass = [NSMutableDictionary dictionary];
         sOrigSetAlphaByClass  = [NSMutableDictionary dictionary];
+        sOrigSetFrameByClass  = [NSMutableDictionary dictionary];
+        sOrigSetCenterByClass = [NSMutableDictionary dictionary];
     }
     // v2.0.66.34-perf: 懒建零分配 CFDict 镜像(指针键, 不 retain)
     if (!sOrigSetHiddenByClassCF) {
@@ -2632,8 +2680,10 @@ static void MKHookOneLabelClass(Class cls) {
         sOrigDidMoveToWindowByClassCF = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
         sOrigDidMoveToSuperviewByClassCF = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
         sOrigSetIconLabelAlphaByClassCF = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+        sOrigSetFrameByClassCF = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+        sOrigSetCenterByClassCF = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
     }
-    if ([sOrigSetHiddenByClass objectForKey:k]) return; // 已钩，幂等
+    if ([sOrigSetHiddenByClass objectForKey:k] && [sOrigSetAlphaByClass objectForKey:k] && [sOrigSetFrameByClass objectForKey:k] && [sOrigSetCenterByClass objectForKey:k]) return; // 全部已钩，幂等
     // v1.6.87: 仅当本类「真正重写」setHidden:/setAlpha: 才替换 IMP。
     // 此前对任意（含继承来的）Method 都 method_setImplementation，会把基类 orig 捕成
     // MKSetHiddenHook 自身 → 调用时死循环/向错误 self 发未识别 selector → 解锁安全模式。
@@ -2653,6 +2703,43 @@ static void MKHookOneLabelClass(Class cls) {
         [sOrigSetAlphaByClass setObject:[NSValue valueWithPointer:(void *)orig] forKey:k];
         CFDictionarySetValue(sOrigSetAlphaByClassCF, (const void *)cls, (const void *)orig);
         method_setImplementation(m2, (IMP)MKSetAlphaHook);
+    }
+    // v2.0.66.42: 位移即时校验 —— 系统可能先 setHidden:NO 复显 label(此刻 frame 仍在主屏→物理判定 NO 放行),
+    // 之后才用 setFrame:/setCenter: 把位置搬到 dock; 既有 setHidden/setAlpha/didMoveToSuperview 三 hook 不钩位移 → 漏藏。
+    // 此处每次位移后即时校验 dock 纵带, 命中即藏名, 堵死「纯位移不触发 setHidden」缺口。
+    // 用 class_replace/class_add 强制在本类挂 override(无论本类是否重写, 确保纯位移路径必被捕获; 若仅 method_setImplementation
+    // 且本类未重写 setFrame: 则钩不上)。orig 取 superclass IMP(未重写时)。
+    if (!sOrigSetFrameByClass) sOrigSetFrameByClass = [NSMutableDictionary dictionary];
+    if ([sOrigSetFrameByClass objectForKey:k] == nil) {
+        Method mf = class_getInstanceMethod(cls, @selector(setFrame:));
+        Method supMf = sup ? class_getInstanceMethod(sup, @selector(setFrame:)) : NULL;
+        if (mf && supMf) {
+            IMP origF = NULL;
+            if (class_getInstanceMethod(cls, @selector(setFrame:)) != supMf) {
+                origF = class_replaceMethod(cls, @selector(setFrame:), (IMP)MKSetFrameHook, method_getTypeEncoding(mf));
+            } else {
+                class_addMethod(cls, @selector(setFrame:), (IMP)MKSetFrameHook, method_getTypeEncoding(supMf));
+                origF = method_getImplementation(supMf);
+            }
+            if (origF) { [sOrigSetFrameByClass setObject:[NSValue valueWithPointer:(void *)origF] forKey:k];
+                CFDictionarySetValue(sOrigSetFrameByClassCF, (const void *)cls, (const void *)origF); }
+        }
+    }
+    if (!sOrigSetCenterByClass) sOrigSetCenterByClass = [NSMutableDictionary dictionary];
+    if ([sOrigSetCenterByClass objectForKey:k] == nil) {
+        Method mc = class_getInstanceMethod(cls, @selector(setCenter:));
+        Method supMc = sup ? class_getInstanceMethod(sup, @selector(setCenter:)) : NULL;
+        if (mc && supMc) {
+            IMP origC = NULL;
+            if (class_getInstanceMethod(cls, @selector(setCenter:)) != supMc) {
+                origC = class_replaceMethod(cls, @selector(setCenter:), (IMP)MKSetCenterHook, method_getTypeEncoding(mc));
+            } else {
+                class_addMethod(cls, @selector(setCenter:), (IMP)MKSetCenterHook, method_getTypeEncoding(supMc));
+                origC = method_getImplementation(supMc);
+            }
+            if (origC) { [sOrigSetCenterByClass setObject:[NSValue valueWithPointer:(void *)origC] forKey:k];
+                CFDictionarySetValue(sOrigSetCenterByClassCF, (const void *)cls, (const void *)origC); }
+        }
     }
     // v2.0.7: 创建点拦截 —— 安全替换 didMoveToWindow:（用 class_replaceMethod / class_addMethod，
     // 即便本类未重写也只在本类加 override，绝不污染 superclass IMP → 不触发 ___forwarding___ 陷阱）。
@@ -4639,6 +4726,7 @@ static void MKRefreshFolderIcons(void) {
         RDLog(@"======== RDBUILD-NOTE v2.0.66.36: 方案C 解锁精准救回个别指示器 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.40: 旋转/尺寸变更失效 sDockFrame 缓存(防 dock 串名旋转后复发 + 过渡期误藏主屏标签) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.41: IconColor 主色解析日志收进 sDebugLog 门控(诊断关时 rd_log.txt 不再漏记新 App 取色行) ========");
+        RDLog(@"======== RDBUILD-NOTE v2.0.66.42: 位移即时校验 hook(setFrame:/setCenter:) 堵『先 setHidden:NO 复显、后 setFrame 搬到 dock』纯位移漏藏缺口; 仅可见 label 做 dock 纵带校验, 零分配早退, 开销可忽略; 诊断关零输出 ========");
     }
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
