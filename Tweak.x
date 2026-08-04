@@ -377,9 +377,6 @@ static NSInteger sUnlockToken = 0;
 // (323 行) 之前声明，因为 MKUnlockRestore 内调用了它，否则新版 clang -Werror 报
 // implicit-function-declaration（v2.0.1 回归：前向声明原在 531 行、晚于调用点）。
 static void MKRefreshAllIcons(void);
-// v2.0.66.45: dock 串名机制无关扫描 —— 不关心标签如何到达 dock, 仅事件驱动时机整树扫一遍,
-// 把「物理落在 dock 纵带、但不属于 dock 图标」的可见名 label 钉死(封死 .38~.44 漏的「父视图被 reposition、子 label 顺带拖过去」路径)。
-static void MKDockBandSweep(void);
 // v2.0.66.3: 关闭「保留小黄点」时对称隐藏全部 beta 点(定义于 ~L804); 必须在 MKRefreshAllIcons
 // (3011 行) 之前声明, 否则调用点(L3063)触发 -Werror implicit-function-declaration。
 static void MKBetaHideAll(UIView *);
@@ -430,10 +427,11 @@ static void MKUnlockRestore(void) {
         // 仍触发全量刷新：让每个图标经逐帧不变量重推 hidden/alpha(此刻只解隐、不叠动画,
         // 因 sUnlockFading=YES 抑制逐帧淡入; 同时是离屏未布局图标的安全网)。
         MKRefreshAllIcons();
-        // v2.0.66.45: 用户实测「解锁后约 1 秒 dock 串名又冒出来」——串名在解锁 t=0 已随主屏重建归位,
-        // 但约 1s 后某过渡又把该 label 顺带拖回 dock 纵带; 故在 0.5s/1.3s 各补一次机制无关扫描兜底。
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ MKDockBandSweep(); });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ MKDockBandSweep(); });
+        // v2.0.66.46: 用户实测「解锁后约 1 秒 dock 串名又冒出来」——串名在解锁 t=0 已随主屏重建归位,
+        // 但约 1s 后某过渡又把该 label 拖回 dock 纵带; 该时刻 label 往往已静止(无 layoutSubviews 可依赖),
+        // 故保留一次 t=1.3s 的全量刷新兜底(其 BFS 已内联 MKDockStrayHide 判定, 顺带完成 dock 串名复核)。
+        // v2.0.66.45 的 0.5s/1.3s 两次独立全树扫描(MKDockBandSweep)已整体删除: 判定并入每帧路径与本刷新, 不再重复遍历。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ MKRefreshAllIcons(); });
         if (sDebugLog) RDLog(@"UNLOCK: instant reveal all overlays + refreshed icons");
     } @catch (NSException *e) { RDLog(@"UNLOCK EXCEPTION: %@", e.reason); }
 }
@@ -2177,6 +2175,43 @@ static BOOL MKLabelPhysicallyInDock(UIView *label) {
     return midY >= CGRectGetMinY(sDockFrame) && midY <= CGRectGetMaxY(sDockFrame);
 }
 
+// v2.0.66.46: dock 串名【统一即时判定】—— 取代 v2.0.66.45 的独立全树扫描(MKDockBandSweep, 已删)。
+// 根因复盘：v2.0.66.31 在 SBIconView.layoutSubviews 加的「每帧强制藏名」才是历史上「一出现就藏」的真身,
+// 但它只认【祖先链含 Dock 类名】(MKLabelInDock) —— 那对应形态 A: 主屏 iconView 被回收去渲染 dock 槽, iconView 确实在 dock 子树里。
+// 当前复发的是形态 B: label 仅【物理位置】被搬到 dock 纵带, 视图层级仍挂主屏(祖先链无 Dock 类名) → 祖先链判定永不命中,
+// 于是唯一能被「父容器移动」触发的每帧路径整段跳过(父容器移动不会调 label 自己的任何 setter, 故 .38/.42 的 setter 钩子也抓不到)。
+// v2.0.66.38 引入物理判定时只补了 label 自身三个 setter, 独独漏了这条每帧路径 —— 这就是 .38~.45 一路补丁仍复发的结构性缺口。
+// 本函数把「祖先链」与「物理位置」两个维度合一, 供 layoutSubviews(每帧即时拦截) 与 MKRefreshAllIcons 的 BFS(事件兜底, 零额外遍历) 共用。
+// 返回值 = 是否真 dock 图标(调用方应 return, 不走主屏逻辑); *outStray=YES 表示主屏图标 label 异常漂到 dock 且已被钉藏。
+// 开销: 正常帧 = 一次 strstr(零分配) + 一次关联对象读; label 不可见即早退(运行中 App 全走这条); 仅「可见 label」才做一次 convertRect。
+static BOOL MKDockStrayHide(SBIconView *iv, BOOL *outStray) {
+    if (outStray) *outStray = NO;
+    if (!iv) return NO;
+    BOOL dockCtx = MKLabelInDock((UIView *)iv);   // 零分配: class_getName + strstr
+    UIView *lbl = MKGetCachedLabel(iv);
+    if (!lbl) return dockCtx;
+    BOOL hit = dockCtx;
+    if (!hit) {
+        if (lbl.hidden || lbl.alpha <= 0.01f) return NO;   // 已不可见 → 无需判定(最常见早退路径)
+        if (!MKLabelPhysicallyInDock(lbl)) return NO;      // 物理不在 dock 纵带 → 正常主屏标签, 放行
+        hit = YES;
+        if (outStray) *outStray = YES;
+        static int sStrayLogs = 0;
+        if (sDebugLog && sStrayLogs < 30) {
+            sStrayLogs++;
+            RDLog(@"DOCK-STRAY-HIDE: lbl=%s (物理漂移, 祖先链仍主屏)", class_getName([lbl class]));
+        }
+    }
+    if (hit && (!lbl.hidden || lbl.alpha > 0.0f)) {
+        lbl.hidden = YES;
+        lbl.alpha = 0.0f;
+        lbl.layer.opacity = 0.0f;
+        lbl.opaque = NO;
+        [lbl.layer removeAllAnimations];
+    }
+    return dockCtx;
+}
+
 
 // v2.0.66.21: 暴力 dump —— 不再猜负一屏容器类名(SBDock/SBToday/SBWidget/SBDashboard/TodayView), 改结构判定:
 
@@ -3469,54 +3504,10 @@ static void MKRefreshAllIcons() {
                     } else {
                         MKBetaHideAll((UIView *)current);   // v2.0.66.3: OFF → 隐藏全部 beta 点(运行+未运行)
                     }
-                }
-                for (UIView *child in current.subviews) {
-                    [stack addObject:child];
-                }
-            }
-        }
-        MKDockBandSweep(); // v2.0.66.45: dock 串名最终防线(机制无关扫描, 覆盖父视图移动顺带拖 label 的漏路)
-    });
-}
-
-// v2.0.66.45: dock 串名「最终防线」——机制无关扫描。
-// 背景：v2.0.66.38 物理位置判定 + v2.0.66.42 标签自身 setFrame/setCenter 钩子只装在【标签自己】身上,
-// 只能抓「标签自身被 setFrame/setCenter 搬到 dock」；抓不到「父视图 SBIconView 被 reposition/recycle 到
-// dock 纵带、标签作为子视图被顺带拖过去」的路径(父视图移动不触发标签自己的几何 hook)。该漏路在 .38~.44 一直存在 → dock 串名复发。
-// 本函数不关心标签如何到达 dock：在事件驱动时机(解锁/关窗/App状态变更/旋转后, 即 MKRefreshAllIcons 各调用点)整树 BFS,
-// 凡「图标视图自身 window-frame midY 落入 dock 纵带(异常定位)且其名 label 可见并物理落在 dock 纵带、且所属 SBIconView 不是 dock 图标」一律钉藏。
-// 仅事件驱动触发(不接滚动 → 无滚动误杀); 热路径零分配早退: 先判 icon view 是否在 dock 纵带, 仅异常帧才查 label;
-// MKGetCachedLabel 仅在 icon view 已命中 dock 纵带时才调用, 故正常帧零额外成本。
-static void MKDockBandSweep(void) {
-    MKSafe(^{
-        if (!sInitDone) return;
-        MKUpdateDockFrame();
-        if (CGRectIsEmpty(sDockFrame)) return;
-        NSArray *windows = [UIApplication sharedApplication].windows;
-        for (UIWindow *window in windows) {
-            NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
-            while (stack.count > 0) {
-                UIView *current = [stack lastObject];
-                [stack removeLastObject];
-                if ([current isKindOfClass:MKSBIconViewClass()]) {
-                    SBIconView *iv = (SBIconView *)current;
-                    if (!MKLabelInDock((UIView *)iv)) { // 非 dock 图标(主屏/文件夹)才可能串名
-                        if (iv.window) {
-                            CGRect ivr = [iv convertRect:iv.bounds toView:iv.window];
-                            CGFloat midY = CGRectGetMidY(ivr);
-                            if (midY >= CGRectGetMinY(sDockFrame) && midY <= CGRectGetMaxY(sDockFrame)) {
-                                // icon view 异常定位到 dock 纵带 → 取其名 label 复核并钉藏
-                                UIView *lbl = MKGetCachedLabel(iv);
-                                if (lbl && !lbl.hidden && lbl.alpha > 0.01f && MKLabelPhysicallyInDock(lbl)) {
-                                    lbl.hidden = YES;
-                                    lbl.alpha = 0.0f;
-                                    lbl.layer.opacity = 0.0f;
-                                    [lbl.layer removeAllAnimations];
-                                    if (sDebugLog) RDLog(@"DOCK-SWEEP-HIDE: cls=%@ physInDock=YES notDockIcon", NSStringFromClass([lbl class]));
-                                }
-                            }
-                        }
-                    }
+                    // v2.0.66.46: dock 串名事件兜底 —— 内联进本趟 BFS, 零额外遍历
+                    // (取代 v2.0.66.45 在函数尾部再独立 BFS 一整棵树的 MKDockBandSweep)。
+                    // 必须放在 MKUpdate 之后: MKUpdate 会为非运行 App 复显名称, 先藏会被它覆盖。
+                    MKDockStrayHide((SBIconView *)current, NULL);
                 }
                 for (UIView *child in current.subviews) {
                     [stack addObject:child];
@@ -3889,16 +3880,19 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     // v2.0.66.31: dock 上下文每帧强制藏名 —— 根治 dock 随机串名(主屏 SBIconView 回收复用渲染 dock 槽, 把任意旧名带进来; 名字随机=回收哪个图标随机)。
     // 不依赖 sHiddenBids(随机名可能非运行中 app), 也不依赖创建点钩子(复用后原地改可见性不触发 moveToWindow/superview)。
     // 仅当本 SBIconView 在 dock 容器内时每帧把 name label 归零; dock 仅 ~4 图标开销可忽略; 主屏/文件夹 MKLabelInDock 返回 NO 即跳过, 不误伤。
-    if (MKLabelInDock((UIView *)self)) {
-        UIView *dlbl = MKGetCachedLabel((SBIconView *)self);
-        if (dlbl && !dlbl.hidden && dlbl.alpha > 0.0f) {  // 仅仍可见才强制归零, 避免无谓 layer 重绘
-            dlbl.hidden = YES;
-            dlbl.alpha = 0.0f;
-            dlbl.layer.opacity = 0.0f;
-            dlbl.opaque = NO;
-            [dlbl.layer removeAllAnimations];
+    // v2.0.66.46: 判定升级为「祖先链 OR 物理位置」二合一(MKDockStrayHide)。
+    // 旧实现只判 MKLabelInDock(祖先链含 Dock 类名) → 只覆盖形态 A(iconView 被回收进 dock 子树);
+    // 形态 B(label 仅物理漂到 dock 纵带、层级仍主屏)整段跳过 → 每帧藏名对当前复发的串名完全失效。
+    {
+        BOOL strayHidden = NO;
+        if (MKDockStrayHide((SBIconView *)self, &strayHidden)) {
+            return;  // 真 dock 图标: 名字已钉藏, 不走下方主屏/文件夹逻辑; 指示器几何由 MKUpdate 全局管理
         }
-        return;  // dock 不走下方主屏/文件夹逻辑(其 name label 本就不该显); 指示器几何由 MKUpdate 全局管理
+        if (strayHidden) {
+            // 主屏图标但 label 物理漂到 dock 纵带(异常瞬态): 已钉藏, 本帧不再往下走 ——
+            // 否则下方「非运行 App 恢复名称」分支会立刻把它复显, 白藏。指示器几何仍由 MKUpdate/MKRepositionIndicator 全局兜。
+            return;
+        }
     }
 
     // v1.6.70: 移除"文件夹打开期间一律显示名称并 return"的压制。
@@ -4807,7 +4801,7 @@ static void MKRefreshFolderIcons(void) {
 
     // v2.0.66.39: 启动日志彻底精简 —— 单行版本戳也收进 sDebugLog(诊断关时彻底零输出, 仅 @catch 异常仍可见); 多行改动清单同收进 sDebugLog。
     if (sDebugLog) {
-        RDLog(@"======== RunningDotIndicator v2.0.66.45 loaded ========");
+        RDLog(@"======== RunningDotIndicator v2.0.66.46 loaded ========");
         RDLog(@"======== RDBUILD v2.0.66.38: 物理位置判定补刀(MKLabelPhysicallyInDock)治「主屏 label 漂到 dock 位置显示(祖先链仍主屏)」的串名(前版 fctx 仅靠类名祖先链覆盖不到); + 收进 sDebugLog(生产安静); 行为零变化 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.30: NEG-SETTEXT 最终捕获版(彻底无门控) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.31: DOCK-RANDOM-FIX 根治 dock 随机串名 + 移除 1s 扫描定时器 ========");
@@ -4819,7 +4813,7 @@ static void MKRefreshFolderIcons(void) {
         RDLog(@"======== RDBUILD-NOTE v2.0.66.40: 旋转/尺寸变更失效 sDockFrame 缓存(防 dock 串名旋转后复发 + 过渡期误藏主屏标签) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.41: IconColor 主色解析日志收进 sDebugLog 门控(诊断关时 rd_log.txt 不再漏记新 App 取色行) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.44: MKBuildPathCache/MKSyncFromSBAppCtrl/MKDelayedInit 共 10 处启动日志收进 sDebugLog 门控(诊断关时 rd_log.txt 彻底零输出, 仅 @catch 异常仍可见); 启动版本戳更新为 v2.0.66.44; 行为零变化 ========");
-        RDLog(@"======== RDBUILD-NOTE v2.0.66.45: DOCK-SWEEP 机制无关扫描(MKDockBandSweep)封死 .38~.44 漏的「父视图 SBIconView 被 reposition/recycle 到 dock 纵带、子 label 顺带拖过去」路径(标签自身几何 hook 抓不到); 在 MKRefreshAllIcons 各调用点 + 解锁后 0.5s/1.3s 延迟扫描触发; NO LABEL 诊断日志补 sDebugLog 门控; 行为零变化 ========");
+        RDLog(@"======== RDBUILD-NOTE v2.0.66.46: dock 串名【结构性缺口】修复 —— v2.0.66.31 的 layoutSubviews 每帧藏名(历史上「一出现就藏」的真身)只认祖先链 MKLabelInDock, 仅覆盖形态A(主屏 iconView 被回收去渲染 dock 槽、确在 dock 子树内); 对形态B(label 仅【物理位置】漂到 dock 纵带、视图层级仍挂主屏)整段跳过 —— 这才是 .38~.45 一路补丁仍复发的真因(父容器移动不调 label 任何 setter, 故 .38/.42 的 setter 钩子同样抓不到)。本版新增 MKDockStrayHide(祖先链 OR 物理位置 二合一), 接入两处: layoutSubviews 每帧即时拦截(找回一出现就藏) + MKRefreshAllIcons 的 BFS 内联兜底(置于 MKUpdate 之后, 零额外遍历)。同时整体删除 v2.0.66.45 的 MKDockBandSweep(47 行独立全树扫描; 其 iconView midY 前置筛选恰好把形态B筛掉 = 实为无效防线)及其 0.5s 延迟调用; 解锁静止期兜底改为 t=1.3s 复用全量刷新。净效果: 覆盖面变宽, 事件时机少一趟全树 BFS 与一次 dock 帧树查找, 待机功耗仍为零 ========");
     }
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
