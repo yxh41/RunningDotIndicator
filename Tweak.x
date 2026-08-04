@@ -377,6 +377,9 @@ static NSInteger sUnlockToken = 0;
 // (323 行) 之前声明，因为 MKUnlockRestore 内调用了它，否则新版 clang -Werror 报
 // implicit-function-declaration（v2.0.1 回归：前向声明原在 531 行、晚于调用点）。
 static void MKRefreshAllIcons(void);
+// v2.0.66.45: dock 串名机制无关扫描 —— 不关心标签如何到达 dock, 仅事件驱动时机整树扫一遍,
+// 把「物理落在 dock 纵带、但不属于 dock 图标」的可见名 label 钉死(封死 .38~.44 漏的「父视图被 reposition、子 label 顺带拖过去」路径)。
+static void MKDockBandSweep(void);
 // v2.0.66.3: 关闭「保留小黄点」时对称隐藏全部 beta 点(定义于 ~L804); 必须在 MKRefreshAllIcons
 // (3011 行) 之前声明, 否则调用点(L3063)触发 -Werror implicit-function-declaration。
 static void MKBetaHideAll(UIView *);
@@ -427,6 +430,10 @@ static void MKUnlockRestore(void) {
         // 仍触发全量刷新：让每个图标经逐帧不变量重推 hidden/alpha(此刻只解隐、不叠动画,
         // 因 sUnlockFading=YES 抑制逐帧淡入; 同时是离屏未布局图标的安全网)。
         MKRefreshAllIcons();
+        // v2.0.66.45: 用户实测「解锁后约 1 秒 dock 串名又冒出来」——串名在解锁 t=0 已随主屏重建归位,
+        // 但约 1s 后某过渡又把该 label 顺带拖回 dock 纵带; 故在 0.5s/1.3s 各补一次机制无关扫描兜底。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ MKDockBandSweep(); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ MKDockBandSweep(); });
         if (sDebugLog) RDLog(@"UNLOCK: instant reveal all overlays + refreshed icons");
     } @catch (NSException *e) { RDLog(@"UNLOCK EXCEPTION: %@", e.reason); }
 }
@@ -1903,7 +1910,7 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
             dd = dd.superview;
         }
         static int sNoLabelLogs = 0;
-        if (!skipDump && sNoLabelLogs < 20) {
+        if (sDebugLog && !skipDump && sNoLabelLogs < 20) {
             sNoLabelLogs++;
             NSMutableString *dump = [NSMutableString stringWithFormat:@"NO LABEL - %@ direct:[", NSStringFromClass([iconView class])];
             for (UIView *sv in iconView.subviews) {
@@ -3468,6 +3475,54 @@ static void MKRefreshAllIcons() {
                 }
             }
         }
+        MKDockBandSweep(); // v2.0.66.45: dock 串名最终防线(机制无关扫描, 覆盖父视图移动顺带拖 label 的漏路)
+    });
+}
+
+// v2.0.66.45: dock 串名「最终防线」——机制无关扫描。
+// 背景：v2.0.66.38 物理位置判定 + v2.0.66.42 标签自身 setFrame/setCenter 钩子只装在【标签自己】身上,
+// 只能抓「标签自身被 setFrame/setCenter 搬到 dock」；抓不到「父视图 SBIconView 被 reposition/recycle 到
+// dock 纵带、标签作为子视图被顺带拖过去」的路径(父视图移动不触发标签自己的几何 hook)。该漏路在 .38~.44 一直存在 → dock 串名复发。
+// 本函数不关心标签如何到达 dock：在事件驱动时机(解锁/关窗/App状态变更/旋转后, 即 MKRefreshAllIcons 各调用点)整树 BFS,
+// 凡「图标视图自身 window-frame midY 落入 dock 纵带(异常定位)且其名 label 可见并物理落在 dock 纵带、且所属 SBIconView 不是 dock 图标」一律钉藏。
+// 仅事件驱动触发(不接滚动 → 无滚动误杀); 热路径零分配早退: 先判 icon view 是否在 dock 纵带, 仅异常帧才查 label;
+// MKGetCachedLabel 仅在 icon view 已命中 dock 纵带时才调用, 故正常帧零额外成本。
+static void MKDockBandSweep(void) {
+    MKSafe(^{
+        if (!sInitDone) return;
+        MKUpdateDockFrame();
+        if (CGRectIsEmpty(sDockFrame)) return;
+        NSArray *windows = [UIApplication sharedApplication].windows;
+        for (UIWindow *window in windows) {
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
+            while (stack.count > 0) {
+                UIView *current = [stack lastObject];
+                [stack removeLastObject];
+                if ([current isKindOfClass:MKSBIconViewClass()]) {
+                    SBIconView *iv = (SBIconView *)current;
+                    if (!MKLabelInDock((UIView *)iv)) { // 非 dock 图标(主屏/文件夹)才可能串名
+                        if (iv.window) {
+                            CGRect ivr = [iv convertRect:iv.bounds toView:iv.window];
+                            CGFloat midY = CGRectGetMidY(ivr);
+                            if (midY >= CGRectGetMinY(sDockFrame) && midY <= CGRectGetMaxY(sDockFrame)) {
+                                // icon view 异常定位到 dock 纵带 → 取其名 label 复核并钉藏
+                                UIView *lbl = MKGetCachedLabel(iv);
+                                if (lbl && !lbl.hidden && lbl.alpha > 0.01f && MKLabelPhysicallyInDock(lbl)) {
+                                    lbl.hidden = YES;
+                                    lbl.alpha = 0.0f;
+                                    lbl.layer.opacity = 0.0f;
+                                    [lbl.layer removeAllAnimations];
+                                    if (sDebugLog) RDLog(@"DOCK-SWEEP-HIDE: cls=%@ physInDock=YES notDockIcon", NSStringFromClass([lbl class]));
+                                }
+                            }
+                        }
+                    }
+                }
+                for (UIView *child in current.subviews) {
+                    [stack addObject:child];
+                }
+            }
+        }
     });
 }
 
@@ -4752,7 +4807,7 @@ static void MKRefreshFolderIcons(void) {
 
     // v2.0.66.39: 启动日志彻底精简 —— 单行版本戳也收进 sDebugLog(诊断关时彻底零输出, 仅 @catch 异常仍可见); 多行改动清单同收进 sDebugLog。
     if (sDebugLog) {
-        RDLog(@"======== RunningDotIndicator v2.0.66.44 loaded ========");
+        RDLog(@"======== RunningDotIndicator v2.0.66.45 loaded ========");
         RDLog(@"======== RDBUILD v2.0.66.38: 物理位置判定补刀(MKLabelPhysicallyInDock)治「主屏 label 漂到 dock 位置显示(祖先链仍主屏)」的串名(前版 fctx 仅靠类名祖先链覆盖不到); + 收进 sDebugLog(生产安静); 行为零变化 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.30: NEG-SETTEXT 最终捕获版(彻底无门控) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.31: DOCK-RANDOM-FIX 根治 dock 随机串名 + 移除 1s 扫描定时器 ========");
@@ -4764,6 +4819,7 @@ static void MKRefreshFolderIcons(void) {
         RDLog(@"======== RDBUILD-NOTE v2.0.66.40: 旋转/尺寸变更失效 sDockFrame 缓存(防 dock 串名旋转后复发 + 过渡期误藏主屏标签) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.41: IconColor 主色解析日志收进 sDebugLog 门控(诊断关时 rd_log.txt 不再漏记新 App 取色行) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.44: MKBuildPathCache/MKSyncFromSBAppCtrl/MKDelayedInit 共 10 处启动日志收进 sDebugLog 门控(诊断关时 rd_log.txt 彻底零输出, 仅 @catch 异常仍可见); 启动版本戳更新为 v2.0.66.44; 行为零变化 ========");
+        RDLog(@"======== RDBUILD-NOTE v2.0.66.45: DOCK-SWEEP 机制无关扫描(MKDockBandSweep)封死 .38~.44 漏的「父视图 SBIconView 被 reposition/recycle 到 dock 纵带、子 label 顺带拖过去」路径(标签自身几何 hook 抓不到); 在 MKRefreshAllIcons 各调用点 + 解锁后 0.5s/1.3s 延迟扫描触发; NO LABEL 诊断日志补 sDebugLog 门控; 行为零变化 ========");
     }
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
