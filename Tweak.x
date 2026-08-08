@@ -153,6 +153,7 @@ static char kMKIconKey;      // 缓存的 icon 指针（检测视图回收复用
 static char kMKLabelIconKey;  // v2.0.3: label→SBIconView 直接指针关联键（层级无关，关文件夹动画重父 label 时不失效）
 static char kMKIndicatorBidKey; // v1.6.63: 指示器归属的 bid（防回收复用导致"乱跑"）
 static char kMKOurBetaKey;     // v2.0.33: 标记「我们脱离的小黄点」——退出时只移除这些，不碰系统原生 TestFlight 黄点徽章
+static char kMKDockPinnedKey;  // v2.0.66.47: 标记「被 MKDockStrayHide 钉藏的 dock 外来 label」——防其(可能存在的)合法属主复显造成每帧互搏闪烁；由 MKGetCachedLabelEx 在该 label 重获合法属主时清除（对称 restore，绝不永久消失）
 // v1.6.60: bid → SBIconView 弱引用注册表（替代不可靠的窗口遍历刷新）
 // iOS 16 SpringBoard 在文件夹/滚动/转场等活跃态下，主屏图标视图常不在
 // [UIApplication sharedApplication].windows 的常规遍历可达路径，导致 MKRefreshIconForBundleID
@@ -751,7 +752,23 @@ static NSString *MKGetCachedBid(SBIconView *iv) {
 }
 
 // 缓存名字标签视图（避免每次 layoutSubviews 都跑 MKFindLabelView 4 重策略）
-static UIView *MKGetCachedLabel(SBIconView *iv) {
+//
+// v2.0.66.47 【结构性改造：把被丢弃的案发对象带出来】
+// ─────────────────────────────────────────────────────────────────────
+// 本函数在 owner ≠ 当前 iv 时返回 nil。而「owner ≠ 当前 iv」正是【串名的定义本身】。
+// 于是形成一个逆向门控：
+//     不串名 → 拿得到 label → 上层 dock 防线正常跑；
+//     真串名 → label 被丢弃 → 上层三层防线(.31 祖先链 / .38 物理坐标 / .46 二合一)
+//               全部挂在这一个取数点上，一个 nil 让它们【同时静默失效】。
+// 逐版本核查证实：本函数内 `label = nil` 恒为 2 处，从 .31 出生第一天起未变过
+// (.31/.37/.38/.40/.43/.45/.46 全部 =2)，八个版本一直在扩大「什么算 dock」，
+// 从没人碰过「拿不到 label 就返回」这一条 —— 这就是 dock 串名 8 战 0 胜的机械原因。
+//
+// 改造方式：新增 out 参数把「本该被丢弃的那个 label」交给调用方，供 dock 侧做
+// default-deny 处置（见 MKDockStrayHide）。签名保持不变的 MKGetCachedLabel 作为
+// 薄包装保留，33 个既有调用点【一行不动】，行为完全等价，零回归面。
+static UIView *MKGetCachedLabelEx(SBIconView *iv, UIView **outForeign) {
+    if (outForeign) *outForeign = nil;
     UIView *label = objc_getAssociatedObject(iv, &kMKLabelKey);
     if (label && label.superview) {
         // v2.0.35: 所有权校验 —— 仅当 label 仍有效归属本 iv 才直接复用；
@@ -761,8 +778,16 @@ static UIView *MKGetCachedLabel(SBIconView *iv) {
         UIView *owner = objc_getAssociatedObject(label, &kMKLabelIconKey);
         if (owner && owner != (id)iv) {
             objc_setAssociatedObject(iv, &kMKLabelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            if (outForeign) *outForeign = label;   // v2.0.66.47: 带出案发对象（原地丢弃 → 上层永远看不见）
             label = nil;
         } else {
+            // v2.0.66.47 【对称 restore 落点之一 —— 必须在此, 否则名字会永久消失】
+            // 场景: dock 侧钉藏 label L 时会清掉 L 的 kMKLabelIconKey; L 的真实属主(主屏 iv_B)
+            // 下一帧走本缓存命中路径时 owner 已是 nil → 校验通过 → 若在此直接 return,
+            // kMKDockPinnedKey 就再没有任何机会被清除, 两个 setter hook 会把 iv_B 的名字钉死到天荒地老。
+            // 先读后写: 正常帧只多一次关联对象【读】(未钉即跳过), 不分配、不写, 守住热路径零分配铁律。
+            if (objc_getAssociatedObject(label, &kMKDockPinnedKey))
+                objc_setAssociatedObject(label, &kMKDockPinnedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             return label;  // 仍然有效
         }
     }
@@ -774,6 +799,7 @@ static UIView *MKGetCachedLabel(SBIconView *iv) {
         // owner==nil 或 owner==iv 才是本 iv 的合法 label。
         UIView *owner = objc_getAssociatedObject(label, &kMKLabelIconKey);
         if (owner && owner != (id)iv) {
+            if (outForeign) *outForeign = label;   // v2.0.66.47: 带出案发对象（此路更权威——策略1 走的是 SBIconView 系统 accessor，返回的就是本 iv 当下真正挂着的那张 label）
             label = nil;
         } else {
             objc_setAssociatedObject(iv, &kMKLabelKey, label, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -782,9 +808,20 @@ static UIView *MKGetCachedLabel(SBIconView *iv) {
             // 使 MKLabelToBid 的 superview 层级查找全部失效 → 漏藏 → 名称闪现。
             // 直接指针随 label 对象自身走，重父/重建时仍可被 MKLabelToBid 取出，绕过层级解出 bid。
             objc_setAssociatedObject(label, &kMKLabelIconKey, iv, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            // v2.0.66.47 【对称 restore 落点之二】—— 该 label 已重新获得合法属主，解除 dock 钉藏标记。
+            // 与上方缓存命中路径成对存在，二者共同保证「被我们钉藏的 label 一旦回到合法属主名下即解钉」，
+            // 名字绝不永久消失（这是本次改动最大的风险，必须双路闭合）。同样是先读后写、零分配。
+            if (outForeign) *outForeign = nil;     // 已找到本 iv 的合法 label，前面那次陈旧缓存不再视为案发对象
+            if (objc_getAssociatedObject(label, &kMKDockPinnedKey))
+                objc_setAssociatedObject(label, &kMKDockPinnedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
     }
     return label;
+}
+
+// 签名不变的薄包装：既有 33 个调用点全部继续走这里，行为与 .46 完全等价。
+static UIView *MKGetCachedLabel(SBIconView *iv) {
+    return MKGetCachedLabelEx(iv, NULL);
 }
 
 // v2.0.30: beta（TestFlight）小黄点保护 —— 运行中 App 藏名时不再连带藏掉小黄点。
@@ -2184,12 +2221,80 @@ static BOOL MKLabelPhysicallyInDock(UIView *label) {
 // 本函数把「祖先链」与「物理位置」两个维度合一, 供 layoutSubviews(每帧即时拦截) 与 MKRefreshAllIcons 的 BFS(事件兜底, 零额外遍历) 共用。
 // 返回值 = 是否真 dock 图标(调用方应 return, 不走主屏逻辑); *outStray=YES 表示主屏图标 label 异常漂到 dock 且已被钉藏。
 // 开销: 正常帧 = 一次 strstr(零分配) + 一次关联对象读; label 不可见即早退(运行中 App 全走这条); 仅「可见 label」才做一次 convertRect。
+// v2.0.66.47 【装眼睛】dock 案发分支专用埋点 —— 刻意【不挂 sDebugLog 门控】。
+// 理由: dock 串名随机复现(用户实测「注销后几小时才冒出来一次」), 单次验证周期以小时~天计,
+// 用户不可能为了守株待兔长期挂着诊断开关 —— 挂开关 = 继续抓不到, 这正是前 8 版
+// 「每版只能靠下次还出不出现来判断成败, 于是每版都敢自称根治」的根源。
+// 成本可控: 本分支仅在「iconView 的 label 属主校验失败」这一异常态才进入(正常帧零触发),
+// 且硬限流 20 条/开机周期, 日志体积与功耗均可忽略。RDLog 自身无门控(直接写文件), 故必达。
+// v2.0.66.47 【配额必须按上下文分开, 否则埋点等于没装】
+// rd_log(3) 实测: 文件夹场景孤儿 label(bid=?) 极其密集(FOLDER-FLOATY 684 条/64 秒),
+// 若与 dock 共用一个计数器, 开一次文件夹就能把配额吃光 —— 等 dock 串名真正发生时早已限流,
+// 结果与「没装埋点」完全等价。故: dock 上下文(真正要抓的稀有事件)独占 20 条且无门控必达;
+// 非 dock 上下文仅作参考, 收进 sDebugLog 且只给 5 条, 绝不挤占 dock 配额。
+static void MKDockForeignProbe(SBIconView *iv, UIView *foreign, BOOL dockCtx, BOOL acted) {
+    static int sDockForeignLogs = 0;
+    static int sOtherForeignLogs = 0;
+    if (dockCtx) {
+        if (sDockForeignLogs >= 20) return;
+        sDockForeignLogs++;
+    } else {
+        if (!sDebugLog || sOtherForeignLogs >= 5) return;
+        sOtherForeignLogs++;
+    }
+    @try {
+        UIView *owner    = objc_getAssociatedObject(foreign, &kMKLabelIconKey);
+        NSString *ivBid  = objc_getAssociatedObject(iv, &kMKBidKey);
+        NSString *ownBid = (owner ? objc_getAssociatedObject(owner, &kMKBidKey) : nil);
+        NSString *lblBid = objc_getAssociatedObject(foreign, &kMKLabelBidKey);
+        CGRect f = foreign.frame;
+        RDLog(@"DOCK-FOREIGN[%d]: acted=%d dockCtx=%d ivBid=%@ lblCls=%s lblBid=%@ owner=%p ownerBid=%@ h=%d a=%.2f frame={%.1f,%.1f,%.1f,%.1f} ivSup=%s",
+              (dockCtx ? sDockForeignLogs : sOtherForeignLogs), (int)acted, (int)dockCtx,
+              ivBid ?: @"?", class_getName([foreign class]), lblBid ?: @"?",
+              (void *)owner, ownBid ?: @"?",
+              (int)foreign.hidden, (float)foreign.alpha,
+              (float)f.origin.x, (float)f.origin.y, (float)f.size.width, (float)f.size.height,
+              iv.superview ? class_getName([iv.superview class]) : "nil");
+    } @catch (NSException *e) {}
+}
+
 static BOOL MKDockStrayHide(SBIconView *iv, BOOL *outStray) {
     if (outStray) *outStray = NO;
     if (!iv) return NO;
     BOOL dockCtx = MKLabelInDock((UIView *)iv);   // 零分配: class_getName + strstr
-    UIView *lbl = MKGetCachedLabel(iv);
-    if (!lbl) return dockCtx;
+    UIView *foreign = nil;
+    UIView *lbl = MKGetCachedLabelEx(iv, &foreign);
+    if (!lbl) {
+        // v2.0.66.47 【闭合 8 版失败的机械缺口】原实现此处为 `if (!lbl) return dockCtx;` —— 零埋点静默退出。
+        // 而 lbl==nil 的主因恰恰是 owner 校验失败 = 串名本身, 于是三层 dock 防线在真正案发的那一刻集体失效。
+        //
+        // default-deny 处置, 但严格【容器约束】(dockCtx 成立才动手), 绝不用物理纵带:
+        //   · dock 原生不显示任何名称 → dock 容器内出现【任何可见 name label】= 100% 非法, 判定无误伤空间;
+        //   · 失败模式退化为「dock 名字不显示」, 而 dock 本来就没名字 → 用户零感知;
+        //   · 反之若按纵带(MKLabelPhysicallyInDock 只比 midY 不比 X)放开, 会波及主屏底行/文件夹/
+        //     Spotlight, 误伤代价是「名字凭空消失」, 比串名更刺眼 —— 故此处坚决不用。
+        BOOL acted = NO;
+        if (dockCtx && foreign && !foreign.hidden && foreign.alpha > 0.01f) {
+            // v2.0.65 配方(必须成对): 【清两枚过期键 + 藏】。
+            // 只藏不清键 → 下一帧 owner 仍不符 → 再次进入本分支 → 每帧重入、永不收敛, 反而不如 v2.0.65;
+            // 清键后 owner 回落为 nil, 下帧由 MKGetCachedLabelEx 正常绑定给真实属主并自动解钉(对称 restore)。
+            objc_setAssociatedObject(foreign, &kMKLabelIconKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(foreign, &kMKLabelBidKey,  nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            foreign.hidden = YES;
+            foreign.alpha  = 0.0f;
+            foreign.layer.opacity = 0.0f;
+            foreign.opaque = NO;
+            [foreign.layer removeAllAnimations];
+            // 钉标记: 防「该 label 的合法属主(另一个活着的 iconView)在本帧内把它复显」造成互搏闪烁
+            // —— 闪烁比静态串名更难看。解钉在 MKGetCachedLabelEx 的两条合法返回路径(缓存命中 / 重新绑定)
+            // 双路闭合, 该 label 一回到合法属主名下即自动解钉, 名字不会永久消失。
+            objc_setAssociatedObject(foreign, &kMKDockPinnedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            acted = YES;
+            if (outStray) *outStray = YES;
+        }
+        if (foreign) MKDockForeignProbe(iv, foreign, dockCtx, acted);
+        return dockCtx;
+    }
     BOOL hit = dockCtx;
     if (!hit) {
         if (lbl.hidden || lbl.alpha <= 0.01f) return NO;   // 已不可见 → 无需判定(最常见早退路径)
@@ -2327,7 +2432,12 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
             }
         }
         NSString *useBid = nil; BOOL mapOnly = NO;
-        if ((useBid = MKShouldHideLabel((UIView *)self, bid, &mapOnly))) {   // v2.0.9 的「关闭动画窗口内让步原生」已在 v2.0.12 撤销：关合窗口内文件夹内 label 也强制藏名(不让步原生)，根治 sub-16ms settle 单帧闪现(第④点残留真凶)。证据 rd_log(63): FOLDER-CLOSE-VISIBLE=0 表明无 strobe 互搏，去掉安全。
+        if (objc_getAssociatedObject((UIView *)self, &kMKDockPinnedKey)) {
+            // v2.0.66.47: dock 钉藏防拉锯 —— 本 label 刚被 MKDockStrayHide 在 dock 容器内钉藏，
+            // 其(可能存在的)合法属主若在同帧走自己的路径把它复显，会与我们互搏成闪烁(比静态串名更难看)。
+            // 该钉标记生命周期极短: 下一帧 MKGetCachedLabelEx 一旦为它绑定合法属主即自动解除，绝不永久生效。
+            hidden = YES;
+        } else if ((useBid = MKShouldHideLabel((UIView *)self, bid, &mapOnly))) {   // v2.0.9 的「关闭动画窗口内让步原生」已在 v2.0.12 撤销：关合窗口内文件夹内 label 也强制藏名(不让步原生)，根治 sub-16ms settle 单帧闪现(第④点残留真凶)。证据 rd_log(63): FOLDER-CLOSE-VISIBLE=0 表明无 strobe 互搏，去掉安全。
             hidden = YES; // 有指示器 -> 名字必须隐藏，压制系统任何复显
             // v1.6.99: MKShouldHideLabel 已写回直接关联键 + 掐动画(标记自持，根除关文件夹缩回/主屏重叠闪现，详见 helper 注释)
             if (sDebugLog && mapOnly)
@@ -2372,7 +2482,10 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
             }
         }
         NSString *useBid = nil; BOOL mapOnly = NO;
-        if ((useBid = MKShouldHideLabel((UIView *)self, bid, &mapOnly))) {   // v2.0.12: 撤销 v2.0.9 关合窗口内让步原生(label 在文件夹内也强制藏名), 根治 sub-16ms settle 单帧闪现。详见 MKSetHiddenHook 同款注释。
+        if (objc_getAssociatedObject((UIView *)self, &kMKDockPinnedKey)) {
+            // v2.0.66.47: dock 钉藏防拉锯 —— 详见 MKSetHiddenHook 同款注释。
+            a = 0.0f;
+        } else if ((useBid = MKShouldHideLabel((UIView *)self, bid, &mapOnly))) {   // v2.0.12: 撤销 v2.0.9 关合窗口内让步原生(label 在文件夹内也强制藏名), 根治 sub-16ms settle 单帧闪现。详见 MKSetHiddenHook 同款注释。
             CGFloat inA = a; // v2.0.41: 留存传入值(下面会覆写)供 REVEAL-ATTEMPT 判据
             a = 0.0f; // 同上，压制 alpha 复显
             // v1.6.99: MKShouldHideLabel 已写回直接关联键 + 掐动画(标记自持，根除关文件夹缩回/主屏重叠闪现，详见 helper 注释)
@@ -4801,7 +4914,7 @@ static void MKRefreshFolderIcons(void) {
 
     // v2.0.66.39: 启动日志彻底精简 —— 单行版本戳也收进 sDebugLog(诊断关时彻底零输出, 仅 @catch 异常仍可见); 多行改动清单同收进 sDebugLog。
     if (sDebugLog) {
-        RDLog(@"======== RunningDotIndicator v2.0.66.46 loaded ========");
+        RDLog(@"======== RunningDotIndicator v2.0.66.47 loaded ========");
         RDLog(@"======== RDBUILD v2.0.66.38: 物理位置判定补刀(MKLabelPhysicallyInDock)治「主屏 label 漂到 dock 位置显示(祖先链仍主屏)」的串名(前版 fctx 仅靠类名祖先链覆盖不到); + 收进 sDebugLog(生产安静); 行为零变化 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.30: NEG-SETTEXT 最终捕获版(彻底无门控) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.31: DOCK-RANDOM-FIX 根治 dock 随机串名 + 移除 1s 扫描定时器 ========");
@@ -4814,6 +4927,7 @@ static void MKRefreshFolderIcons(void) {
         RDLog(@"======== RDBUILD-NOTE v2.0.66.41: IconColor 主色解析日志收进 sDebugLog 门控(诊断关时 rd_log.txt 不再漏记新 App 取色行) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.44: MKBuildPathCache/MKSyncFromSBAppCtrl/MKDelayedInit 共 10 处启动日志收进 sDebugLog 门控(诊断关时 rd_log.txt 彻底零输出, 仅 @catch 异常仍可见); 启动版本戳更新为 v2.0.66.44; 行为零变化 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.46: dock 串名【结构性缺口】修复 —— v2.0.66.31 的 layoutSubviews 每帧藏名(历史上「一出现就藏」的真身)只认祖先链 MKLabelInDock, 仅覆盖形态A(主屏 iconView 被回收去渲染 dock 槽、确在 dock 子树内); 对形态B(label 仅【物理位置】漂到 dock 纵带、视图层级仍挂主屏)整段跳过 —— 这才是 .38~.45 一路补丁仍复发的真因(父容器移动不调 label 任何 setter, 故 .38/.42 的 setter 钩子同样抓不到)。本版新增 MKDockStrayHide(祖先链 OR 物理位置 二合一), 接入两处: layoutSubviews 每帧即时拦截(找回一出现就藏) + MKRefreshAllIcons 的 BFS 内联兜底(置于 MKUpdate 之后, 零额外遍历)。同时整体删除 v2.0.66.45 的 MKDockBandSweep(47 行独立全树扫描; 其 iconView midY 前置筛选恰好把形态B筛掉 = 实为无效防线)及其 0.5s 延迟调用; 解锁静止期兜底改为 t=1.3s 复用全量刷新。净效果: 覆盖面变宽, 事件时机少一趟全树 BFS 与一次 dock 帧树查找, 待机功耗仍为零 ========");
+        RDLog(@"======== RDBUILD-NOTE v2.0.66.47: dock 串名【8 版失败的机械缺口】闭合 + 案发瞬间装眼睛。真因: MKDockStrayHide 首行 UIView *lbl = MKGetCachedLabel(iv); if (!lbl) return dockCtx; 为零埋点静默退出, 而 MKGetCachedLabel 返回 nil 的主因正是 owner != 当前 iconView —— 这【就是串名的定义本身】。于是形成逆向门控: 不串名则取得到 label、三层 dock 防线(.31 祖先链 / .38 物理坐标 / .46 二合一)正常跑; 一旦真串名则 label 被丢弃、三层防线【同时静默失效】, 且日志一片空白 = 案发瞬间物理上不可观测。逐版本核查证实本函数内 label = nil 恒为 2 处(.31/.37/.38/.40/.43/.45/.46 全部 =2), 缺口自 .31 出生第一天即存在, 八版一直在扩大【什么算 dock】, 从没人碰过【拿不到 label 就返回】这一条。本版两项改动: (1) 新增 MKGetCachedLabelEx(iv, outForeign) 把被丢弃的案发 label 带出来, 签名不变的 MKGetCachedLabel 降为薄包装, 既有 33 个调用点一行不动、行为完全等价; (2) !lbl 分支改 default-deny —— 严格【容器约束】(仅 dockCtx 成立才动手, 绝不用只比 midY 不比 X 的物理纵带, 以免波及主屏底行/文件夹/Spotlight), 命中即按 v2.0.65 配方【清 kMKLabelIconKey + kMKLabelBidKey 两枚过期键 + 藏】(只藏不清键会每帧重入永不收敛, 反不如 v2.0.65), 并打 kMKDockPinnedKey 防其合法属主同帧复显造成互搏闪烁; 解钉唯一落点在 MKGetCachedLabelEx 的合法绑定分支(对称 restore, 名字绝不永久消失)。另新增 DOCK-FOREIGN 埋点, 刻意【不挂 sDebugLog 门控】(串名随机复现、单次验证周期以小时计, 挂开关等于继续抓不到), 仅异常态进入 + 硬限流 20 条。失败模式退化为 dock 名字不显示, 而 dock 本就无名称 = 用户零感知。不新增 hook、不碰 sDockFrame、不加第 13 处藏名逻辑; 正常帧仅多一次关联对象读, 功耗零变化。边界: 止血不治本, 文件夹缩略图闪现与负一屏(卡在 label 压根无 owner 键的 gate 1)本版一个字都治不了 ========");
     }
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
