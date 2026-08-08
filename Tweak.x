@@ -2251,7 +2251,7 @@ static void MKDockForeignProbe(SBIconView *iv, UIView *foreign, BOOL dockCtx, BO
         RDLog(@"DOCK-FOREIGN[%d]: acted=%d dockCtx=%d ivBid=%@ lblCls=%s lblBid=%@ owner=%p ownerBid=%@ h=%d a=%.2f frame={%.1f,%.1f,%.1f,%.1f} ivSup=%s",
               (dockCtx ? sDockForeignLogs : sOtherForeignLogs), (int)acted, (int)dockCtx,
               ivBid ?: @"?", class_getName([foreign class]), lblBid ?: @"?",
-              (void *)owner, ownBid ?: @"?",
+              (__bridge void *)owner, ownBid ?: @"?",
               (int)foreign.hidden, (float)foreign.alpha,
               (float)f.origin.x, (float)f.origin.y, (float)f.size.width, (float)f.size.height,
               iv.superview ? class_getName([iv.superview class]) : "nil");
