@@ -4969,56 +4969,33 @@ static int sProbeHit = 0;  // v2.0.66.49 探针限流计数器（全局，所有
 %hook SBIconView
 - (void)_updateLabel {
     %orig;
-    // v2.0.66.50 探针：%orig 后抓 label 真实文本 + bid + LLV 方法列表，定位真正设名 setter（纯埋点，零行为变化）
-    // 设计：SELFCHECK 已证 SBIconLegibilityLabelView 的 setText/setString/setAttr 全不存在(=0)，
-    //       但 REVEAL-ATTEMPT cls=SBIconLegibilityLabelView 证该类实例确实存在 → 文本走非标准方法。
-    //       本探针在 _updateLabel(%orig 刷新 label 后)暴力试文本 getter + 枚举 LLV 方法，找出真正 setter。
+    // v2.0.66.51 探针：确认 _updateLabel 被调(无条件, 限流300) + 尽力抓 label 文本(扩候选访问器).
+    //         纯埋点零行为变化. 真正文本 setter 名由启动 PROBE-LLV-ALL 枚举给出, 本探针仅确认触发时机 + 文本流.
     static int sULProbe = 0;
-    if (sULProbe < 200) {
-        // 取 label（iOS16 属性名不一，多候选 respondsToSelector 探测，绝不硬编码导致编译错）
+    if (sULProbe < 300) {
+        sULProbe++;
+        RDLog(@"(PROBE2) _updateLabel cls=%@", NSStringFromClass([self class]));
+        // 尽力取 label（iOS16 访问器名不一，扩候选；取不到则跳过文本抓取，不影响上面 firing 确认）
         id label = nil;
-        for (NSString *p in @[@"label", @"iconLabel", @"_iconLabel", @"legibilityLabelView"]) {
+        for (NSString *p in @[@"label", @"iconLabel", @"_iconLabel", @"iconLabelView", @"_iconLabelView", @"legibilityLabelView", @"_legibilityLabelView"]) {
             SEL s = NSSelectorFromString(p);
             if ([self respondsToSelector:s]) { label = [self valueForKey:p]; if (label) break; }
         }
         if (!label) label = MKGetCachedLabel((SBIconView *)self);
-        NSString *labelCls = label ? NSStringFromClass([label class]) : @"none";
-        // 暴力试文本 getter（NSString / NSAttributedString 都收）
-        NSString *txt = nil;
-        for (NSString *p in @[@"text", @"string", @"attributedText", @"_text", @"title"]) {
-            SEL s = NSSelectorFromString(p);
-            if ([label respondsToSelector:s]) {
-                id t = [label valueForKey:p];
-                if ([t isKindOfClass:[NSString class]]) { txt = t; break; }
-                if ([t isKindOfClass:[NSAttributedString class]]) { txt = [t string]; break; }
+        if (label) {
+            NSString *labelCls = NSStringFromClass([label class]);
+            NSString *txt = nil;
+            for (NSString *p in @[@"text", @"string", @"attributedText", @"_text", @"title"]) {
+                SEL s = NSSelectorFromString(p);
+                if ([label respondsToSelector:s]) {
+                    id t = [label valueForKey:p];
+                    if ([t isKindOfClass:[NSString class]]) { txt = t; break; }
+                    if ([t isKindOfClass:[NSAttributedString class]]) { txt = [t string]; break; }
+                }
             }
-        }
-        // 取 bid（SBIconView.icon -> SBIcon.applicationBundleID；已证 applicationBundleID=1 存在）
-        NSString *bid = nil;
-        if ([self respondsToSelector:@selector(icon)]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            id icon = [self performSelector:@selector(icon)];
-#pragma clang diagnostic pop
-            if (icon && [icon respondsToSelector:@selector(applicationBundleID)]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                bid = [icon performSelector:@selector(applicationBundleID)];
-#pragma clang diagnostic pop
+            if (txt.length) {
+                RDLog(@"(PROBE2) _updateLabel txt=%@ cls=%@", txt, labelCls);
             }
-        }
-        // 仅记录「label 真有文本」的调用：省启动空 label 额度，把 200 条全留给顽疾触发(开/关文件夹)
-        if (txt.length) {
-            if (sULProbe == 0 && label) {
-                unsigned int mc = 0;
-                Method *ml = class_copyMethodList([label class], &mc);
-                NSMutableArray *mns = [NSMutableArray array];
-                for (unsigned i = 0; i < mc; i++) [mns addObject:NSStringFromSelector(method_getName(ml[i]))];
-                free(ml);
-                RDLog(@"(PROBE2) LLV-METHODS(%@): %@", labelCls, [mns componentsJoinedByString:@","]);
-            }
-            sULProbe++;
-            RDLog(@"(PROBE2) _updateLabel bid=%@ labelCls=%@ txt=%@", bid, labelCls, txt);
         }
     }
 }
@@ -5035,25 +5012,49 @@ static void MKProbeSelfCheck(void) {
         Class cIcon = NSClassFromString(@"SBIcon");
         Class cLLV  = NSClassFromString(@"SBIconLegibilityLabelView");
         Class cIV   = NSClassFromString(@"SBIconView");
-        RDLog(@"PROBE-SELFCHECK v2.0.66.49 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.51 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
               NSStringFromClass(cIcon),
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayName)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayNameForLocation:)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleID)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleIdentifier)] : 0);
-        RDLog(@"PROBE-SELFCHECK v2.0.66.49 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.51 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
               NSStringFromClass(cLLV),
               cLLV ? [cLLV instancesRespondToSelector:@selector(setText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setString:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setAttributedText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(_updateLabelImage)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(legibilityLabel)] : 0);
-        RDLog(@"PROBE-SELFCHECK v2.0.66.49 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.51 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
               NSStringFromClass(cIV),
               cIV ? [cIV instancesRespondToSelector:@selector(_updateLabel)] : 0,
               cIV ? [cIV instancesRespondToSelector:@selector(setIconLabelAlpha:)] : 0,
               cIV ? [cIV instancesRespondToSelector:@selector(label)] : 0,
               cIV ? [cIV instancesRespondToSelector:@selector(setLabel:)] : 0);
+        // v2.0.66.51: 枚举 SBIconLegibilityLabelView 全部方法——找真正承载文本 setter（SELFCHECK 已证 setText/setString/setAttr 全=0，文本必走非标准名）
+        if (cLLV) {
+            unsigned int mc = 0;
+            Method *ml = class_copyMethodList(cLLV, &mc);
+            NSMutableArray *llvM = [NSMutableArray array];
+            for (unsigned i = 0; i < mc; i++) [llvM addObject:NSStringFromSelector(method_getName(ml[i]))];
+            free(ml);
+            RDLog(@"PROBE-LLV-ALL(%@, %u methods): %@", NSStringFromClass(cLLV), mc, [llvM componentsJoinedByString:@","]);
+        }
+        // v2.0.66.51: 枚举 SBIconView 中含 label/egibil/legibility 的访问器——找真实 label 属性名（SELFCHECK 已证 label=0，必为其他名）
+        if (cIV) {
+            unsigned int mc = 0;
+            Method *ml = class_copyMethodList(cIV, &mc);
+            NSMutableArray *ivM = [NSMutableArray array];
+            for (unsigned i = 0; i < mc; i++) {
+                NSString *mn = NSStringFromSelector(method_getName(ml[i]));
+                NSString *low = [mn lowercaseString];
+                if ([low containsString:@"abel"] || [low containsString:@"egibil"] || [low containsString:@"legibility"]) {
+                    [ivM addObject:mn];
+                }
+            }
+            free(ml);
+            RDLog(@"PROBE-IV-LABEL-ACCESSORS(%@, %u methods): %@", NSStringFromClass(cIV), mc, [ivM componentsJoinedByString:@","]);
+        }
     });
 }
 
