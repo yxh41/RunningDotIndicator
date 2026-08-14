@@ -4969,34 +4969,38 @@ static int sProbeHit = 0;  // v2.0.66.49 探针限流计数器（全局，所有
 %hook SBIconView
 - (void)_updateLabel {
     %orig;
-    // v2.0.66.51 探针：确认 _updateLabel 被调(无条件, 限流300) + 尽力抓 label 文本(扩候选访问器).
-    //         纯埋点零行为变化. 真正文本 setter 名由启动 PROBE-LLV-ALL 枚举给出, 本探针仅确认触发时机 + 文本流.
-    static int sULProbe = 0;
-    if (sULProbe < 300) {
-        sULProbe++;
-        RDLog(@"(PROBE2) _updateLabel cls=%@", NSStringFromClass([self class]));
-        // 尽力取 label（iOS16 访问器名不一，扩候选；取不到则跳过文本抓取，不影响上面 firing 确认）
-        id label = nil;
-        for (NSString *p in @[@"label", @"iconLabel", @"_iconLabel", @"iconLabelView", @"_iconLabelView", @"legibilityLabelView", @"_legibilityLabelView"]) {
-            SEL s = NSSelectorFromString(p);
-            if ([self respondsToSelector:s]) { label = [self valueForKey:p]; if (label) break; }
+    // v2.0.66.52 根治：名字渲染入口（PROBE-LLV-ALL 实证 LLV 仅 11 方法无文本 setter，名字由 _updateLabel 构造 imageParameters 经 LLV 渲染成图）。
+    //   之前所有视图层 hook 失败的根因 = 从 label 反查 iconView（label↔iconView 关联链在回收/复用/一对多场景断 → 认不出归属 → 揭示真名）。
+    //   此处 hook 在 SBIconView 自身方法内，self 即 iconView，归属 100% 确定，关联链断不断都无关（含文件夹缩略图/负一屏一对多渲染）。
+    //   真实 label 访问器 = labelView（PROBE-IV-LABEL-ACCESSORS 实证；SELFCHECK label=0 非 label）。dock 图标无 labelView（判空跳过，不影响）。
+    static int s52Hit = 0;
+    id icon = nil;
+    if ([self respondsToSelector:@selector(icon)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        icon = [self performSelector:@selector(icon)];
+#pragma clang diagnostic pop
+    }
+    NSString *bid = nil;
+    if (icon && [icon respondsToSelector:@selector(applicationBundleID)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        bid = [icon performSelector:@selector(applicationBundleID)];
+#pragma clang diagnostic pop
+    }
+    if (bid && sHiddenBids && [sHiddenBids containsObject:bid]) {
+        id lv = nil;
+        if ([self respondsToSelector:@selector(labelView)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            lv = [self performSelector:@selector(labelView)];
+#pragma clang diagnostic pop
         }
-        if (!label) label = MKGetCachedLabel((SBIconView *)self);
-        if (label) {
-            NSString *labelCls = NSStringFromClass([label class]);
-            NSString *txt = nil;
-            for (NSString *p in @[@"text", @"string", @"attributedText", @"_text", @"title"]) {
-                SEL s = NSSelectorFromString(p);
-                if ([label respondsToSelector:s]) {
-                    id t = [label valueForKey:p];
-                    if ([t isKindOfClass:[NSString class]]) { txt = t; break; }
-                    if ([t isKindOfClass:[NSAttributedString class]]) { txt = [t string]; break; }
-                }
-            }
-            if (txt.length) {
-                RDLog(@"(PROBE2) _updateLabel txt=%@ cls=%@", txt, labelCls);
-            }
-        }
+        if (lv) {
+            [lv setHidden:YES];
+            if ([lv respondsToSelector:@selector(setAlpha:)]) [lv setAlpha:0.0f];
+            if (s52Hit < 40) { s52Hit++; RDLog(@"MK52-HIDE bid=%@ labelView=%@", bid, NSStringFromClass([lv class])); }
+        } else if (s52Hit < 40) { s52Hit++; RDLog(@"MK52-NO-LABELVIEW bid=%@", bid); }
     }
 }
 - (void)setIconLabelAlpha:(CGFloat)a {
@@ -5012,20 +5016,20 @@ static void MKProbeSelfCheck(void) {
         Class cIcon = NSClassFromString(@"SBIcon");
         Class cLLV  = NSClassFromString(@"SBIconLegibilityLabelView");
         Class cIV   = NSClassFromString(@"SBIconView");
-        RDLog(@"PROBE-SELFCHECK v2.0.66.51 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.52 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
               NSStringFromClass(cIcon),
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayName)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayNameForLocation:)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleID)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleIdentifier)] : 0);
-        RDLog(@"PROBE-SELFCHECK v2.0.66.51 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.52 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
               NSStringFromClass(cLLV),
               cLLV ? [cLLV instancesRespondToSelector:@selector(setText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setString:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setAttributedText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(_updateLabelImage)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(legibilityLabel)] : 0);
-        RDLog(@"PROBE-SELFCHECK v2.0.66.51 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.52 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
               NSStringFromClass(cIV),
               cIV ? [cIV instancesRespondToSelector:@selector(_updateLabel)] : 0,
               cIV ? [cIV instancesRespondToSelector:@selector(setIconLabelAlpha:)] : 0,
