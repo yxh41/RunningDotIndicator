@@ -5107,7 +5107,46 @@ static int sProbeHit = 0;  // v2.0.66.49 探针限流计数器（全局，所有
     if (sProbeHit < 120) { sProbeHit++; RDLog(@"(PROBE) LLV.setAttr cls=%@ text=%@", NSStringFromClass([self class]), t); }
     %orig;
 }
-// v2.0.66.56: 标签自身层面根治「创建/揭示时机错位」漏藏(rd_log(27) 实证)。
+// v2.0.66.57: 真正的「标签自身层面」根治入口(didMoveToWindow)。
+//   rd_log(29) 实锤: .55/.56 的 setIconView:/setAlpha: 钩子 MK55-LABELBIND=0/MK55-ALPHACATCH=0 —— iOS 经 ivar 绑定 iconView, 不调 setter, 故那两钩子从不触发。
+//   漏藏窗口根因: 文件夹打开(decar 未运行)→ 稍后 decar 进 running(20:11:11)→ 浮窗 label 此刻尚未创建 → 揭示 setter(setIconLabelAlpha a=1)在 20:11:12 被调但 lbl=nil 藏不掉 → label 20:11:17 创建带名 → 20:11:18 才被 _updateLabel 藏(约1s可见)。
+//   修法: 钩 didMoveToWindow(UIKit 生命周期, 标签加入窗口必调, 与 iconView 如何绑定无关)。标签进窗口瞬间按 self.iconView.icon.applicationBundleID 判 sRunningSet 立即钉藏, 覆盖「label 晚于运行态创建」时机错位(文件夹缩略图/负一屏/主屏统一)。
+//   配套诊断: MK55-ENTER-IV / MK55-ENTER-ALPHA 无条件限流探针, 坐实 setIconView:/setAlpha: 是否真被调(不再猜方法名)。
+- (void)didMoveToWindow {
+    %orig;
+    @try {
+        if (!sInitDone) return;
+        id iv = nil;
+        if ([self respondsToSelector:@selector(iconView)]) {
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            iv = [self performSelector:@selector(iconView)];
+            #pragma clang diagnostic pop
+        }
+        NSString *bid = nil;
+        if (iv && [iv respondsToSelector:@selector(icon)]) {
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            id mkIcon = [iv performSelector:@selector(icon)];
+            #pragma clang diagnostic pop
+            if (mkIcon && [mkIcon respondsToSelector:@selector(applicationBundleID)])
+                bid = [mkIcon applicationBundleID];
+        }
+        BOOL running = (bid && sRunningSet && [sRunningSet containsObject:bid]);
+        static int s57Win = 0;
+        if (s57Win < 40) { s57Win++; RDLog(@"MK57-WINDOW-ENTER bid=%@ run=%d cls=%@", bid ? bid : @"?", (int)running, NSStringFromClass([self class])); }
+        if (running) {
+            [(UIView *)self setHidden:YES];
+            [(UIView *)self setAlpha:0.0f];
+            static int s57WinHide = 0;
+            if (s57WinHide < 40) { s57WinHide++; RDLog(@"MK57-WINDOW-HIDE bid=%@", bid); }
+        } else {
+            // 非运行 app: 清掉可能遗留的 hidden, 避免 stale 隐藏(非运行名字本应可见)。
+            if ([(UIView *)self isHidden]) [(UIView *)self setHidden:NO];
+        }
+    } @catch (NSException *e) {}
+}
+// v2.0.66.57: 标签自身层面根治「创建/揭示时机错位」漏藏(rd_log(27) 实证)。
 //   根因: 文件夹浮窗 iconView 的 labelView 在 app 进 running(19:34:38)后、文件夹打开后才懒创建(19:34:43),
 //   此前 SBIconView.setIconLabelAlpha(1) 被调(self 即图标View, lbl=nil)hook 认出 run=1 但无 label 可藏 -> 名字可见 4s+。
 //   .54 主动推送(MKHideLabelForRunningBid)在 19:34:38 跑时文件夹 iconView 仍 windowless, 遍历 windows 找不到 -> MK54-PUSH=0。
@@ -5116,6 +5155,8 @@ static int sProbeHit = 0;  // v2.0.66.49 探针限流计数器（全局，所有
 //   覆盖主屏/文件夹/dock/负一屏所有位置, 且不受「label 晚于运行态创建」时机错位影响。setAlpha: 兜底抓任何经 label 的揭示(alpha>0 时重判)。
 - (void)setIconView:(id)iv {
     %orig;
+    static int s55EnterIV = 0;
+    if (s55EnterIV < 60) { s55EnterIV++; RDLog(@"MK55-ENTER-IV cls=%@ ivCls=%@", NSStringFromClass([self class]), NSStringFromClass([iv class])); }
     @try {
         if (!sInitDone || !iv) return;
         id icon = nil;
@@ -5145,6 +5186,8 @@ static int sProbeHit = 0;  // v2.0.66.49 探针限流计数器（全局，所有
     } @catch (NSException *e) {}
 }
 - (void)setAlpha:(CGFloat)a {
+    static int s55EnterA = 0;
+    if (s55EnterA < 60) { s55EnterA++; RDLog(@"MK55-ENTER-ALPHA a=%.2f cls=%@", a, NSStringFromClass([self class])); }
     if (a > 0.0f && sInitDone) {
         id iv = nil;
         if ([self respondsToSelector:@selector(iconView)]) {
@@ -5233,20 +5276,20 @@ static void MKProbeSelfCheck(void) {
         Class cIcon = NSClassFromString(@"SBIcon");
         Class cLLV  = NSClassFromString(@"SBIconLegibilityLabelView");
         Class cIV   = NSClassFromString(@"SBIconView");
-        RDLog(@"PROBE-SELFCHECK v2.0.66.56 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.57 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
               NSStringFromClass(cIcon),
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayName)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayNameForLocation:)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleID)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleIdentifier)] : 0);
-        RDLog(@"PROBE-SELFCHECK v2.0.66.56 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.57 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
               NSStringFromClass(cLLV),
               cLLV ? [cLLV instancesRespondToSelector:@selector(setText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setString:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setAttributedText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(_updateLabelImage)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(legibilityLabel)] : 0);
-        RDLog(@"PROBE-SELFCHECK v2.0.66.56 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.57 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
               NSStringFromClass(cIV),
               cIV ? [cIV instancesRespondToSelector:@selector(_updateLabel)] : 0,
               cIV ? [cIV instancesRespondToSelector:@selector(setIconLabelAlpha:)] : 0,
