@@ -4860,13 +4860,16 @@ static void MKApplyAppState(NSString *bid, BOOL runningNow, BOOL foreground) {
 // 系统每次重查名字都拿到空格 → 回收/漂移/多处渲染/CAAnimation 全部自动一致，
 // 归属问题从定义上消失（若成，三 bug 同除，.47 视图层兜底层可后续退役）。
 //
-// 作用域：仅主屏(HomeScreen)与 Dock 藏名。搜索(Spotlight)/App Library/多任务卡(Switcher)
-// 等绝不动（否则全局名字被污染成空格）。文件夹图标(SBFolderIcon)无 applicationBundleIdentifier
-// → 自动不命中 → 文件夹名保持正常。
+// 作用域：按 bid 判定，不按 location 数字。运行中 app（bid∈sHiddenBids）在「任何」位置
+// （主屏/Dock/文件夹内）名字都返回单空格。SBFolderIcon 等无 applicationBundleIdentifier
+// → bid=nil → 自动 %orig → 文件夹标题保持正常；搜索/App Library/多任务卡里仅运行中 app
+// 名字变空格，与插件本意一致，不污染全局名字。
+//
+// 为何放弃 location 数字守卫：SBIconLocationFolder 等枚举值无法在无头文件环境可靠坐实
+// （limneos 被 Cloudflare 挡，旧枚举不可信）；rd_log 实证文件夹内图标用 SBIconLocationFolder，
+// 原 0/1 守卫会把它放过→%orig→闪现仍在。bid 判定天然覆盖文件夹内图标且避开文件夹标题。
 //
 // SBIconLocation：iOS 11+ 为 NS_ENUM(NSInteger)，arm64 下 64 位，与 long long 等宽 → ABI 安全。
-// 枚举值假设 HomeScreen=0, Dock=1（iOS 11+ 从 0 连续）。若实际值不同，仅 Dock/主屏漏藏
-// （无回归，.47 视图层兜底），启动自检 + debug 日志会暴露真实值，下版固化。
 // 注意：此 hook 为数据源层首试（全历史 displayNameForLocation: -S 0 命中，落点全新）。
 // ====================================================================
 
@@ -4890,14 +4893,17 @@ static void MKApplyAppState(NSString *bid, BOOL runningNow, BOOL foreground) {
     }
 
     if (bid && sHiddenBids && [sHiddenBids containsObject:bid]) {
-        // 仅主屏(0)/Dock(1) 藏名；其余 location（文件夹内/搜索/AppLibrary/多任务卡）保持原名
-        if (location == 0 || location == 1) {
-            if (sDebugLog) {
-                static int sDNFLogs = 0;
-                if (sDNFLogs < 30) { sDNFLogs++; RDLog(@"MK48-DNF bid=%@ loc=%lld ->SPACE", bid, location); }
-            }
-            return @" ";   // 单空格：宽度≠0 防布局塌陷；避免空串导致系统 label 缓存异常
+        // 数据源层藏名：运行中 app 在「任何」位置（主屏/Dock/文件夹内）名字都返回单空格。
+        // 不再按 location 数字判定作用域——SBIconLocationFolder 等枚举值无法在无头文件环境可靠
+        // 坐实，且硬编码 0/1 会漏藏文件夹内图标（rd_log 实证：FOLDER-FLOATY 内图标
+        // location=SBIconLocationFolder，被原 0/1 守卫放过 -> %orig -> 闪现仍在）。
+        // 改为仅按 bid∈sHiddenBids：SBFolderIcon 无 app bid -> 自动 %orig（不污染文件夹标题）；
+        // 搜索/AppLibrary/多任务卡里仅「运行中 app」名字变空格，与插件本意一致，无回归。
+        if (sDebugLog) {
+            static int sDNFLogs = 0;
+            if (sDNFLogs < 30) { sDNFLogs++; RDLog(@"MK48-DNF bid=%@ loc=%lld ->SPACE", bid, location); }
         }
+        return @" ";   // 单空格：宽度≠0 防布局塌陷；避免空串导致系统 label 缓存异常
     }
     return %orig;
 }
