@@ -2511,6 +2511,27 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
                 }
             }
         }
+        if (!bid.length) {
+            // v2.0.66.60: 关文件夹回收/重父亲态兜底 —— 上一段 [self iconView] 在缩略图 label 被重父瞬间返回 nil,
+            // 但 label 自身仍持 kMKLabelIconKey 图标关联(FOLDER-CLOSE-MISS(A) 实锤 iconPtr=Y)。从该关联取
+            // icon.applicationBundleID 作最终兜底, 仅当关联经反向校验(图标仍认本 label, 防回收复用残留)且确在运行态才采信,
+            // 不误伤非运行 app 名、不杀主屏/文件夹正常名。
+            UIView *ivForLbl = objc_getAssociatedObject((UIView *)self, &kMKLabelIconKey);
+            if (ivForLbl && (UIView *)objc_getAssociatedObject(ivForLbl, &kMKLabelKey) == (UIView *)self) {
+                if ([ivForLbl respondsToSelector:@selector(icon)]) {
+                    #pragma clang diagnostic push
+                    #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                    id mkIcon2 = [ivForLbl performSelector:@selector(icon)];
+                    #pragma clang diagnostic pop
+                    if (mkIcon2 && [mkIcon2 respondsToSelector:@selector(applicationBundleID)]) {
+                        #pragma clang diagnostic push
+                        #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                        bid = [mkIcon2 applicationBundleID];
+                        #pragma clang diagnostic pop
+                    }
+                }
+            }
+        }
         BOOL mkRunningHide = (bid.length && MKIsAppRunning(bid));
         // v2.0.3: 关文件夹窗口内有界定向诊断（setAlpha: 复显路径）
         if (sProbeLog && sFolderClosing && a > 0.0f && sFolderCloseDiag < 8) {
@@ -5362,20 +5383,20 @@ static void MKProbeSelfCheck(void) {
         Class cIcon = NSClassFromString(@"SBIcon");
         Class cLLV  = NSClassFromString(@"SBIconLegibilityLabelView");
         Class cIV   = NSClassFromString(@"SBIconView");
-        RDLog(@"PROBE-SELFCHECK v2.0.66.59 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.60 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
               NSStringFromClass(cIcon),
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayName)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayNameForLocation:)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleID)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleIdentifier)] : 0);
-        RDLog(@"PROBE-SELFCHECK v2.0.66.59 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.60 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
               NSStringFromClass(cLLV),
               cLLV ? [cLLV instancesRespondToSelector:@selector(setText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setString:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setAttributedText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(_updateLabelImage)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(legibilityLabel)] : 0);
-        RDLog(@"PROBE-SELFCHECK v2.0.66.59 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.60 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
               NSStringFromClass(cIV),
               cIV ? [cIV instancesRespondToSelector:@selector(_updateLabel)] : 0,
               cIV ? [cIV instancesRespondToSelector:@selector(setIconLabelAlpha:)] : 0,
