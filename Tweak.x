@@ -4852,6 +4852,59 @@ static void MKApplyAppState(NSString *bid, BOOL runningNow, BOOL foreground) {
 %end
 
 // ====================================================================
+// v2.0.66.48 — 数据源层藏名（displayNameForLocation:）
+// 背景：以往所有藏名都在「视图属性层」（12 处 hidden/alpha hook）。视图回收复用 /
+// 一对多渲染 / CAAnimation 走 render server 三条路径会绕过全部视图 hook → 关联链断裂
+// → 名字串到别的 app（dock 串名 / 文件夹缩略图闪现 / 负一屏随机名三顽疾）。
+// 数据源层 hook displayNameForLocation: 直接改「名字内容」：运行中 app 返回单空格 @" "，
+// 系统每次重查名字都拿到空格 → 回收/漂移/多处渲染/CAAnimation 全部自动一致，
+// 归属问题从定义上消失（若成，三 bug 同除，.47 视图层兜底层可后续退役）。
+//
+// 作用域：仅主屏(HomeScreen)与 Dock 藏名。搜索(Spotlight)/App Library/多任务卡(Switcher)
+// 等绝不动（否则全局名字被污染成空格）。文件夹图标(SBFolderIcon)无 applicationBundleIdentifier
+// → 自动不命中 → 文件夹名保持正常。
+//
+// SBIconLocation：iOS 11+ 为 NS_ENUM(NSInteger)，arm64 下 64 位，与 long long 等宽 → ABI 安全。
+// 枚举值假设 HomeScreen=0, Dock=1（iOS 11+ 从 0 连续）。若实际值不同，仅 Dock/主屏漏藏
+// （无回归，.47 视图层兜底），启动自检 + debug 日志会暴露真实值，下版固化。
+// 注意：此 hook 为数据源层首试（全历史 displayNameForLocation: -S 0 命中，落点全新）。
+// ====================================================================
+
+%hook SBIcon
+
+- (NSString *)displayNameForLocation:(long long)location {
+    // 启动自检（无门控，1 次）：确认本 hook 已挂载、方法真实存在
+    static dispatch_once_t sDNFCheck;
+    dispatch_once(&sDNFCheck, ^{
+        BOOL present = [self respondsToSelector:@selector(displayNameForLocation:)];
+        RDLog(@"MK48-SELFCHECK displayNameForLocation: present=%d (hook mounted)", present);
+    });
+
+    // 取 bid：SBApplicationIcon 有 applicationBundleIdentifier；SBFolderIcon 等无此法 → nil
+    NSString *bid = nil;
+    if ([self respondsToSelector:@selector(applicationBundleIdentifier)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        bid = [self performSelector:@selector(applicationBundleIdentifier)];
+#pragma clang diagnostic pop
+    }
+
+    if (bid && sHiddenBids && [sHiddenBids containsObject:bid]) {
+        // 仅主屏(0)/Dock(1) 藏名；其余 location（文件夹内/搜索/AppLibrary/多任务卡）保持原名
+        if (location == 0 || location == 1) {
+            if (sDebugLog) {
+                static int sDNFLogs = 0;
+                if (sDNFLogs < 30) { sDNFLogs++; RDLog(@"MK48-DNF bid=%@ loc=%lld ->SPACE", bid, location); }
+            }
+            return @" ";   // 单空格：宽度≠0 防布局塌陷；避免空串导致系统 label 缓存异常
+        }
+    }
+    return %orig;
+}
+
+%end
+
+// ====================================================================
 // 构造函数（只做最轻量工作）
 // ====================================================================
 
@@ -4914,7 +4967,7 @@ static void MKRefreshFolderIcons(void) {
 
     // v2.0.66.39: 启动日志彻底精简 —— 单行版本戳也收进 sDebugLog(诊断关时彻底零输出, 仅 @catch 异常仍可见); 多行改动清单同收进 sDebugLog。
     if (sDebugLog) {
-        RDLog(@"======== RunningDotIndicator v2.0.66.47 loaded ========");
+        RDLog(@"======== RunningDotIndicator v2.0.66.48 loaded ========");
         RDLog(@"======== RDBUILD v2.0.66.38: 物理位置判定补刀(MKLabelPhysicallyInDock)治「主屏 label 漂到 dock 位置显示(祖先链仍主屏)」的串名(前版 fctx 仅靠类名祖先链覆盖不到); + 收进 sDebugLog(生产安静); 行为零变化 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.30: NEG-SETTEXT 最终捕获版(彻底无门控) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.31: DOCK-RANDOM-FIX 根治 dock 随机串名 + 移除 1s 扫描定时器 ========");
