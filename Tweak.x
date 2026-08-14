@@ -112,6 +112,10 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 - (NSString *)applicationBundleID;
 @end
 
+// v2.0.66.49 探针：SBIconLegibilityLabelView 真实名字 label 类（编译期前向声明，运行期由 logos 按真实类 hook）
+@interface SBIconLegibilityLabelView : NSObject
+@end
+
 @interface SBApplication : NSObject
 @property (nonatomic, readonly) NSString *bundleIdentifier;
 @end
@@ -4936,7 +4940,7 @@ static int sProbeHit = 0;  // v2.0.66.49 探针限流计数器（全局，所有
 
 %end
 
-// ============ 探针段 v2.0.66.49（诊断：定位真正承载图标名字文本的方法）============
+// 探针段 v2.0.66.49（诊断：定位真正承载图标名字文本的方法）
 // 设计原则（零崩溃风险）：
 //   • 所有探针方法用宽松参数类型（id），仅 RDLog + %orig，绝不 return 修改值。
 //   • logos %hook 一个「不存在于该类」的方法 = 仅给该类新增一个「系统不会调用」的
@@ -4980,21 +4984,21 @@ static void MKProbeSelfCheck(void) {
         Class cIcon = NSClassFromString(@"SBIcon");
         Class cLLV  = NSClassFromString(@"SBIconLegibilityLabelView");
         Class cIV   = NSClassFromString(@"SBIconView");
-        RDLog(@"PROBE-SELFCHECK SBIcon=%p displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
-              (void *)cIcon,
+        RDLog(@"PROBE-SELFCHECK SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
+              NSStringFromClass(cIcon),
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayName)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayNameForLocation:)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleID)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleIdentifier)] : 0);
-        RDLog(@"PROBE-SELFCHECK LLV=%p setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
-              (void *)cLLV,
+        RDLog(@"PROBE-SELFCHECK LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
+              NSStringFromClass(cLLV),
               cLLV ? [cLLV instancesRespondToSelector:@selector(setText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setString:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setAttributedText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(_updateLabelImage)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(legibilityLabel)] : 0);
-        RDLog(@"PROBE-SELFCHECK IV=%p _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
-              (void *)cIV,
+        RDLog(@"PROBE-SELFCHECK IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
+              NSStringFromClass(cIV),
               cIV ? [cIV instancesRespondToSelector:@selector(_updateLabel)] : 0,
               cIV ? [cIV instancesRespondToSelector:@selector(setIconLabelAlpha:)] : 0,
               cIV ? [cIV instancesRespondToSelector:@selector(label)] : 0,
