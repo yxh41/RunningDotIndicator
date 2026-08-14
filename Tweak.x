@@ -4984,20 +4984,20 @@ static void MKProbeSelfCheck(void) {
         Class cIcon = NSClassFromString(@"SBIcon");
         Class cLLV  = NSClassFromString(@"SBIconLegibilityLabelView");
         Class cIV   = NSClassFromString(@"SBIconView");
-        RDLog(@"PROBE-SELFCHECK SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.49 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
               NSStringFromClass(cIcon),
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayName)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayNameForLocation:)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleID)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleIdentifier)] : 0);
-        RDLog(@"PROBE-SELFCHECK LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.49 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
               NSStringFromClass(cLLV),
               cLLV ? [cLLV instancesRespondToSelector:@selector(setText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setString:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setAttributedText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(_updateLabelImage)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(legibilityLabel)] : 0);
-        RDLog(@"PROBE-SELFCHECK IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.49 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
               NSStringFromClass(cIV),
               cIV ? [cIV instancesRespondToSelector:@selector(_updateLabel)] : 0,
               cIV ? [cIV instancesRespondToSelector:@selector(setIconLabelAlpha:)] : 0,
