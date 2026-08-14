@@ -1526,6 +1526,7 @@ static void MKSafe(void (^block)(void)) {
 // 运行状态检测
 // ====================================================================
 
+static void MKHideLabelForRunningBid(NSString *bid);  // v2.0.66.54 forward decl (主动推送隐藏, 定义见 MKRefreshIconForBundleID 后)
 static void MKAddToRunningSet(NSString *bid) {
     if (!bid.length) return;
     if (MKIsBlacklisted(bid)) {
@@ -1540,6 +1541,11 @@ static void MKAddToRunningSet(NSString *bid) {
     BOOL wasNew = ![sRunningSet containsObject:bid];
     [sRunningSet addObject:bid];
     if (sDebugLog && wasNew) RDLog(@"+ RUNNING SET: %@", bid);
+    // v2.0.66.54: 主动推送隐藏 —— app 一进运行态立即遍历所有 iconView(含文件夹浮窗)把其 labelView 钉藏。
+    // 根治 .53 被动隐藏缺陷: .53 三 hook 都在 setter 被调用时才藏, 而 app 在「label 已 visible」态进 running 后,
+    // 稳定显示的 label 不再有 setter 调用 -> 漏藏(rd_log(25): decar 19:17:08 进 running, 文件夹内名字可见到 19:17:40 才被 _updateLabel 被动藏住)。
+    // 此处主动遍历覆盖「已 visible label 无后续 setter」窗口; label 未创建(windowless)的留待 _updateLabel(sRunningSet) 创建时藏。
+    dispatch_async(dispatch_get_main_queue(), ^{ MKHideLabelForRunningBid(bid); });
 }
 
 static void MKRemoveFromRunningSet(NSString *bid) {
@@ -2474,6 +2480,29 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
 static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
     @try {
         NSString *bid = MKLabelToBid((UIView *)self);
+        // v2.0.66.54: 运行态补刀 —— 防止 label 被主动隐藏(hidden=YES)后, iOS 经 setAlpha:>0 单独 re-show(.53 漏拦: setAlpha 路径判据仍是 sHiddenBids, 滞后到 Indicator CREATE 才加)。
+        // labelView 自身持 iconView 引用(PROBE-LLV-ALL 实证), 从 labelView.iconView.icon.applicationBundleID 兜底取 bid, 不依赖关联表。
+        if (!bid.length) {
+            if ([self respondsToSelector:@selector(iconView)]) {
+                #pragma clang diagnostic push
+                #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                id mkIV = [self performSelector:@selector(iconView)];
+                #pragma clang diagnostic pop
+                if (mkIV && [mkIV respondsToSelector:@selector(icon)]) {
+                    #pragma clang diagnostic push
+                    #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                    id mkIcon = [mkIV performSelector:@selector(icon)];
+                    #pragma clang diagnostic pop
+                    if (mkIcon && [mkIcon respondsToSelector:@selector(applicationBundleID)]) {
+                        #pragma clang diagnostic push
+                        #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                        bid = [mkIcon performSelector:@selector(applicationBundleID)];
+                        #pragma clang diagnostic pop
+                    }
+                }
+            }
+        }
+        BOOL mkRunningHide = (bid.length && MKIsAppRunning(bid));
         // v2.0.3: 关文件夹窗口内有界定向诊断（setAlpha: 复显路径）
         if (sProbeLog && sFolderClosing && a > 0.0f && sFolderCloseDiag < 8) {
             UIView *ivForLbl = objc_getAssociatedObject((UIView *)self, &kMKLabelIconKey);
@@ -2489,6 +2518,11 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
         if (objc_getAssociatedObject((UIView *)self, &kMKDockPinnedKey)) {
             // v2.0.66.47: dock 钉藏防拉锯 —— 详见 MKSetHiddenHook 同款注释。
             a = 0.0f;
+        } else if (mkRunningHide) {
+            // v2.0.66.54: 运行中 app 的 label 经 setAlpha:>0 复显时补刀钉藏(覆盖主动隐藏后 iOS 单独 re-show 的路径)
+            a = 0.0f;
+            [((UIView *)self).layer removeAllAnimations];
+            if (sDebugLog) { static int s54a = 0; if (s54a < 40) { s54a++; RDLog(@"MK54-ALPHA-HIDE bid=%@", bid); } }
         } else if ((useBid = MKShouldHideLabel((UIView *)self, bid, &mapOnly))) {   // v2.0.12: 撤销 v2.0.9 关合窗口内让步原生(label 在文件夹内也强制藏名), 根治 sub-16ms settle 单帧闪现。详见 MKSetHiddenHook 同款注释。
             CGFloat inA = a; // v2.0.41: 留存传入值(下面会覆写)供 REVEAL-ATTEMPT 判据
             a = 0.0f; // 同上，压制 alpha 复显
@@ -3732,6 +3766,62 @@ static void MKRefreshIconForBundleID(NSString *bid) {
             }
         }
         if (sDebugLog) RDLog(@"REFRESH bid=%@ via=walk matched=%d", bid, walked);
+    });
+}
+
+// v2.0.66.54: 主动推送隐藏 —— 遍历所有窗口的 iconView(含文件夹浮窗), 把匹配 bid 的 labelView 钉死隐藏。
+// 与 MKRefreshIconForBundleID 同款 BFS 遍历框架, 但只做「藏 label」一件事(不调 MKUpdate 刷新指示器), 避免副作用。
+// 覆盖「app 进 running 时 label 已 visible 但无后续 setter 调用」的漏藏窗口(rd_log(25) decar 实证: 19:17:08 进 running, 文件夹内名字可见到 19:17:40 才被动藏住)。
+// label 尚未创建(windowless, 如刚打开的文件夹内图标)的, 留待 _updateLabel(sRunningSet 判据) 创建时藏; 本函数藏已存在的。
+static void MKHideLabelForRunningBid(NSString *bid) {
+    MKSafe(^{
+        if (!sInitDone || !bid.length) return;
+        NSArray *windows = [UIApplication sharedApplication].windows;
+        int hidden = 0;
+        for (UIWindow *window in windows) {
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
+            while (stack.count > 0) {
+                UIView *current = [stack lastObject];
+                [stack removeLastObject];
+                if ([current isKindOfClass:MKSBIconViewClass()]) {
+                    SBIconView *iv = (SBIconView *)current;
+                    NSString *ivBid = MKGetCachedBid(iv);
+                    if (!ivBid.length) {
+                        if ([iv respondsToSelector:@selector(icon)]) {
+                            #pragma clang diagnostic push
+                            #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                            id ic = [iv performSelector:@selector(icon)];
+                            #pragma clang diagnostic pop
+                            if (ic && [ic respondsToSelector:@selector(applicationBundleID)]) {
+                                #pragma clang diagnostic push
+                                #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                                ivBid = [ic performSelector:@selector(applicationBundleID)];
+                                #pragma clang diagnostic pop
+                            }
+                        }
+                    }
+                    if (ivBid && [ivBid isEqualToString:bid]) {
+                        id lv = nil;
+                        if ([iv respondsToSelector:@selector(labelView)]) {
+                            #pragma clang diagnostic push
+                            #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                            lv = [iv performSelector:@selector(labelView)];
+                            #pragma clang diagnostic pop
+                        }
+                        if (lv) {
+                            [lv setHidden:YES];
+                            if ([lv respondsToSelector:@selector(setAlpha:)]) [lv setAlpha:0.0f];
+                            hidden++;
+                        }
+                    }
+                }
+                for (UIView *child in current.subviews) [stack addObject:child];
+            }
+        }
+        if (sDebugLog && hidden > 0) {
+            static int s54Push = 0;
+            if (s54Push < 40) { s54Push++; RDLog(@"MK54-PUSH bid=%@ hidden=%d", bid, hidden); }
+        }
     });
 }
 
@@ -5072,20 +5162,20 @@ static void MKProbeSelfCheck(void) {
         Class cIcon = NSClassFromString(@"SBIcon");
         Class cLLV  = NSClassFromString(@"SBIconLegibilityLabelView");
         Class cIV   = NSClassFromString(@"SBIconView");
-        RDLog(@"PROBE-SELFCHECK v2.0.66.53 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.54 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
               NSStringFromClass(cIcon),
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayName)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayNameForLocation:)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleID)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleIdentifier)] : 0);
-        RDLog(@"PROBE-SELFCHECK v2.0.66.53 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.54 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
               NSStringFromClass(cLLV),
               cLLV ? [cLLV instancesRespondToSelector:@selector(setText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setString:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setAttributedText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(_updateLabelImage)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(legibilityLabel)] : 0);
-        RDLog(@"PROBE-SELFCHECK v2.0.66.53 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.54 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
               NSStringFromClass(cIV),
               cIV ? [cIV instancesRespondToSelector:@selector(_updateLabel)] : 0,
               cIV ? [cIV instancesRespondToSelector:@selector(setIconLabelAlpha:)] : 0,
