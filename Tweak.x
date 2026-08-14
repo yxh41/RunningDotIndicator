@@ -3149,7 +3149,7 @@ static void MKUpdate(SBIconView *self) {
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:fBid];
                 if (sHiddenBids) [sHiddenBids addObject:fBid]; // v1.6.85: 文件夹合成 key 也要藏名
-                if (sDebugLog) RDLog(@"FICON-CREATE v2.0.66.48: %@ rep=%@ fixed=%d container=%s frame=%@", fBid, rep, fixedColor, fContainerCls, NSStringFromCGRect(indicatorFrame));
+                if (sDebugLog) RDLog(@"FICON-CREATE v2.0.66.49: %@ rep=%@ fixed=%d container=%s frame=%@", fBid, rep, fixedColor, fContainerCls, NSStringFromCGRect(indicatorFrame));
                 MKFadeInFolderIndicatorIfClosing(indicator); // v2.0.43: 关窗期淡入, 消除缩略图点瞬现
             } else {
                 if (indicator.superview != overlay) {
@@ -3428,7 +3428,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.66.48: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.66.49: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
             // v2.0.66.2: 顺带修主屏 beta 小黄点回收残留(见 MKGetCachedBid 回收清理)
@@ -4873,7 +4873,33 @@ static void MKApplyAppState(NSString *bid, BOOL runningNow, BOOL foreground) {
 // 注意：此 hook 为数据源层首试（全历史 displayNameForLocation: -S 0 命中，落点全新）。
 // ====================================================================
 
+static int sProbeHit = 0;  // v2.0.66.49 探针限流计数器（全局，所有探针共享；上限 120 防日志爆炸）
+
 %hook SBIcon
+
+// ── 探针：SBIcon.displayName（名字来源最可疑点，iOS 7+ 稳定存在）──
+// 仅埋点：取 bid（两种可能的 selector 名都试）+ 打印返回文本，不改行为。限流。
+- (NSString *)displayName {
+    NSString *r = %orig;
+    if (sProbeHit < 120) {
+        sProbeHit++;
+        NSString *bid = nil;
+        if ([self respondsToSelector:@selector(applicationBundleID)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            bid = [self performSelector:@selector(applicationBundleID)];
+#pragma clang diagnostic pop
+        }
+        if (!bid && [self respondsToSelector:@selector(applicationBundleIdentifier)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            bid = [self performSelector:@selector(applicationBundleIdentifier)];
+#pragma clang diagnostic pop
+        }
+        RDLog(@"(PROBE) SBIcon.displayName bid=%@ text=%@", bid, r);
+    }
+    return r;
+}
 
 - (NSString *)displayNameForLocation:(long long)location {
     // 启动自检（无门控，1 次）：确认本 hook 已挂载、方法真实存在
@@ -4909,6 +4935,72 @@ static void MKApplyAppState(NSString *bid, BOOL runningNow, BOOL foreground) {
 }
 
 %end
+
+// ============ 探针段 v2.0.66.49（诊断：定位真正承载图标名字文本的方法）============
+// 设计原则（零崩溃风险）：
+//   • 所有探针方法用宽松参数类型（id），仅 RDLog + %orig，绝不 return 修改值。
+//   • logos %hook 一个「不存在于该类」的方法 = 仅给该类新增一个「系统不会调用」的
+//     实现，不影响现有功能；本段纯埋点。
+//   • RDLog 不受 sDebugLog 门控，裸调即落盘（/var/mobile/Documents/rd_log.txt）。
+//   • 启动自检 MKProbeSelfCheck 打印各候选方法 instancesRespondToSelector，区分
+//     "方法不存在" vs "存在但不被调"（.48 翻车根因 = displayNameForLocation: 存在但不被调）。
+
+// --- SBIconLegibilityLabelView（真实名字 label 类，memory 确认）：文本落点候选 ---
+%hook SBIconLegibilityLabelView
+- (void)setText:(id)t {
+    if (sProbeHit < 120) { sProbeHit++; RDLog(@"(PROBE) LLV.setText cls=%@ text=%@", NSStringFromClass([self class]), t); }
+    %orig;
+}
+- (void)setString:(id)t {
+    if (sProbeHit < 120) { sProbeHit++; RDLog(@"(PROBE) LLV.setString cls=%@ text=%@", NSStringFromClass([self class]), t); }
+    %orig;
+}
+- (void)setAttributedText:(id)t {
+    if (sProbeHit < 120) { sProbeHit++; RDLog(@"(PROBE) LLV.setAttr cls=%@ text=%@", NSStringFromClass([self class]), t); }
+    %orig;
+}
+%end
+
+// --- SBIconView：label 更新 / alpha 候选（setIconLabelAlpha: 是 iOS16 控名字显隐已知入口）---
+%hook SBIconView
+- (void)_updateLabel {
+    if (sProbeHit < 120) { sProbeHit++; RDLog(@"(PROBE) SBIconView._updateLabel cls=%@", NSStringFromClass([self class])); }
+    %orig;
+}
+- (void)setIconLabelAlpha:(CGFloat)a {
+    if (sProbeHit < 120) { sProbeHit++; RDLog(@"(PROBE) SBIconView.setIconLabelAlpha a=%.2f cls=%@", a, NSStringFromClass([self class])); }
+    %orig;
+}
+%end
+
+// --- 启动自检：打印候选方法存在性（无门控，dispatch_once 1 次）---
+static void MKProbeSelfCheck(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class cIcon = NSClassFromString(@"SBIcon");
+        Class cLLV  = NSClassFromString(@"SBIconLegibilityLabelView");
+        Class cIV   = NSClassFromString(@"SBIconView");
+        RDLog(@"PROBE-SELFCHECK SBIcon=%p displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
+              (void *)cIcon,
+              cIcon ? [cIcon instancesRespondToSelector:@selector(displayName)] : 0,
+              cIcon ? [cIcon instancesRespondToSelector:@selector(displayNameForLocation:)] : 0,
+              cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleID)] : 0,
+              cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleIdentifier)] : 0);
+        RDLog(@"PROBE-SELFCHECK LLV=%p setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
+              (void *)cLLV,
+              cLLV ? [cLLV instancesRespondToSelector:@selector(setText:)] : 0,
+              cLLV ? [cLLV instancesRespondToSelector:@selector(setString:)] : 0,
+              cLLV ? [cLLV instancesRespondToSelector:@selector(setAttributedText:)] : 0,
+              cLLV ? [cLLV instancesRespondToSelector:@selector(_updateLabelImage)] : 0,
+              cLLV ? [cLLV instancesRespondToSelector:@selector(legibilityLabel)] : 0);
+        RDLog(@"PROBE-SELFCHECK IV=%p _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
+              (void *)cIV,
+              cIV ? [cIV instancesRespondToSelector:@selector(_updateLabel)] : 0,
+              cIV ? [cIV instancesRespondToSelector:@selector(setIconLabelAlpha:)] : 0,
+              cIV ? [cIV instancesRespondToSelector:@selector(label)] : 0,
+              cIV ? [cIV instancesRespondToSelector:@selector(setLabel:)] : 0);
+    });
+}
 
 // ====================================================================
 // 构造函数（只做最轻量工作）
@@ -4969,11 +5061,12 @@ static void MKRefreshFolderIcons(void) {
     }
 
     %init;
+    MKProbeSelfCheck();   // v2.0.66.49 启动探针自检（打印候选方法存在性，零风险）
     MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
     // v2.0.66.39: 启动日志彻底精简 —— 单行版本戳也收进 sDebugLog(诊断关时彻底零输出, 仅 @catch 异常仍可见); 多行改动清单同收进 sDebugLog。
     if (sDebugLog) {
-        RDLog(@"======== RunningDotIndicator v2.0.66.48 loaded ========");
+        RDLog(@"======== RunningDotIndicator v2.0.66.49 loaded ========");
         RDLog(@"======== RDBUILD v2.0.66.38: 物理位置判定补刀(MKLabelPhysicallyInDock)治「主屏 label 漂到 dock 位置显示(祖先链仍主屏)」的串名(前版 fctx 仅靠类名祖先链覆盖不到); + 收进 sDebugLog(生产安静); 行为零变化 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.30: NEG-SETTEXT 最终捕获版(彻底无门控) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.31: DOCK-RANDOM-FIX 根治 dock 随机串名 + 移除 1s 扫描定时器 ========");
