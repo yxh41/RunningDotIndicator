@@ -4968,8 +4968,59 @@ static int sProbeHit = 0;  // v2.0.66.49 探针限流计数器（全局，所有
 // --- SBIconView：label 更新 / alpha 候选（setIconLabelAlpha: 是 iOS16 控名字显隐已知入口）---
 %hook SBIconView
 - (void)_updateLabel {
-    if (sProbeHit < 120) { sProbeHit++; RDLog(@"(PROBE) SBIconView._updateLabel cls=%@", NSStringFromClass([self class])); }
     %orig;
+    // v2.0.66.50 探针：%orig 后抓 label 真实文本 + bid + LLV 方法列表，定位真正设名 setter（纯埋点，零行为变化）
+    // 设计：SELFCHECK 已证 SBIconLegibilityLabelView 的 setText/setString/setAttr 全不存在(=0)，
+    //       但 REVEAL-ATTEMPT cls=SBIconLegibilityLabelView 证该类实例确实存在 → 文本走非标准方法。
+    //       本探针在 _updateLabel(%orig 刷新 label 后)暴力试文本 getter + 枚举 LLV 方法，找出真正 setter。
+    static int sULProbe = 0;
+    if (sULProbe < 200) {
+        // 取 label（iOS16 属性名不一，多候选 respondsToSelector 探测，绝不硬编码导致编译错）
+        id label = nil;
+        for (NSString *p in @[@"label", @"iconLabel", @"_iconLabel", @"legibilityLabelView"]) {
+            SEL s = NSSelectorFromString(p);
+            if ([self respondsToSelector:s]) { label = [self valueForKey:p]; if (label) break; }
+        }
+        if (!label) label = MKGetCachedLabel((SBIconView *)self);
+        NSString *labelCls = label ? NSStringFromClass([label class]) : @"none";
+        // 暴力试文本 getter（NSString / NSAttributedString 都收）
+        NSString *txt = nil;
+        for (NSString *p in @[@"text", @"string", @"attributedText", @"_text", @"title"]) {
+            SEL s = NSSelectorFromString(p);
+            if ([label respondsToSelector:s]) {
+                id t = [label valueForKey:p];
+                if ([t isKindOfClass:[NSString class]]) { txt = t; break; }
+                if ([t isKindOfClass:[NSAttributedString class]]) { txt = [t string]; break; }
+            }
+        }
+        // 取 bid（SBIconView.icon -> SBIcon.applicationBundleID；已证 applicationBundleID=1 存在）
+        NSString *bid = nil;
+        if ([self respondsToSelector:@selector(icon)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            id icon = [self performSelector:@selector(icon)];
+#pragma clang diagnostic pop
+            if (icon && [icon respondsToSelector:@selector(applicationBundleID)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                bid = [icon performSelector:@selector(applicationBundleID)];
+#pragma clang diagnostic pop
+            }
+        }
+        // 仅记录「label 真有文本」的调用：省启动空 label 额度，把 200 条全留给顽疾触发(开/关文件夹)
+        if (txt.length) {
+            if (sULProbe == 0 && label) {
+                unsigned int mc = 0;
+                Method *ml = class_copyMethodList([label class], &mc);
+                NSMutableArray *mns = [NSMutableArray array];
+                for (unsigned i = 0; i < mc; i++) [mns addObject:NSStringFromSelector(method_getName(ml[i]))];
+                free(ml);
+                RDLog(@"(PROBE2) LLV-METHODS(%@): %@", labelCls, [mns componentsJoinedByString:@","]);
+            }
+            sULProbe++;
+            RDLog(@"(PROBE2) _updateLabel bid=%@ labelCls=%@ txt=%@", bid, labelCls, txt);
+        }
+    }
 }
 - (void)setIconLabelAlpha:(CGFloat)a {
     if (sProbeHit < 120) { sProbeHit++; RDLog(@"(PROBE) SBIconView.setIconLabelAlpha a=%.2f cls=%@", a, NSStringFromClass([self class])); }
