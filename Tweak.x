@@ -2328,7 +2328,7 @@ static BOOL MKDockStrayHide(SBIconView *iv, BOOL *outStray) {
     }
     if (hit && (!lbl.hidden || lbl.alpha > 0.0f)) {
         lbl.hidden = YES;
-        lbl.alpha = 0.0f;
+        lbl.layer.opacity = 0.0f;
         lbl.layer.opacity = 0.0f;
         lbl.opaque = NO;
         [lbl.layer removeAllAnimations];
@@ -2586,13 +2586,13 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
             a = 0.0f;
             if (mkFolderAnimOffA) {
                 // ①: 关窗文件夹缩略图 -> 瞬钉 0(名称 CA 动画由 orig 处 CATransaction 禁用)
-                ((UIView *)self).alpha = 0.0f;
+                ((UIView *)self).layer.opacity = 0.0f;
                 static int s65faA = 0; if (s65faA < 20) { s65faA++; RDLog(@"MK65-FOLDER-ANIM-OFF via=Alpha bid=%@", bid); }
             } else if (((UIView *)self).alpha > 0.01f) {
-                // v2.0.66.66: MRC 下 animate block 不 retain 捕获对象 → 图标飞出释放 label 致 use-after-free 注销; 手动 retain 保活 + 改 layer.opacity 避免重入 setAlpha hook
+                // v2.0.66.66: layer.opacity 直接设底层不触发 setAlpha: setter, 断重入递归(项目 ARC 无 retain; 旧"use-after-free"注释误, 真因即 setter 重入无限递归)
                 [((UIView *)self).layer removeAllAnimations];
                 CGFloat mkStartA = ((UIView *)self).alpha;
-                ((UIView *)self).alpha = mkStartA;
+                ((UIView *)self).layer.opacity = mkStartA;
                 UIView *mkFadeV = (UIView *)self;
                 [UIView animateWithDuration:0.22 delay:0.0
                     options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
@@ -2601,7 +2601,7 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
                 static int s65fadeA = 0;
                 if (s65fadeA < 20) { s65fadeA++; RDLog(@"MK65-FADE via=Alpha target=%.2f start=%.2f bid=%@", (float)mkTargetA, (float)mkStartA, bid); }
             } else {
-                ((UIView *)self).alpha = 0.0f;
+                ((UIView *)self).layer.opacity = 0.0f;
             }
             if (sDebugLog) { static int s54a = 0; if (s54a < 40) { s54a++; RDLog(@"MK54-ALPHA-HIDE bid=%@ target=%.2f", bid, (float)mkTargetA); } }
         } else if ((useBid = MKShouldHideLabel((UIView *)self, bid, &mapOnly))) {   // v2.0.12: 撤销 v2.0.9 关合窗口内让步原生(label 在文件夹内也强制藏名), 根治 sub-16ms settle 单帧闪现。详见 MKSetHiddenHook 同款注释。
@@ -2622,13 +2622,13 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
                 a = 0.0f;
                 MKAssocLabelBid((UIView *)self, fb);
                 if (mkFolderAnimOffA) {
-                    ((UIView *)self).alpha = 0.0f;
+                    ((UIView *)self).layer.opacity = 0.0f;
                     static int s65faT = 0; if (s65faT < 20) { s65faT++; RDLog(@"MK65-FOLDER-ANIM-OFF via=AlphaThumb bid=%@", fb); }
                 } else if (((UIView *)self).alpha > 0.01f) {
-                    // v2.0.66.66: 同 mkRunningHide —— MRC retain 保活 + layer.opacity 防重入/use-after-free
+                    // v2.0.66.66: 同 mkRunningHide —— layer.opacity 防重入(ARC 无 retain)
                     [((UIView *)self).layer removeAllAnimations];
                     CGFloat mkStartA = ((UIView *)self).alpha;
-                    ((UIView *)self).alpha = mkStartA;
+                    ((UIView *)self).layer.opacity = mkStartA;
                     UIView *mkFadeV = (UIView *)self;
                     [UIView animateWithDuration:0.22 delay:0.0
                         options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
@@ -2637,7 +2637,7 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
                     static int s65fadeT = 0;
                     if (s65fadeT < 20) { s65fadeT++; RDLog(@"MK65-FADE via=AlphaThumb target=%.2f start=%.2f bid=%@", (float)mkTargetA, (float)mkStartA, fb); }
                 } else {
-                    ((UIView *)self).alpha = 0.0f;
+                    ((UIView *)self).layer.opacity = 0.0f;
                 }
             }
         } else if (MKForeignContainerCtx((UIView *)self) || MKLabelPhysicallyInDock((UIView *)self)) {
@@ -2677,7 +2677,7 @@ static void MKSetFrameHook(id self, SEL _cmd, CGRect f) {
         if (lbl.hidden || lbl.alpha <= 0.01f) return; // 已藏/不可见 → 零分配早退
         if (MKLabelPhysicallyInDock(lbl)) {
             lbl.hidden = YES;
-            lbl.alpha = 0.0f;
+            lbl.layer.opacity = 0.0f;
             lbl.layer.opacity = 0.0f;
             [lbl.layer removeAllAnimations];
             if (sDebugLog) RDLog(@"DOCK-FRAME-HIDE: cls=%@ setFrame physInDock=YES", NSStringFromClass([lbl class]));
@@ -2695,7 +2695,7 @@ static void MKSetCenterHook(id self, SEL _cmd, CGPoint c) {
         if (lbl.hidden || lbl.alpha <= 0.01f) return;
         if (MKLabelPhysicallyInDock(lbl)) {
             lbl.hidden = YES;
-            lbl.alpha = 0.0f;
+            lbl.layer.opacity = 0.0f;
             lbl.layer.opacity = 0.0f;
             [lbl.layer removeAllAnimations];
             if (sDebugLog) RDLog(@"DOCK-FRAME-HIDE: cls=%@ setCenter physInDock=YES", NSStringFromClass([lbl class]));
@@ -2731,7 +2731,7 @@ static void MKLabelDidMoveToWindowHook(id self, SEL _cmd) {
             NSString *bid = MKLabelToBid(lbl); // v2.0.7: 含几何兜底，瞬态也能解出
             if (bid && sHiddenBids && [sHiddenBids containsObject:bid]) {
                 lbl.hidden = YES;
-                lbl.alpha = 0.0f;
+                lbl.layer.opacity = 0.0f;
                 lbl.layer.opacity = 0.0f;
                 lbl.opaque = NO;
                 MKAssocLabelBid(lbl, bid);
@@ -2748,7 +2748,7 @@ static void MKLabelDidMoveToWindowHook(id self, SEL _cmd) {
             }
             if (fctx) {
                 lbl.hidden = YES;
-                lbl.alpha = 0.0f;
+                lbl.layer.opacity = 0.0f;
                 lbl.layer.opacity = 0.0f;
                 [lbl.layer removeAllAnimations];
             }
@@ -2790,7 +2790,7 @@ static void MKLabelDidMoveToSuperviewHook(id self, SEL _cmd) {
             objc_setAssociatedObject(lbl, &kMKLabelIconKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             MKAssocLabelBid(lbl, nil);
             lbl.hidden = YES;
-            lbl.alpha = 0.0f;
+            lbl.layer.opacity = 0.0f;
             lbl.layer.opacity = 0.0f;
             if (sDebugLog) RDLog(@"WARNING DOCK-MISMATCH: cls=%@ oldOwner=%p curIV=%p cleared+hidden",
                                  NSStringFromClass([lbl class]), storedOwner, curIV);
@@ -2801,7 +2801,7 @@ static void MKLabelDidMoveToSuperviewHook(id self, SEL _cmd) {
         NSString *fctx = MKForeignContainerCtx(lbl);
         if (fctx || MKLabelPhysicallyInDock(lbl)) {
             lbl.hidden = YES;
-            lbl.alpha = 0.0f;
+            lbl.layer.opacity = 0.0f;
             lbl.layer.opacity = 0.0f;
             [lbl.layer removeAllAnimations];
             if (sDebugLog && !fctx) RDLog(@"DOCK-PHYS-HIDE: cls=%@ physInDock=YES (ancestor-chain miss)", NSStringFromClass([lbl class]));
@@ -2968,13 +2968,13 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
                 if (mkFolderAnimOff) {
                     // ①: 关窗文件夹缩略图 -> 瞬钉 0; 名称 CA 动画由 orig 处 CATransaction 禁用(无闪无渐隐, 纯 snap)
                     lbl.hidden = NO;
-                    lbl.alpha = 0.0f;
+                    lbl.layer.opacity = 0.0f;
                     static int s65fa = 0; if (s65fa < 20) { s65fa++; RDLog(@"MK65-FOLDER-ANIM-OFF via=IconAlpha bid=%@", bid); }
                 } else if (lbl.alpha > 0.01f) {
-                    // A2: 自驱动淡出 —— MRC 手动 retain 保活 + 改 layer.opacity 避免重入 setIconLabelAlpha hook; 防图标飞出释放 label 致 use-after-free 注销(v2.0.66.66)
+                    // A2: 自驱动淡出 —— layer.opacity 防重入 setIconLabelAlpha hook(ARC 无 retain; 真因 setter 重入递归)
                     [lbl.layer removeAllAnimations];
                     CGFloat mkStartA = lbl.alpha;
-                    lbl.alpha = mkStartA;
+                    lbl.layer.opacity = mkStartA;
                     [UIView animateWithDuration:0.22 delay:0.0
                         options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
                         animations:^{ lbl.layer.opacity = 0.0f; }
@@ -2982,7 +2982,7 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
                     static int s65fade = 0;
                     if (s65fade < 20) { s65fade++; RDLog(@"MK65-FADE via=IconAlpha target=%.2f start=%.2f bid=%@", (float)mkTargetA, (float)mkStartA, bid); }
                 } else {
-                    lbl.alpha = 0.0f;   // 已隐, 仅保持, 绝不瞬切空名
+                    lbl.layer.opacity = 0.0f;   // 已隐, 仅保持, 绝不瞬切空名
                     static int s65hold = 0; if (s65hold < 20) { s65hold++; RDLog(@"MK65-HOLD via=IconAlpha bid=%@", bid); }
                 }
                 // v2.0.66.53: 确认日志(限流40)
@@ -3053,7 +3053,7 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
         while (mkSt.count > 0) {
             UIView *mkV = [mkSt lastObject]; [mkSt removeLastObject];
             if (MKBetaClass(mkV) && (mkV.hidden || mkV.alpha <= 0.0f)) {
-                mkV.hidden = NO; mkV.alpha = 1.0f; mkV.layer.opacity = 1.0f; mkV.opaque = NO;
+                mkV.hidden = NO; mkV.layer.opacity = 1.0f; mkV.opaque = NO;
                 MKEnsureBetaVertAlign((UIView *)self, mkV); // v2.0.63: 复显后竖直对齐文本中心(灭偏上)
                 if (sDebugLog) RDLog(@"BETA-KEEP-ALPHA bid=%@ cls=%@", MKGetCachedBid((SBIconView *)self), NSStringFromClass([mkV class]));
             }
@@ -3378,7 +3378,7 @@ static void MKUpdate(SBIconView *self) {
                     }
                     // 顺带加固 label 隐藏不变量（呼应 v1.6.82，防与圆点重叠）
                     UIView *lbl = MKGetCachedLabel((SBIconView *)self);
-                    if (lbl) { lbl.hidden = YES; lbl.alpha = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO; MKAssocLabelBid(lbl, fBid); }
+                    if (lbl) { lbl.hidden = YES; lbl.layer.opacity = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO; MKAssocLabelBid(lbl, fBid); }
                 }
                 if (sDebugLog) RDLog(@"FICON-SKIP bid=%@ gen=%lu (unchanged, cheap reposition)", fBid, (unsigned long)sFolderContentGen);
                 return;
@@ -4001,7 +4001,7 @@ static void MKHideLabelForRunningBid(NSString *bid) {
                         }
                     if (lv) {
                         [lv setHidden:YES];
-                        if ([lv respondsToSelector:@selector(setAlpha:)]) [lv setAlpha:0.0f];
+                        if ([lv respondsToSelector:@selector(setAlpha:)]) ((UIView *)lv).layer.opacity = 0.0f;
                         MKAssocLabelBid((UIView *)lv, bid); // v2.0.66.59: 给被推藏的 label 写 bid 键, 使后续 setIconLabelAlpha/didMoveToWindow 可从 label 自身键兜底(跨 iconView 复用不丢)
                         hidden++;
                     }
@@ -4028,7 +4028,7 @@ static void MKHideLabelForRunningBid(NSString *bid) {
                     }
                     if (lvBid && [lvBid isEqualToString:bid]) {
                         [(UIView *)current setHidden:YES];
-                        if ([current respondsToSelector:@selector(setAlpha:)]) [(UIView *)current setAlpha:0.0f];
+                        ((UIView *)current).layer.opacity = 0.0f;
                         MKAssocLabelBid((UIView *)current, bid); // v2.0.66.59: LLV 分支同样写 bid 键
                         hidden++;
                     }
@@ -4818,7 +4818,7 @@ static void MKArmFolderCloseGuard(void) {
                                   NSStringFromClass([lbl class]), NSStringFromClass([iv class]));
                         }
                     }
-                                    if (lbl) { lbl.hidden = YES; lbl.alpha = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO; MKAssocLabelBid(lbl, b); }
+                                    if (lbl) { lbl.hidden = YES; lbl.layer.opacity = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO; MKAssocLabelBid(lbl, b); }
                                 }
                             }
                             [stack addObjectsFromArray:cur.subviews];
@@ -4968,7 +4968,7 @@ static void MKArmFolderCloseGuard(void) {
                     NSString *b = MKGetCachedBid(iv);
                     UIView *lbl = MKGetCachedLabel(iv);
                     if (lbl && b.length && sHiddenBids && [sHiddenBids containsObject:b]) {
-                        lbl.hidden = YES; lbl.alpha = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO;
+                        lbl.hidden = YES; lbl.layer.opacity = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO;
                         MKAssocLabelBid(lbl, b);  // 种回直接关联键，使源头级 hook 稳定命中
                     }
                 }
@@ -4986,7 +4986,7 @@ static void MKArmFolderCloseGuard(void) {
                         NSString *b = MKGetCachedBid(iv);
                         UIView *lbl = MKGetCachedLabel(iv);
                         if (lbl && b.length && sHiddenBids && [sHiddenBids containsObject:b]) {
-                            lbl.hidden = YES; lbl.alpha = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO;
+                            lbl.hidden = YES; lbl.layer.opacity = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO;
                             MKAssocLabelBid(lbl, b);
                         }
                     }
@@ -5362,7 +5362,7 @@ static int sProbeHit = 0;  // v2.0.66.49 探针限流计数器（全局，所有
         if (s57Win < 40) { s57Win++; RDLog(@"MK57-WINDOW-ENTER bid=%@ run=%d cls=%@", bid ? bid : @"?", (int)running, NSStringFromClass([self class])); }
         if (running) {
             [(UIView *)self setHidden:YES];
-            [(UIView *)self setAlpha:0.0f];
+            ((UIView *)self).layer.opacity = 0.0f;
             static int s57WinHide = 0;
             if (s57WinHide < 40) { s57WinHide++; RDLog(@"MK57-WINDOW-HIDE bid=%@", bid); }
         } else {
@@ -5401,7 +5401,7 @@ static int sProbeHit = 0;  // v2.0.66.49 探针限流计数器（全局，所有
         BOOL running = (bid && sRunningSet && [sRunningSet containsObject:bid]);
         if (running) {
             [(UIView *)self setHidden:YES];
-            if ([(UIView *)self respondsToSelector:@selector(setAlpha:)]) [(UIView *)self setAlpha:0.0f];
+            ((UIView *)self).layer.opacity = 0.0f;
             static int s55Bind = 0;
             if (s55Bind < 40) { s55Bind++; RDLog(@"MK55-LABELBIND bid=%@ cls=%@", bid, NSStringFromClass([self class])); }
         } else {
@@ -5483,7 +5483,7 @@ static int sProbeHit = 0;  // v2.0.66.49 探针限流计数器（全局，所有
         }
         if (lv) {
             [lv setHidden:YES];
-            if ([lv respondsToSelector:@selector(setAlpha:)]) [lv setAlpha:0.0f];
+            if ([lv respondsToSelector:@selector(setAlpha:)]) ((UIView *)lv).layer.opacity = 0.0f;
             if (s52Hit < 40) { s52Hit++; RDLog(@"MK53-HIDE via=updateLabel run=%d bid=%@ lv=%@", (int)mkRunning, bid, NSStringFromClass([lv class])); }
         } else if (s52Hit < 40) { s52Hit++; RDLog(@"MK53-NO-LABELVIEW run=%d bid=%@", (int)mkRunning, bid); }
     }
@@ -5501,20 +5501,20 @@ static void MKProbeSelfCheck(void) {
         Class cIcon = NSClassFromString(@"SBIcon");
         Class cLLV  = NSClassFromString(@"SBIconLegibilityLabelView");
         Class cIV   = NSClassFromString(@"SBIconView");
-        RDLog(@"PROBE-SELFCHECK v2.0.66.66 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.67 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
               NSStringFromClass(cIcon),
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayName)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayNameForLocation:)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleID)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleIdentifier)] : 0);
-        RDLog(@"PROBE-SELFCHECK v2.0.66.66 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.67 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
               NSStringFromClass(cLLV),
               cLLV ? [cLLV instancesRespondToSelector:@selector(setText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setString:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setAttributedText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(_updateLabelImage)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(legibilityLabel)] : 0);
-        RDLog(@"PROBE-SELFCHECK v2.0.66.66 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.67 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
               NSStringFromClass(cIV),
               cIV ? [cIV instancesRespondToSelector:@selector(_updateLabel)] : 0,
               cIV ? [cIV instancesRespondToSelector:@selector(setIconLabelAlpha:)] : 0,
