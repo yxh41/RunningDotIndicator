@@ -175,22 +175,11 @@ static NSMapTable *sContainerToOverlay; // 滚动容器(UIScrollView) -> overlay
 // 声明提前到此处，确保 MKIsIconInFolder()(v1.6.67) 等辅助函数在其定义前即可引用，满足 -Werror 先声明后使用。
 static BOOL  sFolderOpen     = NO;
 static BOOL  sFolderClosing   = NO;  // v2.0.3: 关文件夹动画窗口标志（~0.8s），用于定向诊断日志节流
-static int    sFolderCloseDiag = 0;   // v2.0.3: 关文件夹诊断计数（每轮关闭最多记若干条，避免刷屏）
-static int    sFolderCloseVisDiag = 0; // v2.0.5: 探针 B 计数（FOLDER-CLOSE-VISIBLE 有界前 8 条）
 static BOOL  sLocked        = NO;  // v1.6.69: 设备是否处于锁屏态（解锁动画期间保持 YES，避免指示器透出）
 static NSTimeInterval sLockAt = 0;   // v1.6.70: 最近一次锁屏时刻；用于 MKUpdate 时间闸门自动复位（不依赖解锁通知）
 static BOOL  sUnlockFading = NO;  // v2.0.50: MKUnlockRestore 显式淡入进行中，抑制逐帧不变量重复叠淡入（防重抖）
 static dispatch_source_t sFolderCloseGuard = NULL;  // v2.0.1: 关文件夹缩回动画期间(~0.5s)持续堵窗定时器，防新建 label 漏藏
-// v2.0.41: 关文件夹全程高频闪现探针——把原 0.8s/16ms 守卫升级为 1.2s/8ms,
-// 每帧在重新藏名【之前】先打 FLASH-PROBE(带精确毫秒),专抓「settle 末拍 sub-16ms 单帧复显」。
-// sFlashWindow 标定时窗口(1.2s)用于 gate 四个 hook 的 REVEAL-ATTEMPT 复显日志。
-static BOOL           sFlashWindow    = NO;
-static NSTimeInterval sFlashStart     = 0;
-static int            sFlashLogCount  = 0;
-static int            sRevealLogCount = 0;
-static int            sThumbLogCount = 0;   // v2.0.42: 缩略图探针(THUMB-CHILD)计数, 有界防刷屏
-static BOOL  sDebugLog      = NO;  // 仅 RDLogRunning 调试守卫仍引用(运行期恒假, 优化器死剥); 调试/探针门控已全部清除, 此变量仅作该守卫占位。
-static char kMKIndicatorContainerKey;    // 指示器记录的所属容器（仅供调试/稳健性）
+static BOOL  sDebugLog      = NO;  // 仅 RDLogRunning 调试守卫仍引用(运行期恒假, 优化器死剥); 调试/探针门控与探针计数已全部清除(.73/.74), 此变量仅作该守卫占位。
 static char kMKFIconBidsKey;  // v1.6.76: 文件夹图标缓存的「内部后台运行中 App」bid 数组
 static char kMKFIconGenKey;    // v1.6.76: 该缓存的代际（sFolderContentGen 变化时失效）
 static NSUInteger sFolderContentGen = 0; // v1.6.76: 文件夹内容代际；App 运行态变化时 +1 使缓存失效
@@ -319,7 +308,6 @@ static void MKRemoveIndicatorForBid(NSString *bid) {
     UIView *ind = MKFindIndicator(bid);
     if (ind) {
         [ind removeFromSuperview];
-        objc_setAssociatedObject(ind, &kMKIndicatorContainerKey, nil, OBJC_ASSOCIATION_ASSIGN);
     }
     if (sBidToIndicator) [sBidToIndicator removeObjectForKey:bid];
     // v1.6.86: 仅在 App 确实不再运行时才恢复名字。文件夹关闭时内层 App 的指示器视图被拆掉
@@ -1005,7 +993,6 @@ static BOOL MKIsBlacklisted(NSString *bid) {
 }
 
 // ─── 全局状态 ─────────────────────────────────────────────
-static int   sCallCount    = 0;
 static BOOL  sInitDone     = NO;
 
 // v1.6.52: 滚动/翻页守卫 —— 滚动中不重定位/创建指示器，避免翻页 churn 与粘错
@@ -1036,7 +1023,6 @@ static NSMutableArray *sLifecycleObservers = nil;
 static NSTimeInterval sDisableTS = 0;
 static BOOL  sDisableChecked = NO;
 static BOOL  sDisabled = NO;
-static NSMutableDictionary<NSString*, NSNumber*> *sRunLogCounts = nil; // 日志限流
 static NSMutableSet<NSString*> *sForegroundBIDs = nil; // 当前前台 App 不显示其桌面指示器
 static NSMutableSet<NSString*> *sPendingBIDs    = nil; // v1.5.6+: 等待300ms后才显示指示器的App（标签已隐藏，指示器待创建）
 static NSMutableSet<NSString*> *sAnimateIndicatorBIDs = nil; // v1.5.7: 指示器需要渐显动画的 App（状态切换时创建）
@@ -1048,6 +1034,7 @@ static dispatch_queue_t sColorDiskQueue = nil; // v2.0.66.6: 颜色缓存写盘�
 // v2.0.66.73: 最终优化 —— 删除全部 sDebugLog/sProbeLog 调试门控与 MKDebugDumpBetaLabel/MKLogRevealAttempt 调试函数(RDLog 为编译期 no-op 宏, 参数不求值, 删之零行为影响); 仅 RDLogRunning 守卫保留以维持 .47 行为。
 // 调试/探针门控已全部清除(RDLog 为编译期 no-op 宏, 参数不求值; 全部 sDebugLog/sProbeLog 门控已删除)。
 // 仅 RDLogRunning 保留 if(!sDebugLog) return; 守卫以维持 .47 行为; sProbeLog 声明已删除。
+// v2.0.66.74: 续优化 —— 删除探针遗留 write-only 计数器(sFlashWindow/sFlashStart/sFlashLogCount/sRevealLogCount/sThumbLogCount/sFolderCloseDiag/sFolderCloseVisDiag) 与 sRunLogCounts/sCallCount(仅 RDLogRunning 死体/sCallCount 仅死日志读) 及 kMKIndicatorContainerKey(仅关联 nil 从未读); 全部运行期零副作用, 行为严格等价 .47。
 // 文件夹打开/滚动刷新合并：避免同一事件多次触发全量刷新
 static BOOL  sFolderRefreshScheduled = NO;   // 文件夹刷新是否已排程（300ms 内只排一次）
 static NSTimeInterval sLastFolderOpenTS = 0; // 上次文件夹打开时间戳（0.4s 内去重）
@@ -1408,13 +1395,6 @@ static UIColor *MKCachedIconColorForBundleID(NSString *bid) {
 // ─── 限流日志（同一 bundleID 最多记录 5 次 RUNNING）──────────────
 static void RDLogRunning(NSString *bid) {
     if (!sDebugLog) return; // v1.6.26: 默认安静，仅调试模式记录 RUNNING 噪声
-    if (!sRunLogCounts) sRunLogCounts = [NSMutableDictionary dictionary];
-    NSNumber *countObj = sRunLogCounts[bid];
-    NSInteger count = countObj ? [countObj integerValue] : 0;
-    if (count < 5) {
-        sRunLogCounts[bid] = @(count + 1);
-        RDLog(@"RUNNING: %@ (call=%d, log=%ld)", bid, sCallCount, (long)(count+1));
-    }
 }
 
 // ─── 紧急开关 ────────────────────────────────────────────────
@@ -2856,7 +2836,6 @@ static void MKUpdate(SBIconView *self) {
             }
         }
 
-        sCallCount++;
         if (MKIsDisabled()) {
             MKRemoveAllIndicators();
             UIView *label = MKGetCachedLabel(self);
@@ -4129,10 +4108,6 @@ static void MKFadeInFolderIndicatorIfClosing(UIView *ind) {
 
 static void MKArmFolderCloseGuard(void) {
     sFolderClosing = YES;
-    sFolderCloseDiag = 0;
-    sFolderCloseVisDiag = 0;
-    // v2.0.41: 闪现探针窗口——武装即开(1.2s),gate 四个 hook 的 REVEAL-ATTEMPT 复显日志
-    sFlashWindow = YES; sFlashStart = [NSDate date].timeIntervalSince1970; sFlashLogCount = 0; sRevealLogCount = 0; sThumbLogCount = 0;
         if (sFolderCloseGuard) { dispatch_source_cancel(sFolderCloseGuard); sFolderCloseGuard = NULL; }
         sFolderCloseGuard = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
         if (sFolderCloseGuard) {
@@ -4187,8 +4162,6 @@ static void MKArmFolderCloseGuard(void) {
                 if (fcTicks >= 150) {
                     dispatch_source_cancel(sFolderCloseGuard); sFolderCloseGuard = NULL;
                     sFolderClosing = NO;
-                    sFlashWindow = NO; sFlashStart = 0;
-                                        
                 }
             });
             dispatch_resume(sFolderCloseGuard);
