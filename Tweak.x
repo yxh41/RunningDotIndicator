@@ -189,8 +189,8 @@ static NSTimeInterval sFlashStart     = 0;
 static int            sFlashLogCount  = 0;
 static int            sRevealLogCount = 0;
 static int            sThumbLogCount = 0;   // v2.0.42: 缩略图探针(THUMB-CHILD)计数, 有界防刷屏
-static BOOL  sDebugLog      = NO;  // v1.6.26: 调试日志开关；声明提前到此处，确保 MKLockStateCallback()(v1.6.69) 等在其定义前即可引用。
-static BOOL  sProbeLog      = NO;  // v2.0.54: 深度诊断探针专用开关（FLASH-PROBE / SNAP-PRE-NAME / THUMB / REVEAL-ATTEMPT / 文件夹关合闪 等）。默认在 %ctor 里赋值 = sDebugLog，故当前日志行为不变；将来可独立关闭而不影响通用调试日志（RUNNING/REFRESH/BETA-* 等）。
+static BOOL  sDebugLog      = NO;  // v2.0.66.72: 调试日志开关已移除；保留为 NO 占位，供 120 处 if(sDebugLog) 门控编译通过(运行期恒假, 优化器死剥)。不再从偏好读取。
+static BOOL  sProbeLog      = NO;  // v2.0.66.72: 同上，深度探针开关随调试开关一并移除；占位 NO。
 static char kMKIndicatorContainerKey;    // 指示器记录的所属容器（仅供调试/稳健性）
 static char kMKFIconBidsKey;  // v1.6.76: 文件夹图标缓存的「内部后台运行中 App」bid 数组
 static char kMKFIconGenKey;    // v1.6.76: 该缓存的代际（sFolderContentGen 变化时失效）
@@ -1099,14 +1099,9 @@ static NSMutableDictionary<NSString*, UIColor*> *sIconColorCache = nil; // v1.5.
 static NSMutableSet<NSString*> *sIconColorMissLogged = nil; // v1.6.12: 取色失败诊断（每 bid 只记一次）
 static dispatch_queue_t sColorDiskQueue = nil; // v2.0.66.6: 颜色缓存写盘串行队列（后台异步，避免主线程 jank）
 
-// ─── v1.6.26: 调试日志开关 + 刷新合并 ───
-// 默认 NO（生产安静）。存在 /var/mobile/Documents/rd_debug 文件即开启详细日志。
-// 注意：sDebugLog 全局已在文件顶部（sLocked 旁边）声明，此处仅赋值。
-static void MKUpdateDebugFlag(void) {
-    MKConfig *cfg = [MKConfig sharedConfig];
-    sDebugLog = cfg ? [cfg debugLog] : NO;
-    sProbeLog = sDebugLog;  // v2.0.54: 探针开关跟随调试开关（当前行为不变；仅做结构性收拢）
-}
+// v2.0.66.72: 调试日志开关已移除（RDLog 为编译期 no-op 宏，开关无意义）。
+// sDebugLog/sProbeLog 保留为 static BOOL = NO（见文件顶部），仅作 120 处 if(...) 门控的编译占位，
+// 运行期恒假、被优化器死剥；不再从偏好读取，设置页已删「调试日志」cell。
 // 文件夹打开/滚动刷新合并：避免同一事件多次触发全量刷新
 static BOOL  sFolderRefreshScheduled = NO;   // 文件夹刷新是否已排程（300ms 内只排一次）
 static NSTimeInterval sLastFolderOpenTS = 0; // 上次文件夹打开时间戳（0.4s 内去重）
@@ -3861,7 +3856,6 @@ static void MKDelayedInit() {
 
     // ─── 标记初始化完成 ──────
     sInitDone = YES;
-    MKUpdateDebugFlag(); // v1.6.26: 初始化完成后读取调试开关
     if (sDebugLog) RDLog(@"DELAYED INIT: done. sInitDone=YES");
 
 
@@ -3874,7 +3868,6 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
                                     CFStringRef name, const void *object,
                                     CFDictionaryRef userInfo) {
     [[MKConfig sharedConfig] reload];
-    MKUpdateDebugFlag(); // v1.6.26: 设置变更后刷新调试开关
     MKRefreshAllIcons();
     MKRefreshFolderIcons();
 }
@@ -4807,11 +4800,10 @@ static void MKRefreshFolderIcons(void) {
     }
 
     %init;
-    MKUpdateDebugFlag(); // v1.6.26: 读取调试开关（默认 NO，生产安静）
 
     // v2.0.66.39: 启动日志彻底精简 —— 单行版本戳也收进 sDebugLog(诊断关时彻底零输出, 仅 @catch 异常仍可见); 多行改动清单同收进 sDebugLog。
     if (sDebugLog) {
-        RDLog(@"======== RunningDotIndicator v2.0.66.71 loaded ========");
+        RDLog(@"======== RunningDotIndicator v2.0.66.72 loaded ========");
         RDLog(@"======== RDBUILD v2.0.66.38: 物理位置判定补刀(MKLabelPhysicallyInDock)治「主屏 label 漂到 dock 位置显示(祖先链仍主屏)」的串名(前版 fctx 仅靠类名祖先链覆盖不到); + 收进 sDebugLog(生产安静); 行为零变化 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.30: NEG-SETTEXT 最终捕获版(彻底无门控) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.31: DOCK-RANDOM-FIX 根治 dock 随机串名 + 移除 1s 扫描定时器 ========");

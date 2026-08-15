@@ -96,14 +96,6 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
     return (o < 0.1f) ? 0.1f : (o > 1.0f ? 1.0f : o);
 }
 
-- (BOOL)debugLog {
-    // v1.6.29: 设置页「调试日志」开关优先；回退到文件开关 /var/mobile/Documents/rd_debug（历史兼容）
-    // 二者 OR：任一为真即输出详细排障日志。文件开关为临时兼容手段，稳定后将随调试开关一起移除。
-    id v = _prefs[@"debugLog"];
-    if (v) return [v boolValue];
-    return [[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/rd_debug"];
-}
-
 - (UIColor *)color {
     NSString *custom = _prefs[@"customColor"];
     if ([custom isKindOfClass:[NSString class]] && [custom length]) {
