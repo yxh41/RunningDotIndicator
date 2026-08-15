@@ -95,7 +95,7 @@
 #include <string.h>          // v2.0.22: strcmp 用于无分配类名比较（MKIsFolderIcon 每帧热路径）
 #include <objc/runtime.h>
 
-// ─── RDLog 已改为编译期 no-op 宏（.71 起彻底去掉诊断/探针输出；参数不求值，故 (void*)owner 等 ARC 桥接错误一并消失；残留 sDebugLog/sProbeLog 门控与探针函数体均变为 inert）──
+// ─── RDLog 已改为编译期 no-op 宏（.71 起彻底去掉诊断/探针输出；参数不求值，故 (void*)owner 等 ARC 桥接错误一并消失；全部 sDebugLog/sProbeLog 调试门控与探针函数体已在 .73 最终优化中删除，仅 RDLogRunning 守卫保留）──
 #define RDLog(fmt, ...) ((void)0)
 
 // libproc 函数声明（iOS 运行时存在，但 iPhoneOS SDK 不含此头文件）
@@ -189,8 +189,7 @@ static NSTimeInterval sFlashStart     = 0;
 static int            sFlashLogCount  = 0;
 static int            sRevealLogCount = 0;
 static int            sThumbLogCount = 0;   // v2.0.42: 缩略图探针(THUMB-CHILD)计数, 有界防刷屏
-static BOOL  sDebugLog      = NO;  // v2.0.66.72: 调试日志开关已移除；保留为 NO 占位，供 120 处 if(sDebugLog) 门控编译通过(运行期恒假, 优化器死剥)。不再从偏好读取。
-static BOOL  sProbeLog      = NO;  // v2.0.66.72: 同上，深度探针开关随调试开关一并移除；占位 NO。
+static BOOL  sDebugLog      = NO;  // 仅 RDLogRunning 调试守卫仍引用(运行期恒假, 优化器死剥); 调试/探针门控已全部清除, 此变量仅作该守卫占位。
 static char kMKIndicatorContainerKey;    // 指示器记录的所属容器（仅供调试/稳健性）
 static char kMKFIconBidsKey;  // v1.6.76: 文件夹图标缓存的「内部后台运行中 App」bid 数组
 static char kMKFIconGenKey;    // v1.6.76: 该缓存的代际（sFolderContentGen 变化时失效）
@@ -261,7 +260,7 @@ static BOOL MKIsIconInFolder(UIView *iv) {
     // → setHidden/MKLabelDidMoveToWindowHook 的藏名拦截漏掉它们 → 缩回末尾名字复显闪一下(第④点残留真凶)。
     // 故 FloatyFolder 容器无论 sFolderOpen 与否都直接识别为「在文件夹内」，其余容器维持原语义(需 sFolderOpen)。
     if ([cls isEqualToString:@"SBFloatyFolderScrollView"]) {
-        if (sDebugLog) RDLog(@"FOLDER-FLOATY: iv=%@ cls=%@", iv, cls);
+        
         return YES;
     }
     return (sFolderOpen && container);
@@ -276,17 +275,6 @@ static BOOL MKIsFolderIcon(SBIconView *iv) {
     // 避免 layoutSubviews 每帧为【每个图标】都分配一个 NSString（原实现每个图标每帧一次）。
     // 实际比较用 strcmp，行为与原来 isEqualToString: 完全等价（类名 camelCase）。
     const char *cls = class_getName([icon class]);
-    NSString *clsStr = nil; // 仅 Debug 日志时按需构造
-    static NSMutableSet *sFolderIconLog;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ sFolderIconLog = [NSMutableSet new]; });
-    if (sDebugLog && cls) {
-        clsStr = @(cls);
-        if (![sFolderIconLog containsObject:clsStr]) {
-            [sFolderIconLog addObject:clsStr];
-            RDLog(@"FOLDER-ICON-CLS: %@", clsStr);
-        }
-    }
     return cls && (strcmp(cls, "SBFolderIcon") == 0 || strcmp(cls, "SBIconFolderIcon") == 0);
 }
 static UIView *MKOverlayForContainer(UIView *container) {
@@ -405,10 +393,10 @@ static void MKUnlockRevealOverlays(void) {
                 NSString *indBid = (NSString *)objc_getAssociatedObject(ind, &kMKIndicatorBidKey);
                 if (indBid.length && MKIsAppRunning(indBid)) {
                     ind.hidden = NO;
-                    if (sDebugLog) RDLog(@"UNLOCK-IND-REVEAL: bid=%@ (running, rescued)", indBid);
+                    
                 }
             }
-            if (sDebugLog) RDLog(@"UNLOCK-REVEAL: ov=%@ (instant unhide, native carry)", NSStringFromClass([ov class]));
+            
         }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ sUnlockFading = NO; });
@@ -432,7 +420,7 @@ static void MKUnlockRestore(void) {
         // 故保留一次 t=1.3s 的全量刷新兜底(其 BFS 已内联 MKDockStrayHide 判定, 顺带完成 dock 串名复核)。
         // v2.0.66.45 的 0.5s/1.3s 两次独立全树扫描(MKDockBandSweep)已整体删除: 判定并入每帧路径与本刷新, 不再重复遍历。
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ MKRefreshAllIcons(); });
-        if (sDebugLog) RDLog(@"UNLOCK: instant reveal all overlays + refreshed icons");
+        
     } @catch (NSException *e) { RDLog(@"UNLOCK EXCEPTION: %@", e.reason); }
 }
 // v1.6.67: 计算某 bid 的指示器在 overlay 坐标系中的 frame（transform/滚动偏移安全）。
@@ -535,11 +523,7 @@ static void MKCollectRunningFromFolder(id folder, NSMutableArray<NSString*> *out
         }
         if (acc.count) icons = acc;
     }
-    if (sDebugLog) {
-        NSInteger nApp = 0;
-        for (id s in icons) if (appCls && [s isKindOfClass:appCls]) nApp++;
-        RDLog(@"FOLDERCOLLECT cls=%@ icons=%ld appIcons=%ld", NSStringFromClass([folder class]), (long)(icons?icons.count:0), (long)nApp);
-    }
+    
     if (!icons) return;
     for (id sub in icons) {
         if (appCls && [sub isKindOfClass:appCls]) {
@@ -550,10 +534,7 @@ static void MKCollectRunningFromFolder(id folder, NSMutableArray<NSString*> *out
                 b = [sub performSelector:NSSelectorFromString(@"applicationBundleIdentifier")];
             BOOL run = [b isKindOfClass:[NSString class]] && b.length && MKIsAppRunning(b);
             BOOL fg = run && MKIsForeground(b);
-            if (sDebugLog && [b isKindOfClass:[NSString class]] && b.length && (run || out.count == 0)) {
-                static int sFCILogs = 0;
-                if (sFCILogs < 100) { sFCILogs++; RDLog(@"FOLDERCOLLECT-ITEM bid=%@ running=%d fg=%d", b, (int)run, (int)fg); }
-            }
+            
             if (run && !fg) [out addObject:b];
         } else if (fCls && [sub isKindOfClass:fCls]) {
             id sf = nil; // 嵌套文件夹：递归
@@ -634,7 +615,7 @@ static void MKScheduleUnlock(void) {
             // 不再做独立淡入(圆点统一由原生解锁动画携带揭示); sUnlockFading 抑制其后逐帧淡入(防重抖)。
             MKUnlockRevealOverlays();   // v2.0.66.32: 即时 un-hide(原生携带) 替代延迟淡入
             MKRefreshAllIcons();
-            if (sDebugLog) RDLog(@"UNLOCK(timer): explicit fade-in overlays + refreshed all icons");
+            
         } @catch (NSException *e) {
             RDLog(@"UNLOCK(timer) EXCEPTION: %@", e.reason);
         }
@@ -655,7 +636,7 @@ static void MKLockStateCallback(CFNotificationCenterRef center, void *observer, 
                 if (sUnlockTimer) { dispatch_source_cancel(sUnlockTimer); sUnlockTimer = NULL; }
                 sLocked = NO;
                 MKUnlockRestore();  // v2.0.1: 延迟淡入，不在解锁动画进行中硬显示
-                if (sDebugLog) RDLog(@"UNLOCK(lockstate): scheduled fade-in restore");
+                
                 return;
             }
             lockNow = [obj isEqualToString:@"1"];
@@ -670,7 +651,7 @@ static void MKLockStateCallback(CFNotificationCenterRef center, void *observer, 
             sLockAt = [NSDate date].timeIntervalSince1970;
             MKSetAllIndicatorsHidden(YES);
             MKScheduleUnlock();  // v1.6.75: 排兜底复原定时器
-            if (sDebugLog) RDLog(@"LOCK: hid all indicators");
+            
         }
         // 解锁不再在此处理：交由 MKUpdate 时间闸门 + 兜底定时器自动复位（见 sLocked 守卫）。
     } @catch (NSException *e) {
@@ -920,46 +901,12 @@ static void MKEnsureBetaOnIconView(UIView *iconView, UIView *dot) {
     objc_setAssociatedObject(dot, &kMKOurBetaKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v2.0.33: 标记为我们脱离的，退出时只移这些
 }
 
-// v2.0.61-dbg: 枚举「运行 App」label 子树 —— 定位「名称文本子视图」确切类名与 beta 配件布局，
-// 为「只藏文本、保留 beta 点」修复(灭偏上+灭解锁消失)提供证据。
-// 取消 MKBetaClass 门控：任一到达 MKDetachBetaOnce 的运行 App label 都打一次(assoc 标记)，
-// 这样即便 MKBetaClass 字符串匹配漏掉文件夹 beta 配件类，也能在 dump 里看到真实类名供后续修正。
-// 输出含 bid 与 mkBetaClassHit 标记，便于区分普通运行 App 与含 beta 点 App。
-static void MKDebugDumpBetaLabel(UIView *label, NSString *bid) {
-    if (!label || !sDebugLog) return;
-    static char kMKDumpedKey;
-    if (objc_getAssociatedObject(label, &kMKDumpedKey)) return; // 已打过
-    objc_setAssociatedObject(label, &kMKDumpedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    // 预扫 MKBetaClass 命中情况（仅用于提示，不再作为 dump 门控）
-    BOOL mkHasBeta = NO;
-    NSMutableArray *mkSt = [NSMutableArray arrayWithArray:(NSArray *)label.subviews];
-    while (mkSt.count > 0) {
-        UIView *mkV = [mkSt lastObject]; [mkSt removeLastObject];
-        if (MKBetaClass(mkV)) { mkHasBeta = YES; break; }
-        [mkSt addObjectsFromArray:mkV.subviews];
-    }
-    NSMutableString *mkS = [NSMutableString stringWithFormat:
-        @"BETA-LABEL-DUMP bid=%@ mkBetaClassHit=%d cls=%@ frame=%@ center=%@ hidden=%d alpha=%.2f subviews=%lu",
-        bid ?: @"?", mkHasBeta, NSStringFromClass([label class]), NSStringFromCGRect(label.frame),
-        NSStringFromCGPoint(label.center), label.hidden, (float)label.alpha,
-        (unsigned long)label.subviews.count];
-    for (UIView *v in label.subviews) {
-        [mkS appendFormat:@"\n  - %@ frame=%@ center=%@ hidden=%d alpha=%.2f beta=%d",
-            NSStringFromClass([v class]), NSStringFromCGRect(v.frame),
-            NSStringFromCGPoint(v.center), v.hidden, (float)v.alpha, MKBetaClass(v)];
-        for (UIView *w in v.subviews) {
-            [mkS appendFormat:@"\n    - %@ frame=%@ center=%@ hidden=%d alpha=%.2f beta=%d",
-                NSStringFromClass([w class]), NSStringFromCGRect(w.frame),
-                NSStringFromCGPoint(w.center), w.hidden, (float)w.alpha, MKBetaClass(w)];
-        }
-    }
-    RDLog(@"%@", mkS);
-}
+
 
 static void MKDetachBetaOnce(UIView *iconView) {
     if (!iconView) return;
     UIView *label = MKGetCachedLabel((SBIconView *)iconView);
-    if (sDebugLog) MKDebugDumpBetaLabel(label, MKGetCachedBid((SBIconView *)iconView)); // v2.0.64: 仅调试开时枚举(生产零开销，省每帧 MKGetCachedBid 求值)
+     // v2.0.64: 仅调试开时枚举(生产零开销，省每帧 MKGetCachedBid 求值)
     // v2.0.30: 「保留小黄点」开关 —— 关则退回 v2.0.23 行为（不保护，由藏名逻辑连带藏掉 beta 点）
     if (![MKConfig sharedConfig].keepBetaDot) return;
     if (!label) return;
@@ -973,8 +920,7 @@ static void MKDetachBetaOnce(UIView *iconView) {
         return; // 非 beta / 已脱离 -> 不动，保留 iconView 上现有脱离点（v2.0.58: 不再闩锁"无点"）
     }
     MKEnsureBetaOnIconView(iconView, dot); // v2.0.50: 统一走 helper（含坐标退化 + 脱落到 iconView）
-    if (sDebugLog) RDLog(@"BETA-DETACH bid=%@ dot=%@ super=%@",
-        MKGetCachedBid((SBIconView *)iconView), NSStringFromClass([dot class]), NSStringFromClass([iconView class]));
+    
 }
 // 退出/恢复：移除我们脱离到 iconView 的小黄点（系统会在原 label 重建自己的点，原生恢复）。
 static void MKRestoreBetaOrphan(UIView *iconView) {
@@ -987,7 +933,7 @@ static void MKRestoreBetaOrphan(UIView *iconView) {
             [sv removeFromSuperview]; removed = YES;
         }
     }
-    if (sDebugLog && removed) RDLog(@"BETA-RESTORE bid=%@", MKGetCachedBid((SBIconView *)iconView));
+    
 }
 
 // v2.0.34: force re-show hidden beta dot after keepBetaDot OFF->ON.
@@ -1002,7 +948,7 @@ static void MKBetaReconcile(SBIconView *iconView) {
         if (MKBetaClass(v) && (v.hidden || v.alpha <= 0.0f)) {
             v.hidden = NO; v.alpha = 1.0f; v.layer.opacity = 1.0f; v.opaque = NO;
             MKEnsureBetaVertAlign((UIView *)iconView, v); // v2.0.63: 复显后竖直对齐文本中心(灭偏上)
-            if (sDebugLog) RDLog(@"BETA-RESTORE-VIS bid=%@ cls=%@", MKGetCachedBid(iconView), NSStringFromClass([v class]));
+            
         }
         [st addObjectsFromArray:v.subviews];
     }
@@ -1099,9 +1045,9 @@ static NSMutableDictionary<NSString*, UIColor*> *sIconColorCache = nil; // v1.5.
 static NSMutableSet<NSString*> *sIconColorMissLogged = nil; // v1.6.12: 取色失败诊断（每 bid 只记一次）
 static dispatch_queue_t sColorDiskQueue = nil; // v2.0.66.6: 颜色缓存写盘串行队列（后台异步，避免主线程 jank）
 
-// v2.0.66.72: 调试日志开关已移除（RDLog 为编译期 no-op 宏，开关无意义）。
-// sDebugLog/sProbeLog 保留为 static BOOL = NO（见文件顶部），仅作 120 处 if(...) 门控的编译占位，
-// 运行期恒假、被优化器死剥；不再从偏好读取，设置页已删「调试日志」cell。
+// v2.0.66.73: 最终优化 —— 删除全部 sDebugLog/sProbeLog 调试门控与 MKDebugDumpBetaLabel/MKLogRevealAttempt 调试函数(RDLog 为编译期 no-op 宏, 参数不求值, 删之零行为影响); 仅 RDLogRunning 守卫保留以维持 .47 行为。
+// 调试/探针门控已全部清除(RDLog 为编译期 no-op 宏, 参数不求值; 全部 sDebugLog/sProbeLog 门控已删除)。
+// 仅 RDLogRunning 保留 if(!sDebugLog) return; 守卫以维持 .47 行为; sProbeLog 声明已删除。
 // 文件夹打开/滚动刷新合并：避免同一事件多次触发全量刷新
 static BOOL  sFolderRefreshScheduled = NO;   // 文件夹刷新是否已排程（300ms 内只排一次）
 static NSTimeInterval sLastFolderOpenTS = 0; // 上次文件夹打开时间戳（0.4s 内去重）
@@ -1367,7 +1313,7 @@ static void MKLoadColorCacheFromDisk() {
 			UIColor *c = [UIColor colorWithRed:r green:g blue:b alpha:a];
 			if (c) sIconColorCache[bid] = c;
 		}
-		if (sDebugLog) RDLog(@"ColorCache loaded from disk: %lu entries", (unsigned long)sIconColorCache.count);
+		
 	} @catch (NSException *e) {}
 }
 
@@ -1434,7 +1380,7 @@ static UIColor *MKCachedIconColorForBundleID(NSString *bid) {
     if (result) {
         sIconColorCache[bid] = result;
         MKSaveColorCacheToDisk();
-        if (sDebugLog) RDLog(@"IconColor: %@ → %@", bid, result);
+        
         return result;
     }
     // v1.6.11: 取不到图标 → 返回固定色用于即时显示，但【不缓存】
@@ -1444,7 +1390,7 @@ static UIColor *MKCachedIconColorForBundleID(NSString *bid) {
     if (!sIconColorMissLogged) sIconColorMissLogged = [NSMutableSet set];
     if (![sIconColorMissLogged containsObject:bid]) {
         [sIconColorMissLogged addObject:bid];
-        if (sDebugLog) RDLog(@"IconColor MISS: %@ (SBIconView 存在但 MKGetIconImage 未取到图标)", bid);
+        
         // v2.0.66.6: 图标未就绪导致取色失败 → 延迟 1s 重试一次（越过 SBIconController 初始化窗口）。
         // 此前用「下一 runloop」会与控制器初始化抢跑、几乎必败，于是文件夹 App 总要先打开一次才取到色。
         // sIconColorMissLogged 已保证每个 bid 只触发一次，不会无限重试。
@@ -1499,24 +1445,19 @@ static void MKSafe(void (^block)(void)) {
 static void MKAddToRunningSet(NSString *bid) {
     if (!bid.length) return;
     if (MKIsBlacklisted(bid)) {
-        static int sBlacklistLogs = 0;
-        if (sDebugLog && sBlacklistLogs < 10) { // v2.0.66.37: 收进 sDebugLog(纯诊断, 关掉即安静)
-            sBlacklistLogs++;
-            RDLog(@"BLACKLIST: skipped %@", bid);
-        }
         return;
     }
     if (!sRunningSet) sRunningSet = [NSMutableSet set];
     BOOL wasNew = ![sRunningSet containsObject:bid];
     [sRunningSet addObject:bid];
-    if (sDebugLog && wasNew) RDLog(@"+ RUNNING SET: %@", bid);
+    
 }
 
 static void MKRemoveFromRunningSet(NSString *bid) {
     if (!bid.length) return;
     BOOL wasIn = sRunningSet && [sRunningSet containsObject:bid];
     [sRunningSet removeObject:bid];
-    if (sDebugLog && wasIn) RDLog(@"- RUNNING SET: %@", bid);
+    
 }
 
 static BOOL MKIsAppRunning(NSString *bundleID) {
@@ -1541,7 +1482,7 @@ static BOOL MKIsForeground(NSString *bid) {
 
 // ─── NSFileManager 扫描构建 bundleID↔executablePath 映射 ────
 static void MKBuildPathCache() {
-    if (sDebugLog) RDLog(@"PathCache: starting NSFileManager scan...");
+    
     if (!sBidToExePath) sBidToExePath = [NSMutableDictionary dictionary];
     if (!sPathToBundleID) sPathToBundleID = [NSMutableDictionary dictionary];
 
@@ -1606,7 +1547,7 @@ static void MKBuildPathCache() {
         }
     }
 
-    if (sDebugLog) RDLog(@"PathCache: cached %d apps", added);
+    
 }
 
 // ─── SBApplicationController.runningApplications 初始同步 ────
@@ -1614,13 +1555,13 @@ static void MKSyncFromSBAppCtrl() {
     @try {
         id appCtrl = [SBApplicationController sharedInstance];
         if (!appCtrl) {
-            if (sDebugLog) RDLog(@"SBAppCtrl: sharedInstance is nil");
+            
             return;
         }
 
         SEL runningSel = NSSelectorFromString(@"runningApplications");
         if (![appCtrl respondsToSelector:runningSel]) {
-            if (sDebugLog) RDLog(@"SBAppCtrl: does not respond to runningApplications");
+            
             return;
         }
 
@@ -1630,7 +1571,7 @@ static void MKSyncFromSBAppCtrl() {
 #pragma clang diagnostic pop
 
         if (!runningApps) {
-            if (sDebugLog) RDLog(@"SBAppCtrl: runningApplications returned nil");
+            
             return;
         }
 
@@ -1653,7 +1594,7 @@ static void MKSyncFromSBAppCtrl() {
                 count++;
             }
         }
-        if (sDebugLog) RDLog(@"SBAppCtrl: synced %d running apps (total=%lu)", count, (unsigned long)runningApps.count);
+        
 
     } @catch (NSException *e) {
         RDLog(@"SBAppCtrl EXCEPTION: %@", e.reason);
@@ -1918,27 +1859,7 @@ static UIView *MKFindLabelView(SBIconView *iconView) {
             }
             dd = dd.superview;
         }
-        static int sNoLabelLogs = 0;
-        if (sDebugLog && !skipDump && sNoLabelLogs < 20) {
-            sNoLabelLogs++;
-            NSMutableString *dump = [NSMutableString stringWithFormat:@"NO LABEL - %@ direct:[", NSStringFromClass([iconView class])];
-            for (UIView *sv in iconView.subviews) {
-                [dump appendFormat:@" %@", NSStringFromClass([sv class])];
-            }
-            [dump appendString:@"]"];
-            UIView *parent = iconView.superview;
-            NSInteger lvl = 0;
-            while (parent && lvl < 8) {
-                [dump appendFormat:@" | L%ld(%@, %lu kids):[", (long)lvl, NSStringFromClass([parent class]), (unsigned long)parent.subviews.count];
-                for (UIView *sv in parent.subviews) {
-                    [dump appendFormat:@" %@(y=%.0f,h=%.0f)", NSStringFromClass([sv class]), sv.frame.origin.y, sv.frame.size.height];
-                }
-                [dump appendString:@"]"];
-                parent = parent.superview;
-                lvl++;
-            }
-            RDLog(@"%@", dump);
-        }
+        
 
     } @catch (NSException *e) {
         RDLog(@"MKFindLabelView exception: %@", e.reason);
@@ -2250,11 +2171,6 @@ static BOOL MKDockStrayHide(SBIconView *iv, BOOL *outStray) {
         if (!MKLabelPhysicallyInDock(lbl)) return NO;      // 物理不在 dock 纵带 → 正常主屏标签, 放行
         hit = YES;
         if (outStray) *outStray = YES;
-        static int sStrayLogs = 0;
-        if (sDebugLog && sStrayLogs < 30) {
-            sStrayLogs++;
-            RDLog(@"DOCK-STRAY-HIDE: lbl=%s (物理漂移, 祖先链仍主屏)", class_getName([lbl class]));
-        }
     }
     if (hit && (!lbl.hidden || lbl.alpha > 0.0f)) {
         lbl.hidden = YES;
@@ -2309,7 +2225,6 @@ static CFMutableDictionaryRef sOrigSetCenterByClassCF = NULL;
 // MKLabelDidMoveToWindowHook/主路径 mustHide 四处撤销)。该函数已无调用点,留之则 -Werror unused-function 编不过,故删。
 // v2.0.41: 关文件夹窗口内,iOS 试图复显运行 App label 时记一笔(无论 bid 能否解析),
 // 定位「末拍闪一下」到底走哪条 setter / 是否落在我们 hook 的拦截判据里。gate 在 sFlashWindow。
-static void MKLogRevealAttempt(NSString *via, CGFloat a, NSString *bid, Class lblCls);
 static void MKFadeInFolderIndicatorIfClosing(UIView *ind); // v2.0.43: 关窗期文件夹缩略图运行点淡入(消除瞬现)
 // v2.0.66.1: 文件夹缩略图上下文判定 + 缩略图迷你图标 bid 解析（精准修关窗缩略图运行 App 名称/指示器闪现）
 static BOOL MKViewInFolderThumb(UIView *v);
@@ -2370,16 +2285,7 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
     @try {
         NSString *bid = MKLabelToBid((UIView *)self);
         // v2.0.3: 关文件夹窗口内有界定向诊断（仅 debug 开 + sFolderClosing 时）
-        if (sProbeLog && sFolderClosing && !hidden && sFolderCloseDiag < 8) {
-            UIView *ivForLbl = objc_getAssociatedObject((UIView *)self, &kMKLabelIconKey);
-            if (!bid) {
-                sFolderCloseDiag++;
-                RDLog(@"FOLDER-CLOSE-MISS(H): cls=%@ selfCls=%@ iconPtr=%@ sup=%@",
-                      [(UIView *)self class], object_getClass(self),
-                      ivForLbl ? @"Y" : @"N",
-                      ((UIView *)self).superview ? NSStringFromClass([((UIView *)self).superview class]) : @"nil");
-            }
-        }
+        
         NSString *useBid = nil; BOOL mapOnly = NO;
         if (objc_getAssociatedObject((UIView *)self, &kMKDockPinnedKey)) {
             // v2.0.66.47: dock 钉藏防拉锯 —— 本 label 刚被 MKDockStrayHide 在 dock 容器内钉藏，
@@ -2389,8 +2295,7 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
         } else if ((useBid = MKShouldHideLabel((UIView *)self, bid, &mapOnly))) {   // v2.0.9 的「关闭动画窗口内让步原生」已在 v2.0.12 撤销：关合窗口内文件夹内 label 也强制藏名(不让步原生)，根治 sub-16ms settle 单帧闪现(第④点残留真凶)。证据 rd_log(63): FOLDER-CLOSE-VISIBLE=0 表明无 strobe 互搏，去掉安全。
             hidden = YES; // 有指示器 -> 名字必须隐藏，压制系统任何复显
             // v1.6.99: MKShouldHideLabel 已写回直接关联键 + 掐动画(标记自持，根除关文件夹缩回/主屏重叠闪现，详见 helper 注释)
-            if (sDebugLog && mapOnly)
-                RDLog(@"OVERLAP-GAP: caught via ptr-map cls=%@ bid=%@", object_getClass(self), useBid);
+            
             // v2.0.64: 删除原 REVEAL-ATTEMPT 分支 —— hidden 已在上行置 YES，!hidden 恒为 NO，该分支实际不可达(纯 debug 死代码)
         } else if (MKViewInFolderThumb((UIView *)self)) {
             // v2.0.66.1: 缩略图内运行 App 名称 label 经 setHidden: 复显时兜底钉藏(仅运行 App + 仅缩略图上下文)
@@ -2420,16 +2325,7 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
     @try {
         NSString *bid = MKLabelToBid((UIView *)self);
         // v2.0.3: 关文件夹窗口内有界定向诊断（setAlpha: 复显路径）
-        if (sProbeLog && sFolderClosing && a > 0.0f && sFolderCloseDiag < 8) {
-            UIView *ivForLbl = objc_getAssociatedObject((UIView *)self, &kMKLabelIconKey);
-            if (!bid) {
-                sFolderCloseDiag++;
-                RDLog(@"FOLDER-CLOSE-MISS(A): cls=%@ selfCls=%@ iconPtr=%@ sup=%@ a=%.2f",
-                      [(UIView *)self class], object_getClass(self),
-                      ivForLbl ? @"Y" : @"N",
-                      ((UIView *)self).superview ? NSStringFromClass([((UIView *)self).superview class]) : @"nil", (float)a);
-            }
-        }
+        
         NSString *useBid = nil; BOOL mapOnly = NO;
         if (objc_getAssociatedObject((UIView *)self, &kMKDockPinnedKey)) {
             // v2.0.66.47: dock 钉藏防拉锯 —— 详见 MKSetHiddenHook 同款注释。
@@ -2438,11 +2334,9 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
             CGFloat inA = a; // v2.0.41: 留存传入值(下面会覆写)供 REVEAL-ATTEMPT 判据
             a = 0.0f; // 同上，压制 alpha 复显
             // v1.6.99: MKShouldHideLabel 已写回直接关联键 + 掐动画(标记自持，根除关文件夹缩回/主屏重叠闪现，详见 helper 注释)
-            if (sDebugLog && mapOnly)
-                RDLog(@"OVERLAP-GAP: caught via ptr-map cls=%@ bid=%@", object_getClass(self), useBid);
+            
             // v2.0.66-diag: 关窗内 iOS 经 setAlpha:>0 复显【任意图标(含非运行 app)】label 也记(REVEAL-ATTEMPT); useBid=nil 即非运行,可区分
-            if (sProbeLog && sFlashWindow && inA > 0.0f)
-                MKLogRevealAttempt(@"(diag)setAlpha:", inA, useBid, object_getClass(self));
+            
         } else if (MKViewInFolderThumb((UIView *)self)) {
             // v2.0.66.1: 缩略图内运行 App 名称 label 经 setAlpha: 复显时兜底钉藏(仅运行 App + 仅缩略图上下文)
             NSString *fb = MKFolderThumbBid((UIView *)self);
@@ -2485,7 +2379,7 @@ static void MKSetFrameHook(id self, SEL _cmd, CGRect f) {
             lbl.alpha = 0.0f;
             lbl.layer.opacity = 0.0f;
             [lbl.layer removeAllAnimations];
-            if (sDebugLog) RDLog(@"DOCK-FRAME-HIDE: cls=%@ setFrame physInDock=YES", NSStringFromClass([lbl class]));
+            
         }
     } @catch (NSException *e) { RDLog(@"MKSetFrameHook EXCEPTION: %@", e.reason); }
 }
@@ -2503,7 +2397,7 @@ static void MKSetCenterHook(id self, SEL _cmd, CGPoint c) {
             lbl.alpha = 0.0f;
             lbl.layer.opacity = 0.0f;
             [lbl.layer removeAllAnimations];
-            if (sDebugLog) RDLog(@"DOCK-FRAME-HIDE: cls=%@ setCenter physInDock=YES", NSStringFromClass([lbl class]));
+            
         }
     } @catch (NSException *e) { RDLog(@"MKSetCenterHook EXCEPTION: %@", e.reason); }
 }
@@ -2528,11 +2422,7 @@ static void MKLabelDidMoveToWindowHook(id self, SEL _cmd) {
         // 只在「已进 window 且当前可见」时检查；移除(window=nil)不处理
         if (lbl.window && (lbl.alpha > 0.0f)) {   // v2.0.40: 放宽——覆盖半残态(hidden=YES 但 alpha>0), 旧 !lbl.hidden 把 rd_log(168) CLOSE-TAIL lbl(h=1 a=1.00) 漏过   // v2.0.12: 撤销 v2.0.9 关合窗口内文件夹内 label 让步原生(label 一进 window 即刻强藏, 根除 sub-16ms settle 单帧闪现); 详见 MKSetHiddenHook 同款注释。
             // v2.0.41: 关窗内 label 进 window 即带名可见(属运行 App)时记一笔(REVEAL-ATTEMPT)
-            if (sProbeLog && sFlashWindow) {
-                NSString *rb = MKLabelToBid(lbl);
-                if (rb.length && sHiddenBids && [sHiddenBids containsObject:rb])
-                    MKLogRevealAttempt(@"didMoveToWindow:", lbl.alpha, rb, object_getClass(lbl));
-            }
+            
             NSString *bid = MKLabelToBid(lbl); // v2.0.7: 含几何兜底，瞬态也能解出
             if (bid && sHiddenBids && [sHiddenBids containsObject:bid]) {
                 lbl.hidden = YES;
@@ -2592,8 +2482,7 @@ static void MKLabelDidMoveToSuperviewHook(id self, SEL _cmd) {
             lbl.hidden = YES;
             lbl.alpha = 0.0f;
             lbl.layer.opacity = 0.0f;
-            if (sDebugLog) RDLog(@"WARNING DOCK-MISMATCH: cls=%@ oldOwner=%p curIV=%p cleared+hidden",
-                                 NSStringFromClass([lbl class]), storedOwner, curIV);
+            
         }
         // v2.0.66.25: foreign 容器(dock/负一屏/widget)内图标名 label 在 superview 变更点也强制藏名,
         // 覆盖「仅换父、window 不变」的显形路径(与 didMoveToWindow 双保险, 灭亚秒级闪现);
@@ -2604,7 +2493,7 @@ static void MKLabelDidMoveToSuperviewHook(id self, SEL _cmd) {
             lbl.alpha = 0.0f;
             lbl.layer.opacity = 0.0f;
             [lbl.layer removeAllAnimations];
-            if (sDebugLog && !fctx) RDLog(@"DOCK-PHYS-HIDE: cls=%@ physInDock=YES (ancestor-chain miss)", NSStringFromClass([lbl class]));
+            
         }
     } @catch (NSException *e) {}
 }
@@ -2682,10 +2571,7 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
         }
         // v2.0.66-diag: 关窗内 iOS 经 setIconLabelAlpha:>0 复显【文件夹内任意图标(含非运行 app)】label 都记(REVEAL-ATTEMPT)，
         // 区分「a 层运行 app(cached-bid 翻转,可修)」vs「非运行/b 层(本 hook 看不到→日志零命中,近似无解)」。via 串含 hasBid。
-        if (sProbeLog && sFlashWindow && a > 0.0f) {
-            UIView *rl = MKGetCachedLabel((SBIconView *)self);
-            MKLogRevealAttempt([NSString stringWithFormat:@"(diag)setIconLabelAlpha: hasBid=%d", (int)hasBid], a, bid, (rl ? object_getClass(rl) : object_getClass(self)));
-        }
+        
         if (hasBid) {   // 仅藏名 bid 成员：钉死 alpha=0 压制 iOS 经此 setter 补回的回弹
             a = 0.0f;
             UIView *lbl = MKGetCachedLabel((SBIconView *)self);
@@ -2724,7 +2610,7 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
             if (MKBetaClass(mkV) && (mkV.hidden || mkV.alpha <= 0.0f)) {
                 mkV.hidden = NO; mkV.alpha = 1.0f; mkV.layer.opacity = 1.0f; mkV.opaque = NO;
                 MKEnsureBetaVertAlign((UIView *)self, mkV); // v2.0.63: 复显后竖直对齐文本中心(灭偏上)
-                if (sDebugLog) RDLog(@"BETA-KEEP-ALPHA bid=%@ cls=%@", MKGetCachedBid((SBIconView *)self), NSStringFromClass([mkV class]));
+                
             }
             [mkSt addObjectsFromArray:mkV.subviews];
         }
@@ -2939,7 +2825,7 @@ static void MKInstallLabelHook(void) {
             }
             for (NSString *cn in toHook) MKHookOneLabelClass(NSClassFromString(cn));
             MKHookSBIconViewAlpha();   // v2.0.40: 钉关文件夹 settle 的 label alpha 回弹入口
-            if (sDebugLog) RDLog(@"MKInstallLabelHook: hooked %lu label class(es)", (unsigned long)toHook.count);
+            
         } @catch (NSException *e) {
             RDLog(@"MKInstallLabelHook EXCEPTION: %@", e.reason);
         }
@@ -3016,7 +2902,7 @@ static void MKUpdate(SBIconView *self) {
             // can be indexed and reused.
             id fIcon = [self icon];
             NSString *fBid = fIcon ? [NSString stringWithFormat:@"__folder__%p", fIcon] : nil;
-            if (sDebugLog) RDLog(@"FICON-ENTER bid=%@ cls=%@ folderIndicators=%d", fBid, NSStringFromClass([fIcon class]), (int)[MKConfig sharedConfig].folderIndicators);
+            
             if (!fBid.length) return;
             // v1.6.92: 文件夹打开动画中，桌面文件夹图标 view 可能被临时 reparent 到
             // SBFloatyFolderScrollView 等容器下；此时若走 FICON 创建/重定位，会把圆点
@@ -3027,7 +2913,7 @@ static void MKUpdate(SBIconView *self) {
             const char *fContainerCls = fContainer ? class_getName([fContainer class]) : "";
             BOOL fIsHomeOrDock = (strcmp(fContainerCls, "SBIconScrollView") == 0) || (strncmp(fContainerCls, "SBDock", 5) == 0);
             if (!fIsHomeOrDock) {
-                if (sDebugLog) RDLog(@"FICON-ABORT bid=%@ reason=container=%s (not home/dock)", fBid, fContainerCls);
+                
                 return;
             }
             // v1.6.83: 文件夹图标重算风暴根因——MKRefreshSubviews 每次布局/滚动都对 folder 图标走完整 FICON 重算
@@ -3049,13 +2935,13 @@ static void MKUpdate(SBIconView *self) {
                     UIView *lbl = MKGetCachedLabel((SBIconView *)self);
                     if (lbl) { lbl.hidden = YES; lbl.alpha = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO; MKAssocLabelBid(lbl, fBid); }
                 }
-                if (sDebugLog) RDLog(@"FICON-SKIP bid=%@ gen=%lu (unchanged, cheap reposition)", fBid, (unsigned long)sFolderContentGen);
+                
                 return;
             }
             NSArray<NSString*> *contained = MKContainedRunningBids((SBIconView *)self);
-            if (sDebugLog && contained.count > 0) RDLog(@"FICON-CONTAINED bid=%@ running-bids=%@", fBid, [contained componentsJoinedByString:@","]);
+            
             if (contained.count == 0) {
-                if (sDebugLog) RDLog(@"FICON-ABORT bid=%@ reason=no-running-apps", fBid);
+                
                 UIView *lbl = MKGetCachedLabel(self);
                 if (lbl) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; MKAssocLabelBid(lbl, nil); }
                 UIView *fi = MKFindIndicator(fBid);
@@ -3064,7 +2950,7 @@ static void MKUpdate(SBIconView *self) {
             }
             MKConfig *fCfg = [MKConfig sharedConfig];
             if (!fCfg || !fCfg.folderIndicators) {
-                if (sDebugLog) RDLog(@"FICON-ABORT bid=%@ reason=folderIndicators-off", fBid);
+                
                 UIView *lbl = MKGetCachedLabel(self);
                 if (lbl) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; MKAssocLabelBid(lbl, nil); }
                 UIView *fi = MKFindIndicator(fBid);
@@ -3075,7 +2961,7 @@ static void MKUpdate(SBIconView *self) {
             BOOL fixedColor = (fCfg.colorMode == MKColorModeFixed);
             NSString *rep = MKFolderChosenBid(contained);
             UIView *label = MKGetCachedLabel(self);
-            if (sDebugLog) RDLog(@"FICON-LABEL bid=%@ label=%@ cls=%@ frame=%@", fBid, label ? @"YES" : @"NO", label ? NSStringFromClass([label class]) : @"-", label ? NSStringFromCGRect(label.frame) : @"-");
+            
             if (label) { label.hidden = YES; label.alpha = 0.0f; label.layer.opacity = 0.0f; label.opaque = NO; MKAssocLabelBid(label, fBid); }
             UIView *container = MKContainerForIconView((UIView *)self);
             UIView *overlay = MKOverlayForContainer(container);
@@ -3098,7 +2984,7 @@ static void MKUpdate(SBIconView *self) {
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:fBid];
                 if (sHiddenBids) [sHiddenBids addObject:fBid]; // v1.6.85: 文件夹合成 key 也要藏名
-                if (sDebugLog) RDLog(@"FICON-CREATE v2.0.66.12: %@ rep=%@ fixed=%d container=%s frame=%@", fBid, rep, fixedColor, fContainerCls, NSStringFromCGRect(indicatorFrame));
+                
                 MKFadeInFolderIndicatorIfClosing(indicator); // v2.0.43: 关窗期淡入, 消除缩略图点瞬现
             } else {
                 if (indicator.superview != overlay) {
@@ -3124,7 +3010,7 @@ static void MKUpdate(SBIconView *self) {
         }
 
         if (sFolderOpen && !MKIsIconInFolder((UIView *)self)) {
-            if (sDebugLog) RDLog(@"MKU-FOLDER-GUARD skip bid=%@ (main-screen icon while folder open)", MKGetCachedBid(self));
+            
             return;
         }
 
@@ -3191,11 +3077,7 @@ static void MKUpdate(SBIconView *self) {
                     }
                     // 诊断——仅当逐帧不变量「真的纠正了」某个 overlay 才打点（gated by sDebugLog）。
                     // reveal 行带 " fade(reveal)" 标记，grep PERFRAME-FIX 可证触发/救回数。
-                    if (sDebugLog) RDLog(@"PERFRAME-FIX: bid=%@ %@->%@%@ sLocked=%d dt=%.2f",
-                                          bundleID, mkWasHidden?@"YES":@"NO",
-                                          mkShouldHide?@"YES":@"NO",
-                                          mkShouldHide?@"":@" fade(reveal)",
-                                          (int)sLocked, (float)(mkNow - sLockAt));
+                    
                 }
             }
         }
@@ -3203,9 +3085,7 @@ static void MKUpdate(SBIconView *self) {
         // 能看到：MKUpdate 是否真的被调到、当时 sScrolling/hasIndicator 状态、最终是否建出。
         // 若 REFRESH 命中却无本行 → MKUpdate 没被调（触发链断）；
         // 若有本行却无 Indicator CREATE → MKUpdate 内部早退；据此一击定位。
-        if (sDebugLog && running && !isForeground) {
-            RDLog(@"MKU-bg bid=%@ scroll=%d hasInd=%d", bundleID, sScrolling, (int)!!existingIndicator);
-        }
+        
         // v1.6.81: folder icons don't participate in scroll gate; opening animation is mis-detected as scrolling
         BOOL isInFolder = MKIsIconInFolder((UIView *)self);
         // v1.6.70: 移除"文件夹打开期间一律显示名称并 return"的压制。
@@ -3213,12 +3093,7 @@ static void MKUpdate(SBIconView *self) {
         // 建在文件夹自己的 overlay 上（MKOverlayForContainer 按当前容器懒建）。
         // 非运行中 App 自然落到下方 !running 分支恢复名称。
         if (sScrolling && !isInFolder) {
-            if (sDebugLog) {
-                static NSMutableSet *sGateScroll; static dispatch_once_t sOnceS;
-                dispatch_once(&sOnceS, ^{ sGateScroll = [NSMutableSet new]; });
-                NSString *k = bundleID ? bundleID : NSStringFromClass([self class]);
-                if (![sGateScroll containsObject:k]) { [sGateScroll addObject:k]; RDLog(@"RDGATE %@ ret=scroll", k); }
-            }
+            
             // v1.6.59: 滚动中不再一律跳过。仅为「运行中+后台+尚无指示器」的 App 即时补建，
             // 根治 v1.6.57/58 零指示器回归（滚动门控把创建永久挡在门外、翻停重试又不可靠覆盖）。
             // 其余场景（前台/文件夹/非运行）滚动中仍跳过，避免 v1.6.56 的 fg 闪烁 churn：
@@ -3249,17 +3124,11 @@ static void MKUpdate(SBIconView *self) {
                 // （与主屏一致：名称隐藏、指示器显示在文件夹 overlay）。非运行中 App 自然落到下方
                 // !running 分支恢复名称。同一 bid 的主屏/文件夹指示器由 MKOverlayForContainer
                 // 自动重父到当前容器，关闭文件夹时 FOLDER CLOSE 刷新会把它重父回主屏 overlay，无重复/无丢失。
-                if (sDebugLog) RDLog(@"RET-folder bid=%@ container=%@", bundleID,
-                      NSStringFromClass([MKContainerForIconView((UIView *)self) class]));
+                
             }
         }
         if (!bundleID || bundleID.length == 0) {
-            if (sDebugLog) {
-                static NSMutableSet *sGateBid; static dispatch_once_t sOnceB;
-                dispatch_once(&sOnceB, ^{ sGateBid = [NSMutableSet new]; });
-                NSString *k = NSStringFromClass([self class]);
-                if (![sGateBid containsObject:k]) { [sGateBid addObject:k]; RDLog(@"RDGATE %@ ret=nobid", k); }
-            }
+            
             return;
         }
 
@@ -3268,10 +3137,7 @@ static void MKUpdate(SBIconView *self) {
 
         // v1.6.55: 入口门控快照 —— 只给"正在运行的后台 App"打，定位主屏指示器为何不创建。
         // 若某 App 走到这里却既没建指示器、也没打 NO LABEL/RUNNING 日志，看这行即可知卡在哪道门控。
-        if (sDebugLog && running) {
-            RDLog(@"RDUPD %@ fg=%d scroll=%d pend=%d fade=%d bid=%@",
-                  NSStringFromClass([self class]), isForeground, sScrolling, isPending, isFading, bundleID);
-        }
+        
 
         // v1.6.76: 文件夹「内部」运行的 App 现在走下方常规主功能路径各自显示圆点
         // （用户要求「保留里面各自显」）。文件夹【图标】本身挂圆点的逻辑在上方 MKIsFolderIcon 分支。
@@ -3283,7 +3149,7 @@ static void MKUpdate(SBIconView *self) {
 
         // 当前被用户打开在前台的 App，桌面上不再显示指示器（避免启动动画残留）
         if (!running || isForeground) {
-            if (sDebugLog) RDLog(@"RET-fg bid=%@ running=%d fg=%d", bundleID, running, isForeground);
+            
             // ── App 不在运行 / 在前台 → 移除指示器，恢复名字 ──
             if (indicator) MKRemoveIndicatorForBid(bundleID);
             MKRestoreBetaOrphan((UIView *)self); // v2.0.30: 移除我们脱离的孤儿小黄点，系统自建原 label 点
@@ -3302,14 +3168,14 @@ static void MKUpdate(SBIconView *self) {
         // v1.5.8: 标签正在渐隐中 → 不干扰动画，不创建指示器
         // 让 250ms 渐隐动画自然播放，300ms后才创建指示器
         if (isFading) {
-            if (sDebugLog) RDLog(@"RET-fading bid=%@", bundleID);
+            
             return;  // 不做任何操作，让渐隐动画继续
         }
 
         // v1.5.6+: pending 期间只隐藏标签，不创建指示器（等300ms回调）
         // 标签渐隐已完成（alpha=0），但仍需保持隐藏状态防止系统恢复
         if (isPending) {
-            if (sDebugLog) RDLog(@"RET-pending bid=%@", bundleID);
+            
             if (label) {
                 label.hidden = YES;
                 label.alpha = 0.0f;
@@ -3332,7 +3198,7 @@ static void MKUpdate(SBIconView *self) {
                 MKAssocLabelBid(label, bundleID);
             } else {
             // v1.5.5 诊断：App 在运行但找不到标签
-            if (sDebugLog) RDLog(@"NO LABEL for running app: %@", bundleID);
+            
         }
 
         // v1.6.64: 指示器尺寸改由 MKIndicatorFrameInOverlay 内部按 cfg 计算，此处不再需要。
@@ -3377,9 +3243,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.66.12: %@ shape=%d animate=%d label=%@",
-                  bundleID, (int)cfg.shape, shouldAnimate,
-                  label ? @"YES" : @"NO(FALLBACK)");
+            
             // v2.0.66.2: 顺带修主屏 beta 小黄点回收残留(见 MKGetCachedBid 回收清理)
 
             if (shouldAnimate) {
@@ -3389,7 +3253,7 @@ static void MKUpdate(SBIconView *self) {
                 [sBidToIndicator setObject:indicator forKey:bundleID];
                 if (sHiddenBids) [sHiddenBids addObject:bundleID]; // v1.6.85: 标记此 bid 名字必须隐藏
                 CGFloat finalAlpha = cfg.opacity;
-                if (sDebugLog) RDLog(@"Indicator FADE-IN: %@ alpha 0→%.2f", bundleID, finalAlpha);
+                
                 [UIView animateWithDuration:0.2 animations:^{
                     indicator.alpha = finalAlpha;
                 }];
@@ -3400,9 +3264,7 @@ static void MKUpdate(SBIconView *self) {
                 if (sHiddenBids) [sHiddenBids addObject:bundleID]; // v1.6.85: 标记此 bid 名字必须隐藏
             }
             [overlay bringSubviewToFront:indicator];  // v1.6.71: 确保指示器在文件夹 overlay 顶层（z-order）
-            if (sDebugLog) RDLog(@"IND-OVERLAY bid=%@ container=%@ frame=%@ hidden=%d alpha=%.2f",
-                  bundleID, NSStringFromClass([container class]),
-                  NSStringFromCGRect(indicator.frame), indicator.hidden, (float)indicator.alpha);
+            
         } else {
             // v1.6.64: 已存在 → 校验是否还在正确的 overlay 上（容器变了需重父）。
             // v1.6.71: 同一 bid 在主屏/文件夹是两处不同图标实例、各自 overlay；
@@ -3413,9 +3275,7 @@ static void MKUpdate(SBIconView *self) {
                 [indicator removeFromSuperview];
                 [overlay addSubview:indicator];
                 [overlay bringSubviewToFront:indicator];
-                if (sDebugLog) RDLog(@"IND-REPARENT bid=%@ from=%@ to=%@",
-                      bundleID, NSStringFromClass([oldParent class]),
-                      NSStringFromClass([overlay class]));
+                
             }
             // 图标离屏时保留最后位置不重算
             if (!CGRectIsEmpty(indicatorFrame)) {
@@ -3506,9 +3366,7 @@ static void MKRefreshSubviews(UIView *containerView) {
                 sFolderVisualOrder[key] = bids;
             }
         }
-        if (refreshed > 0 && sDebugLog) {
-            RDLog(@"FOLDER REFRESH: refreshed %d icons inside container", refreshed);
-        }
+        
     });
 }
 
@@ -3550,7 +3408,7 @@ static void MKRefreshAllIcons() {
             }
             if (!hasFolder) {
                 sFolderOpen = NO;
-                if (sDebugLog) RDLog(@"FOLDER-WATCHDOG: reset sFolderOpen=NO (no SBFolderView in window)");
+                
             }
         }
         NSArray *windows = [UIApplication sharedApplication].windows;
@@ -3596,7 +3454,7 @@ static void MKRefreshIconForBundleID(NSString *bid) {
         if (regView && [regView isKindOfClass:MKSBIconViewClass()]) {
             NSString *regBid = MKGetCachedBid(regView);
             if (regBid && [regBid isEqualToString:bid]) {
-                if (sDebugLog) RDLog(@"REFRESH bid=%@ via=registry", bid);
+                
                 MKUpdate(regView);
                 return;
             }
@@ -3622,7 +3480,7 @@ static void MKRefreshIconForBundleID(NSString *bid) {
                 }
             }
         }
-        if (sDebugLog) RDLog(@"REFRESH bid=%@ via=walk matched=%d", bid, walked);
+        
     });
 }
 
@@ -3755,7 +3613,7 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
         // callback to clear -> visible "blank then appears". Clear pending/fading now and
         // refresh immediately (main-screen icons are FOLDER-GUARD skipped, safe);
         // in-folder running apps get their indicator on the next frame.
-        if (sDebugLog) RDLog(@"ONSTATE-FOLDER bid=%@ running=%d fg=%d", bid, (int)running, (int)foreground);
+        
         MKRemovePending(bid);
         MKRemoveFadingLabel(bid);
         dispatch_async(dispatch_get_main_queue(), ^{ MKRefreshAllIcons(); });
@@ -3832,7 +3690,7 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
 // ====================================================================
 
 static void MKDelayedInit() {
-    if (sDebugLog) RDLog(@"DELAYED INIT: starting heavy work...");
+    
 
     // ─── 步骤 1：系统黑名单 ──────
     MKInitBlacklist();
@@ -3851,12 +3709,12 @@ static void MKDelayedInit() {
     // ─── 步骤 4：进程枚举辅助 ──────
     MKComputeRunningSetFromProc();
 
-    if (sDebugLog) RDLog(@"DELAYED INIT: runningSet has %lu items", (unsigned long)sRunningSet.count);
-    if (sDebugLog) RDLog(@"runningSet: %@", [[sRunningSet allObjects] componentsJoinedByString:@", "]);
+    
+    
 
     // ─── 标记初始化完成 ──────
     sInitDone = YES;
-    if (sDebugLog) RDLog(@"DELAYED INIT: done. sInitDone=YES");
+    
 
 
     // ─── 首次刷新所有图标 ──────
@@ -3917,16 +3775,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     }
     if (sInitDone) {
         // v1.6.0: 诊断日志 — 追踪 App 图标出现时机（特别是文件夹内图标）
-        if (sDebugLog) {
-            NSString *bid = MKGetCachedBid(self);
-            if (bid && MKIsAppRunning(bid)) {
-                RDLog(@"IconView.APPEAR: %@ running=YES fg=%d hasIndicator=%@ iconCls=%@ superviewCls=%@",
-                      bid, MKIsForeground(bid),
-                      MKFindIndicator(bid) ? @"YES" : @"NO",
-                      NSStringFromClass([[self icon] class] ?: [NSObject class]),
-                      NSStringFromClass([self.superview class] ?: [NSObject class]));
-            }
-        }
+        
         dispatch_async(dispatch_get_main_queue(), ^{
             MKUpdate(self);
         });
@@ -4006,7 +3855,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     // !running 分支恢复名称。下方 if(MKIsIconInFolder) 块仅在 sDebugLog 时打点；
     // 注意：MKIsIconInFolder 本身还参与真实分支判断（如 2397/3349/3378 的文件夹内/外区分），并非仅诊断用途。
     if (MKIsIconInFolder((UIView *)self)) {
-        if (sDebugLog) RDLog(@"INFOLDER layout bid=%@ fg=%d", MKGetCachedBid(self), MKIsForeground(MKGetCachedBid(self)));
+        
     }
 
     BOOL running = MKIsAppRunning(bid);
@@ -4063,7 +3912,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
                     } else if (mkS.hidden || mkS.alpha <= 0.0f) {
                         mkS.hidden = NO; mkS.alpha = 1.0f; mkS.layer.opacity = 1.0f; mkS.opaque = NO;
                         MKEnsureBetaVertAlign((UIView *)self, mkS); // v2.0.63: 复显后竖直对齐文本中心(灭偏上)
-                        if (sDebugLog) RDLog(@"BETA-KEEP bid=%@ cls=%@", MKGetCachedBid((SBIconView *)self), NSStringFromClass([mkS class]));
+                        
                     } else {
                         // v2.0.63: 已在 iconView 上且可见 → 每帧对齐，防 iOS 重布局把 β点钉回 label 顶沿(偏上复现)
                         MKEnsureBetaVertAlign((UIView *)self, mkS);
@@ -4086,7 +3935,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
                     } else if (mkS.hidden || mkS.alpha <= 0.0f) {
                         mkS.hidden = NO; mkS.alpha = 1.0f; mkS.layer.opacity = 1.0f; mkS.opaque = NO;
                         MKEnsureBetaVertAlign((UIView *)self, mkS); // v2.0.63: 复显后竖直对齐文本中心(灭偏上)
-                        if (sDebugLog) RDLog(@"BETA-KEEP bid=%@ cls=%@", MKGetCachedBid((SBIconView *)self), NSStringFromClass([mkS class]));
+                        
                     } else {
                         // v2.0.63: 已在 iconView 上且可见 → 每帧对齐，防 iOS 重布局把 β点钉回 label 顶沿(偏上复现)
                         MKEnsureBetaVertAlign((UIView *)self, mkS);
@@ -4094,7 +3943,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
                 } else if (!mkS.hidden && mkS.alpha > 0.0f) {
                     // v2.0.66.3: 关「保留小黄点」→ 直接藏掉 non-Label 类 beta 点(幂等, 无布局回环)。
                     mkS.hidden = YES; mkS.alpha = 0.0f; mkS.layer.opacity = 0.0f; mkS.opaque = NO;
-                    if (sDebugLog) RDLog(@"BETA-HIDE-OFF bid=%@ cls=%@", MKGetCachedBid((SBIconView *)self), NSStringFromClass([mkS class]));
+                    
                 }
             }
             [mkSub addObjectsFromArray:mkS.subviews];
@@ -4123,7 +3972,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     // （与 MKUpdate 同款守卫）。否则主屏实例把指示器重父回主屏 overlay
     // → 被文件夹盖住，造成"重开空位置 / 有些 App 没反应"。
     if (sFolderOpen && !MKIsIconInFolder((UIView *)self)) {
-        if (sDebugLog) RDLog(@"FOLDER-GUARD skip bid=%@ (main-screen icon while folder open)", MKGetCachedBid(self));
+        
         return;
     }
 
@@ -4186,8 +4035,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         [indicator removeFromSuperview];
         [overlay addSubview:indicator];
         [overlay bringSubviewToFront:indicator];
-        if (sDebugLog) RDLog(@"IND-REPARENT-LS bid=%@ to=%@",
-              bid, NSStringFromClass([overlay class]));
+        
     }
     MKRepositionIndicator(bid, self, cfg);
 }
@@ -4278,13 +4126,7 @@ static void MKFadeInFolderIndicatorIfClosing(UIView *ind) {
                      completion:nil];
 }
 
-static void MKLogRevealAttempt(NSString *via, CGFloat a, NSString *bid, Class lblCls) {
-    if (!sProbeLog || !sFlashWindow) return;
-    if (sRevealLogCount >= 16) return;
-    sRevealLogCount++;
-    RDLog(@"REVEAL-ATTEMPT via=%@ a=%.2f bid=%@ cls=%@",
-          via ? via : @"?", (float)a, bid ? bid : @"?", NSStringFromClass(lblCls));
-}
+
 static void MKArmFolderCloseGuard(void) {
     sFolderClosing = YES;
     sFolderCloseDiag = 0;
@@ -4334,16 +4176,7 @@ static void MKArmFolderCloseGuard(void) {
                     // 第④点 settle 末尾 sub-16ms 单帧复显本就未被 2.0.5 根治，此处回到轻量基础逻辑，
                     // 靠 MKSetHiddenHook/MKSetAlphaHook 的每层 setHidden:/setAlpha: 兜底藏名(2.0.3/4)。
                     // v2.0.41: FLASH-PROBE —— 重新藏名【之前】先记此刻 label 是否可见(带精确毫秒),专抓 sub-16ms 单帧复显。节流 24 条。
-                    if (sProbeLog && sFlashLogCount < 24) {
-                        if (lbl && (!lbl.hidden || lbl.alpha > 0.0f || lbl.layer.opacity > 0.0f)) {
-                            NSTimeInterval fnow = [NSDate date].timeIntervalSince1970;
-                            double el = (fnow - sFlashStart) * 1000.0;
-                            sFlashLogCount++;
-                            RDLog(@"FLASH-PROBE t=%.0fms bid=%@ lbl(h=%d a=%.2f op=%.2f) cls=%@ ivCls=%@",
-                                  el, b, (int)lbl.hidden, (float)lbl.alpha, (float)lbl.layer.opacity,
-                                  NSStringFromClass([lbl class]), NSStringFromClass([iv class]));
-                        }
-                    }
+                    
                                     if (lbl) { lbl.hidden = YES; lbl.alpha = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO; MKAssocLabelBid(lbl, b); }
                                 }
                             }
@@ -4355,75 +4188,11 @@ static void MKArmFolderCloseGuard(void) {
                     dispatch_source_cancel(sFolderCloseGuard); sFolderCloseGuard = NULL;
                     sFolderClosing = NO;
                     sFlashWindow = NO; sFlashStart = 0;
-                                        if (sDebugLog) {
-                        RDLog(@"FOLDER-CLOSE-ARM on=0 ticks=150");
-                        // v2.0.41 探针：关文件夹收尾帧 dump 名称 label + 指示器 overlay 可见性(FLASH-PROBE 已在每帧重藏前抓过单帧复显, 此为其稳态确认)
-                        @try {
-                            Class ivCls3 = MKSBIconViewClass();
-                            NSArray *wins3 = [UIApplication sharedApplication].windows;
-                            for (UIWindow *w3 in wins3) {
-                                NSMutableArray *stk = [NSMutableArray arrayWithObject:w3];
-                                while (stk.count > 0) {
-                                    UIView *cur = [stk lastObject]; [stk removeLastObject];
-                                    const char *curName3 = class_getName(object_getClass(cur));
-                                    BOOL isFolderIcon3 = (strcmp(curName3, "SBFolderIcon") == 0 || strcmp(curName3, "SBIconFolderIcon") == 0);
-                                    if (isFolderIcon3) {
-                                    } else if (ivCls3 && [cur isKindOfClass:ivCls3]) {
-                                        SBIconView *iv = (SBIconView *)cur;
-                                        NSString *b = MKGetCachedBid(iv);
-                                        if (b.length) {
-                                            UIView *l3 = MKGetCachedLabel(iv);
-                                            UIView *ind3 = MKFindIndicator(b);
-                                            if ((l3 && (!l3.hidden || l3.alpha > 0.0f)) || (ind3 && (!ind3.hidden || ind3.alpha > 0.0f))) {
-                                                RDLog(@"CLOSE-DUMP bid=%@ lbl(h=%d a=%.2f op=%.2f) ind(h=%d a=%.2f op=%.2f) sup=%@",
-                                                      b,
-                                                      l3 ? (int)l3.hidden : 0, l3 ? l3.alpha : 0.0f, l3 ? l3.layer.opacity : 0.0f,
-                                                      ind3 ? (int)ind3.hidden : 0, ind3 ? ind3.alpha : 0.0f, ind3 ? ind3.layer.opacity : 0.0f,
-                                                      NSStringFromClass([cur.superview class]));
-                                            }
-                                        }
-                                    }
-                                    [stk addObjectsFromArray:cur.subviews];
-                                }
-                            }
-                        } @catch (NSException *e) {}
-                        // 尾随探针：guard 结束后每 0.05s 采样一次、共 ~0.4s，捕捉「关闭差不多结束时名称/圆点闪一下」的 sub-帧（guard 停了才暴露）
-                        for (int k = 1; k <= 8; k++) {
-                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(k * 0.05 * NSEC_PER_SEC)),
-                                           dispatch_get_main_queue(), ^{
-                                if (!sDebugLog) return;
-                                @try {
-                                    Class ivClsK = MKSBIconViewClass();
-                                    NSArray *winsK = [UIApplication sharedApplication].windows;
-                                    for (UIWindow *wK in winsK) {
-                                        NSMutableArray *stkK = [NSMutableArray arrayWithObject:wK];
-                                        while (stkK.count > 0) {
-                                            UIView *curK = [stkK lastObject]; [stkK removeLastObject];
-                                            if (ivClsK && [curK isKindOfClass:ivClsK]) {
-                                                SBIconView *ivK = (SBIconView *)curK;
-                                                NSString *bk = MKGetCachedBid(ivK);
-                                                if (bk.length) {
-                                                    UIView *lk = MKGetCachedLabel(ivK);
-                                                    UIView *indk = MKFindIndicator(bk);
-                                                    if ((lk && (!lk.hidden || lk.alpha > 0.0f)) || (indk && (!indk.hidden || indk.alpha > 0.0f))) {
-                                                        RDLog(@"CLOSE-TAIL k=%d bid=%@ lbl(h=%d a=%.2f) ind(h=%d a=%.2f)",
-                                                              k, bk,
-                                                              lk ? (int)lk.hidden : 0, lk ? lk.alpha : 0.0f,
-                                                              indk ? (int)indk.hidden : 0, indk ? indk.alpha : 0.0f);
-                                                    }
-                                                }
-                                            }
-                                            [stkK addObjectsFromArray:curK.subviews];
-                                        }
-                                    }
-                                } @catch (NSException *e) {}
-                            });
-                        }
-                    }
+                                        
                 }
             });
             dispatch_resume(sFolderCloseGuard);
-        } else { sFolderClosing = NO; if (sProbeLog) RDLog(@"FOLDER-CLOSE-ARM on=0 (guard-alloc-fail)"); }}
+        } else { sFolderClosing = NO;  }}
 
 // v2.0.8: 关闭保护提前到「关闭起始」武装（见 MKArmFolderCloseGuard 注释）。
 // SBFolderController 是文件夹 VC，-viewWillDisappear: 在关闭动画【起始】(文件夹仍在窗口内、
@@ -4432,7 +4201,7 @@ static void MKArmFolderCloseGuard(void) {
 - (void)viewWillDisappear:(BOOL)animated {
     %orig;
     if (sFolderOpen) {
-        if (sProbeLog) RDLog(@"FOLDER-CLOSE-ARM on=1 (vc)");
+        
         MKArmFolderCloseGuard();
     }
 }
@@ -4452,7 +4221,7 @@ static void MKArmFolderCloseGuard(void) {
         sLastFolderOpenTS = now;
         sFolderOpen = YES;
         sFolderClosing = NO;  // v2.0.3: 开文件夹即退出关动画窗口，避免上一轮关闭的 sFolderClosing 残留误触发诊断
-        if (sDebugLog) RDLog(@"FOLDER OPEN: SBFolderView appeared in window");
+        
         // v1.6.53: 立即刷新 —— 文件夹打开瞬间标签与指示器会重叠；
         // 0.4s 去重已防止同一打开事件多次触发，这里再排一次异步刷新即可。
         // 布局动画期间 layoutSubviews 会重新校正指示器位置，无需再额外 300ms 延迟。
@@ -4473,7 +4242,7 @@ static void MKArmFolderCloseGuard(void) {
     } else if (!me.window) {
         sFolderOpen = NO;
         MKArmFolderCloseGuard();  // v2.0.8: 关闭保护提前到关闭起始武装（见函数注释）
-        if (sProbeLog) RDLog(@"FOLDER-CLOSE-ARM on=1");  // v2.0.5 探针 A：确认关文件夹窗口是否真的被置位
+          // v2.0.5 探针 A：确认关文件夹窗口是否真的被置位
 
         // v1.6.86: 动画关闭瞬间先把所有「有指示器」的图标 label 强制隐藏（含文件夹内层运行 App），
         // 防止系统把 label 复显一帧。与源头级 swizzle 形成双保险，杜绝缩回动画里名称闪现。
@@ -4579,7 +4348,7 @@ static void MKArmFolderCloseGuard(void) {
 - (void)scrollViewDidEndDecelerating:(id)scrollView {
     %orig;
     if (sInitDone) {
-        if (sDebugLog) RDLog(@"PAGE SCROLL: decelerating ended");
+        
         if (!sScrollRefreshScheduled) {
             sScrollRefreshScheduled = YES;
             UIView *me = (UIView *)self;
@@ -4605,7 +4374,7 @@ static void MKArmFolderCloseGuard(void) {
 - (void)scrollViewDidEndScrollingAnimation:(id)scrollView {
     %orig;
     if (sInitDone) {
-        if (sDebugLog) RDLog(@"PAGE SCROLL: animation ended");
+        
         if (!sScrollRefreshScheduled) {
             sScrollRefreshScheduled = YES;
             UIView *me = (UIView *)self;
@@ -4658,8 +4427,7 @@ static void MKApplyAppState(NSString *bid, BOOL runningNow, BOOL foreground) {
         int taskState = MKGetIntFromState(state, @"taskState");
         BOOL isForeground = MKGetBoolFromState(state, @"isForeground");
 
-        if (sDebugLog) RDLog(@"SBApp._noteProcess: %@ → isRunning=%d taskState=%d foreground=%d",
-              bid, isRunning, taskState, isForeground);
+        
 
         // FBProcessState.taskState: 2=Running, 3=Suspended → app alive
         // FBProcessState.taskState: 1=NotRunning/Dead → app exited
@@ -4697,8 +4465,7 @@ static void MKApplyAppState(NSString *bid, BOOL runningNow, BOOL foreground) {
         int taskState = MKGetIntFromState(internalState, @"taskState");
         BOOL isForeground = MKGetBoolFromState(internalState, @"isForeground");
 
-        if (sDebugLog) RDLog(@"SBApp._setInternalProcState: %@ → isRunning=%d taskState=%d foreground=%d",
-              bid, isRunning, taskState, isForeground);
+        
 
         BOOL isRunningNow = (isRunning || taskState == 2 || taskState == 3);
         // v1.6.31: 仅前台（用户打开/使用中）才进入 running set；纯后台被 iOS 拉起 foreground=0 不进集合。
@@ -4727,7 +4494,7 @@ static void MKApplyAppState(NSString *bid, BOOL runningNow, BOOL foreground) {
         NSString *bid = [self bundleIdentifier];
         if (!bid.length) return;
 
-        if (sDebugLog) RDLog(@"SBApp._setActivationState: %@ → state=%d", bid, state);
+        
 
         BOOL isForeground = (state == 2);
         BOOL isRunningNow = (state >= 1);
@@ -4786,7 +4553,7 @@ static void MKRefreshFolderIcons(void) {
             if (!dock) dock = MKFindDescendantView(w, @"SBDockView");
             if (dock) total += MKUpdateFolderIconsUnder(dock, ivCls);
         }
-        if (sDebugLog) RDLog(@"FOLDER-REFRESH: found %ld folder icon(s)", (long)total);
+        
     });
 }
 
@@ -4802,22 +4569,7 @@ static void MKRefreshFolderIcons(void) {
     %init;
 
     // v2.0.66.39: 启动日志彻底精简 —— 单行版本戳也收进 sDebugLog(诊断关时彻底零输出, 仅 @catch 异常仍可见); 多行改动清单同收进 sDebugLog。
-    if (sDebugLog) {
-        RDLog(@"======== RunningDotIndicator v2.0.66.72 loaded ========");
-        RDLog(@"======== RDBUILD v2.0.66.38: 物理位置判定补刀(MKLabelPhysicallyInDock)治「主屏 label 漂到 dock 位置显示(祖先链仍主屏)」的串名(前版 fctx 仅靠类名祖先链覆盖不到); + 收进 sDebugLog(生产安静); 行为零变化 ========");
-        RDLog(@"======== RDBUILD-NOTE v2.0.66.30: NEG-SETTEXT 最终捕获版(彻底无门控) ========");
-        RDLog(@"======== RDBUILD-NOTE v2.0.66.31: DOCK-RANDOM-FIX 根治 dock 随机串名 + 移除 1s 扫描定时器 ========");
-        RDLog(@"======== RDBUILD-NOTE v2.0.66.32: UNLOCK-NATIVE-CARRY 解锁即时 un-hide 原生携带 ========");
-        RDLog(@"======== RDBUILD-NOTE v2.0.66.33: 方案B 锁屏 VC 早期揭示(实机静默不装, 退化 .32) ========");
-        RDLog(@"======== RDBUILD-NOTE v2.0.66.34: CLEANUP 撤方案B 无效代码 ========");
-        RDLog(@"======== RDBUILD-NOTE v2.0.66.35: PERF-ZERO-ALLOC 热路径零分配 ========");
-        RDLog(@"======== RDBUILD-NOTE v2.0.66.36: 方案C 解锁精准救回个别指示器 ========");
-        RDLog(@"======== RDBUILD-NOTE v2.0.66.40: 旋转/尺寸变更失效 sDockFrame 缓存(防 dock 串名旋转后复发 + 过渡期误藏主屏标签) ========");
-        RDLog(@"======== RDBUILD-NOTE v2.0.66.41: IconColor 主色解析日志收进 sDebugLog 门控(诊断关时 rd_log.txt 不再漏记新 App 取色行) ========");
-        RDLog(@"======== RDBUILD-NOTE v2.0.66.44: MKBuildPathCache/MKSyncFromSBAppCtrl/MKDelayedInit 共 10 处启动日志收进 sDebugLog 门控(诊断关时 rd_log.txt 彻底零输出, 仅 @catch 异常仍可见); 启动版本戳更新为 v2.0.66.44; 行为零变化 ========");
-        RDLog(@"======== RDBUILD-NOTE v2.0.66.46: dock 串名【结构性缺口】修复 —— v2.0.66.31 的 layoutSubviews 每帧藏名(历史上「一出现就藏」的真身)只认祖先链 MKLabelInDock, 仅覆盖形态A(主屏 iconView 被回收去渲染 dock 槽、确在 dock 子树内); 对形态B(label 仅【物理位置】漂到 dock 纵带、视图层级仍挂主屏)整段跳过 —— 这才是 .38~.45 一路补丁仍复发的真因(父容器移动不调 label 任何 setter, 故 .38/.42 的 setter 钩子同样抓不到)。本版新增 MKDockStrayHide(祖先链 OR 物理位置 二合一), 接入两处: layoutSubviews 每帧即时拦截(找回一出现就藏) + MKRefreshAllIcons 的 BFS 内联兜底(置于 MKUpdate 之后, 零额外遍历)。同时整体删除 v2.0.66.45 的 MKDockBandSweep(47 行独立全树扫描; 其 iconView midY 前置筛选恰好把形态B筛掉 = 实为无效防线)及其 0.5s 延迟调用; 解锁静止期兜底改为 t=1.3s 复用全量刷新。净效果: 覆盖面变宽, 事件时机少一趟全树 BFS 与一次 dock 帧树查找, 待机功耗仍为零 ========");
-        RDLog(@"======== RDBUILD-NOTE v2.0.66.47: dock 串名【8 版失败的机械缺口】闭合 + 案发瞬间装眼睛。真因: MKDockStrayHide 首行 UIView *lbl = MKGetCachedLabel(iv); if (!lbl) return dockCtx; 为零埋点静默退出, 而 MKGetCachedLabel 返回 nil 的主因正是 owner != 当前 iconView —— 这【就是串名的定义本身】。于是形成逆向门控: 不串名则取得到 label、三层 dock 防线(.31 祖先链 / .38 物理坐标 / .46 二合一)正常跑; 一旦真串名则 label 被丢弃、三层防线【同时静默失效】, 且日志一片空白 = 案发瞬间物理上不可观测。逐版本核查证实本函数内 label = nil 恒为 2 处(.31/.37/.38/.40/.43/.45/.46 全部 =2), 缺口自 .31 出生第一天即存在, 八版一直在扩大【什么算 dock】, 从没人碰过【拿不到 label 就返回】这一条。本版两项改动: (1) 新增 MKGetCachedLabelEx(iv, outForeign) 把被丢弃的案发 label 带出来, 签名不变的 MKGetCachedLabel 降为薄包装, 既有 33 个调用点一行不动、行为完全等价; (2) !lbl 分支改 default-deny —— 严格【容器约束】(仅 dockCtx 成立才动手, 绝不用只比 midY 不比 X 的物理纵带, 以免波及主屏底行/文件夹/Spotlight), 命中即按 v2.0.65 配方【清 kMKLabelIconKey + kMKLabelBidKey 两枚过期键 + 藏】(只藏不清键会每帧重入永不收敛, 反不如 v2.0.65), 并打 kMKDockPinnedKey 防其合法属主同帧复显造成互搏闪烁; 解钉唯一落点在 MKGetCachedLabelEx 的合法绑定分支(对称 restore, 名字绝不永久消失)。另新增 DOCK-FOREIGN 埋点, 刻意【不挂 sDebugLog 门控】(串名随机复现、单次验证周期以小时计, 挂开关等于继续抓不到), 仅异常态进入 + 硬限流 20 条。失败模式退化为 dock 名字不显示, 而 dock 本就无名称 = 用户零感知。不新增 hook、不碰 sDockFrame、不加第 13 处藏名逻辑; 正常帧仅多一次关联对象读, 功耗零变化。边界: 止血不治本, 文件夹缩略图闪现与负一屏(卡在 label 压根无 owner 键的 gate 1)本版一个字都治不了 ========");
-    }
+    
     if (MKIsDisabled()) {
         RDLog(@"DISABLED at load; exiting ctor.");
         return;
@@ -4865,14 +4617,14 @@ static void MKRefreshFolderIcons(void) {
                     }
                     if (!hasFolder) {
                         sFolderOpen = NO;
-                        if (sDebugLog) RDLog(@"FOLDER-WATCHDOG(active): reset sFolderOpen=NO");
+                        
                     }
                 }
                 if (!sLocked) return;   // 非锁屏态（如普通切 App 回前台），不动
                 sLocked = NO;
                 // v2.0.66.32: 解锁即时 un-hide(原生携带), 圆点随原生锁屏揭开与主屏一同揭示, 统一解锁动画。
                 MKUnlockRestore();
-                if (sDebugLog) RDLog(@"UNLOCK(active): instant reveal restore");
+                
             } @catch (NSException *e) {}
         }];
 
@@ -4899,7 +4651,7 @@ static void MKRefreshFolderIcons(void) {
             usingBlock:^(NSNotification *note){
             @try {
                 NSString *bid = MKBidFromNote(note);
-                if (sDebugLog) RDLog(@"EXIT NOTE: %@ bid=%@", nm, bid ?: @"(nil)"); // v2.0.66.37: 收进 sDebugLog(事件追踪, 关掉即安静; 实际退出处理不依赖此日志)
+                 // v2.0.66.37: 收进 sDebugLog(事件追踪, 关掉即安静; 实际退出处理不依赖此日志)
                 if (!bid) return;
                 MKRemoveFromRunningSet(bid);
                 if (sInitDone) MKOnStateChange(bid, NO, NO);
@@ -4910,7 +4662,7 @@ static void MKRefreshFolderIcons(void) {
         if (obs) [sLifecycleObservers addObject:obs];
     }
 
-    if (sDebugLog) RDLog(@"======== ctor done (heavy work pending) ========"); // v2.0.66.37: 收进 sDebugLog
+     // v2.0.66.37: 收进 sDebugLog
 
     // ─── 延迟 15 秒执行重量级初始化 ──────────
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC),

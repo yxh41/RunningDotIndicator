@@ -35,7 +35,7 @@ RunningDotIndicator_FILES = \
 	MKConfig.m \
 	MKIndicatorDotView.m
 
-RunningDotIndicator_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-but-set-variable
+RunningDotIndicator_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-but-set-variable -Wno-unused-function
 RunningDotIndicator_FRAMEWORKS = UIKit Foundation
 RunningDotIndicator_PRIVATE_FRAMEWORKS = SpringBoard
 
