@@ -2424,7 +2424,20 @@ static void *MKResolveOrigIMP(NSMutableDictionary *byClass, CFMutableDictionaryR
 static NSString *MKShouldHideLabel(UIView *label, NSString *bid, BOOL *outMapOnly) {
     NSString *mapBid = (sHiddenLabelToBid ? [sHiddenLabelToBid objectForKey:(id)label] : nil);
     BOOL hasBid = (bid && sHiddenBids && [sHiddenBids containsObject:bid]);
-    BOOL inMap  = (mapBid.length && sHiddenBids && [sHiddenBids containsObject:mapBid]);
+    BOOL inMap  = NO;
+    if (mapBid.length && sHiddenBids && [sHiddenBids containsObject:mapBid]) {
+        // v2.0.66.63: label 跨 icon 复用残留弱键表旧 runningBid 兜底校验。
+        // 对象复用(同一 label 跨 icon 换内容、不释放)时弱键表 key 不自动移除, 旧 runningBid 残留;
+        // 仅当 label 当前实时解析 bid 仍 == mapBid(确属同一 app)才采信, 否则清残留、不误藏主屏非运行名。
+        if (bid && [bid isEqualToString:mapBid]) {
+            inMap = YES;
+        } else {
+            static int s63stale = 0;
+            if (s63stale < 20) { s63stale++; RDLog(@"MK63-STALE-MAP stale=%@ cur=%@", mapBid, bid); }
+            if (sHiddenLabelToBid) [sHiddenLabelToBid removeObjectForKey:(id)label];
+            mapBid = nil;
+        }
+    }
     if (hasBid || inMap) {
         NSString *useBid = hasBid ? bid : mapBid;
         MKAssocLabelBid(label, useBid);
@@ -2439,7 +2452,7 @@ static NSString *MKShouldHideLabel(UIView *label, NSString *bid, BOOL *outMapOnl
 static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
     @try {
         NSString *bid = MKLabelToBid((UIView *)self);
-        // v2.0.66.62: 负一屏(TODAY)揭示探针(隐藏路径) —— 见 MKSetAlphaHook 同款说明。
+        // v2.0.66.63: 负一屏(TODAY)揭示探针(隐藏路径) —— 见 MKSetAlphaHook 同款说明。
         NSString *mkFctxH = MKForeignContainerCtx((UIView *)self);
         if (mkFctxH && [mkFctxH isEqualToString:@"TODAY"] && sProbeLog) {
             static int sNeg1h = 0;
@@ -2539,7 +2552,7 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
             }
         }
         BOOL mkRunningHide = (bid.length && MKIsAppRunning(bid));
-        // v2.0.66.62: 负一屏(TODAY)揭示探针 —— 现有 MKStrayNameProbe 覆盖负一屏但 0 命中, 改在揭示入口直接 dump 定位③真正漏点(限流20, 挂 sProbeLog)。
+        // v2.0.66.63: 负一屏(TODAY)揭示探针 —— 现有 MKStrayNameProbe 覆盖负一屏但 0 命中, 改在揭示入口直接 dump 定位③真正漏点(限流20, 挂 sProbeLog)。
         NSString *mkFctxN = MKForeignContainerCtx((UIView *)self);
         if (mkFctxN && [mkFctxN isEqualToString:@"TODAY"] && sProbeLog) {
             static int sNeg1a = 0;
@@ -2677,7 +2690,7 @@ static void MKLabelDidMoveToWindowHook(id self, SEL _cmd) {
             // 在「进 window 创建点」即强制藏名, 先于系统任何显示路径, 灭亚秒级闪现; 此前仅 MKStrayNameProbe 的 if(ctx)
             // 于 setHidden/setAlpha/1s 轮询时藏, 漏掉「直接 addSubview 进已可见父视图」(不调 setHidden/setAlpha)的显形路径。
             NSString *fctx = MKForeignContainerCtx(lbl);
-            // v2.0.66.62: 负一屏(TODAY)揭示探针(进 window 路径) —— 见 MKSetAlphaHook 同款说明。
+            // v2.0.66.63: 负一屏(TODAY)揭示探针(进 window 路径) —— 见 MKSetAlphaHook 同款说明。
             if (fctx && [fctx isEqualToString:@"TODAY"] && sProbeLog) {
                 static int sNeg1w = 0;
                 if (sNeg1w < 20) { sNeg1w++; RDLog(@"NEG1-WINDOW cls=%@ bid=%@ alpha=%.2f hidden=%d", object_getClass(lbl), MKLabelToBid(lbl), (float)lbl.alpha, lbl.hidden); }
@@ -2792,7 +2805,7 @@ static NSString *MKFolderThumbBid(UIView *v) {
     } @catch (NSException *e) {}
     return nil;
 }
-// v2.0.66.62: MKLabelInOpenFolder 随 .61 关窗钳制一并回退 —— 无引用, 留此注释避免 -Wunused-function; 该判定在视图回收瞬态不可靠(见上 MKSetIconLabelAlphaHook 回退说明)。
+// v2.0.66.63: MKLabelInOpenFolder 随 .61 关窗钳制一并回退 —— 无引用, 留此注释避免 -Wunused-function; 该判定在视图回收瞬态不可靠(见上 MKSetIconLabelAlphaHook 回退说明)。
 
 // v2.0.40: 堵「关文件夹 settle 末拍名称闪现」的 alpha 回弹入口。
 // iOS 在缩回动画收尾把 label 的 alpha 经 SBIconView.setIconLabelAlpha: 专用 setter 补回 1.00，
@@ -2872,7 +2885,7 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
         //   改用 sRunningSet(运行检测即入)作钉藏判据, 与可靠 bid 配合, 在揭示入口立即压制(覆盖文件夹缩略图/负一屏/主屏)。
         BOOL running = (bid.length && sRunningSet && [sRunningSet containsObject:bid]);
         BOOL mustHide = hasBid || running;
-        // v2.0.66.62: 负一屏(TODAY)揭示探针(SBIconView 级) —— 见 MKSetAlphaHook 同款说明。
+        // v2.0.66.63: 负一屏(TODAY)揭示探针(SBIconView 级) —— 见 MKSetAlphaHook 同款说明。
         NSString *mkFctxC = MKForeignContainerCtx((UIView *)self);
         if (mkFctxC && [mkFctxC isEqualToString:@"TODAY"] && sProbeLog) {
             static int sNeg1c = 0;
@@ -2944,7 +2957,7 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
                 }
             }
         }
-        // v2.0.66.62: 回退 .61 关窗 alpha 钳制 —— sFolderClosing 全局标志 + 关窗视图回收瞬态使 MKLabelInOpenFolder 误中主屏 label,
+        // v2.0.66.63: 回退 .61 关窗 alpha 钳制 —— sFolderClosing 全局标志 + 关窗视图回收瞬态使 MKLabelInOpenFolder 误中主屏 label,
         // 导致主屏名被藏(滑屏才复显) + 小黄点错位(removeAllAnimations 杀 β点布局动画); 且未根治闪(①). 同 Line B 路线失败, 不再走全局标志钳制.
     } @catch (NSException *e) {}
     void(*orig)(id,SEL,CGFloat) = (void(*)(id,SEL,CGFloat))MKResolveOrigIMP(sOrigSetIconLabelAlphaByClass, sOrigSetIconLabelAlphaByClassCF, self);
@@ -3337,7 +3350,7 @@ static void MKUpdate(SBIconView *self) {
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:fBid];
                 if (sHiddenBids) [sHiddenBids addObject:fBid]; // v1.6.85: 文件夹合成 key 也要藏名
-                if (sDebugLog) RDLog(@"FICON-CREATE v2.0.66.62: %@ rep=%@ fixed=%d container=%s frame=%@", fBid, rep, fixedColor, fContainerCls, NSStringFromCGRect(indicatorFrame));
+                if (sDebugLog) RDLog(@"FICON-CREATE v2.0.66.63: %@ rep=%@ fixed=%d container=%s frame=%@", fBid, rep, fixedColor, fContainerCls, NSStringFromCGRect(indicatorFrame));
                 MKFadeInFolderIndicatorIfClosing(indicator); // v2.0.43: 关窗期淡入, 消除缩略图点瞬现
             } else {
                 if (indicator.superview != overlay) {
@@ -3616,7 +3629,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.66.62: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.66.63: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
             // v2.0.66.2: 顺带修主屏 beta 小黄点回收残留(见 MKGetCachedBid 回收清理)
@@ -5409,20 +5422,20 @@ static void MKProbeSelfCheck(void) {
         Class cIcon = NSClassFromString(@"SBIcon");
         Class cLLV  = NSClassFromString(@"SBIconLegibilityLabelView");
         Class cIV   = NSClassFromString(@"SBIconView");
-        RDLog(@"PROBE-SELFCHECK v2.0.66.62 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.63 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
               NSStringFromClass(cIcon),
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayName)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayNameForLocation:)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleID)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleIdentifier)] : 0);
-        RDLog(@"PROBE-SELFCHECK v2.0.66.62 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.63 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
               NSStringFromClass(cLLV),
               cLLV ? [cLLV instancesRespondToSelector:@selector(setText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setString:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setAttributedText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(_updateLabelImage)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(legibilityLabel)] : 0);
-        RDLog(@"PROBE-SELFCHECK v2.0.66.62 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.63 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
               NSStringFromClass(cIV),
               cIV ? [cIV instancesRespondToSelector:@selector(_updateLabel)] : 0,
               cIV ? [cIV instancesRespondToSelector:@selector(setIconLabelAlpha:)] : 0,
@@ -5519,7 +5532,7 @@ static void MKRefreshFolderIcons(void) {
 
     // v2.0.66.39: 启动日志彻底精简 —— 单行版本戳也收进 sDebugLog(诊断关时彻底零输出, 仅 @catch 异常仍可见); 多行改动清单同收进 sDebugLog。
     if (sDebugLog) {
-        RDLog(@"======== RunningDotIndicator v2.0.66.62 loaded ========");
+        RDLog(@"======== RunningDotIndicator v2.0.66.63 loaded ========");
         RDLog(@"======== RDBUILD v2.0.66.38: 物理位置判定补刀(MKLabelPhysicallyInDock)治「主屏 label 漂到 dock 位置显示(祖先链仍主屏)」的串名(前版 fctx 仅靠类名祖先链覆盖不到); + 收进 sDebugLog(生产安静); 行为零变化 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.30: NEG-SETTEXT 最终捕获版(彻底无门控) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.31: DOCK-RANDOM-FIX 根治 dock 随机串名 + 移除 1s 扫描定时器 ========");
