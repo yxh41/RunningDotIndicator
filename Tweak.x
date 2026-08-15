@@ -95,8 +95,8 @@
 #include <string.h>          // v2.0.22: strcmp 用于无分配类名比较（MKIsFolderIcon 每帧热路径）
 #include <objc/runtime.h>
 
-// ─── RDLog 前向声明（避免 C99 "use before declaration" 错误）──
-static void RDLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
+// ─── RDLog 已改为编译期 no-op 宏（.71 起彻底去掉诊断/探针输出；参数不求值，故 (void*)owner 等 ARC 桥接错误一并消失；残留 sDebugLog/sProbeLog 门控与探针函数体均变为 inert）──
+#define RDLog(fmt, ...) ((void)0)
 
 // libproc 函数声明（iOS 运行时存在，但 iPhoneOS SDK 不含此头文件）
 extern int proc_listallpids(void *buffer, int buffersize);
@@ -220,7 +220,6 @@ static void MKLabelDidMoveToWindowHook(id self, SEL _cmd);  // v2.0.7: 创建点
 static void MKArmFolderCloseGuard(void);  // v2.0.8: 关闭保护(缩回动画进行中即武装 guard)；SBFolderView/-didMoveToWindow 与 SBFolderController/-viewWillDisappear 共调用
 static void MKDetachBetaOnce(UIView *iconView);     // v2.0.30: beta 小黄点脱离到 iconView（仅当仍在 label 内，防每帧抖动）
 static void MKRestoreBetaOrphan(UIView *iconView);  // v2.0.30: 退出/恢复 移除我们脱离的孤儿点（系统自建原 label 点）
-static void MKSafeSnapshotProbe(UIView *snapView);  // v2.0.10: 快照截图【前】探针——扫子树里「该藏却可见」的 label，打 SNAP-PRE-NAME，定位「截图带名飞回」漏点
 static UIView *MKContainerForIconView(UIView *iv) {
     if (!iv) return nil;
     UIView *anc = iv.superview;
@@ -1463,27 +1462,7 @@ static UIColor *MKCachedIconColorForBundleID(NSString *bid) {
     return [[MKConfig sharedConfig] color];
 }
 
-// ─── 文件日志 ────────────────────────────────────────────────
-static void RDLog(NSString *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
-    va_end(args);
-    NSLog(@"[RD] %@", msg);
-    NSString *path = @"/var/mobile/Documents/rd_log.txt";
-    @try {
-        NSString *ts = [NSDate date].description;
-        NSString *line = [NSString stringWithFormat:@"%@ %@\n", ts, msg];
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-        if (fh) {
-            [fh seekToEndOfFile];
-            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-            [fh closeFile];
-        } else {
-            [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        }
-    } @catch (NSException *e) {}
-}
+// ─── 文件日志（RDLog 已统一改为 no-op 宏，见文件顶部；此函数定义已移除，运行期不再写任何诊断到 rd_log.txt）──
 
 // ─── 限流日志（同一 bundleID 最多记录 5 次 RUNNING）──────────────
 static void RDLogRunning(NSString *bid) {
@@ -2232,31 +2211,7 @@ static BOOL MKLabelPhysicallyInDock(UIView *label) {
 // 若与 dock 共用一个计数器, 开一次文件夹就能把配额吃光 —— 等 dock 串名真正发生时早已限流,
 // 结果与「没装埋点」完全等价。故: dock 上下文(真正要抓的稀有事件)独占 20 条且无门控必达;
 // 非 dock 上下文仅作参考, 收进 sDebugLog 且只给 5 条, 绝不挤占 dock 配额。
-static void MKDockForeignProbe(SBIconView *iv, UIView *foreign, BOOL dockCtx, BOOL acted) {
-    static int sDockForeignLogs = 0;
-    static int sOtherForeignLogs = 0;
-    if (dockCtx) {
-        if (sDockForeignLogs >= 20) return;
-        sDockForeignLogs++;
-    } else {
-        if (!sDebugLog || sOtherForeignLogs >= 5) return;
-        sOtherForeignLogs++;
-    }
-    @try {
-        UIView *owner    = objc_getAssociatedObject(foreign, &kMKLabelIconKey);
-        NSString *ivBid  = objc_getAssociatedObject(iv, &kMKBidKey);
-        NSString *ownBid = (owner ? objc_getAssociatedObject(owner, &kMKBidKey) : nil);
-        NSString *lblBid = objc_getAssociatedObject(foreign, &kMKLabelBidKey);
-        CGRect f = foreign.frame;
-        RDLog(@"DOCK-FOREIGN[%d]: acted=%d dockCtx=%d ivBid=%@ lblCls=%s lblBid=%@ owner=%p ownerBid=%@ h=%d a=%.2f frame={%.1f,%.1f,%.1f,%.1f} ivSup=%s",
-              (dockCtx ? sDockForeignLogs : sOtherForeignLogs), (int)acted, (int)dockCtx,
-              ivBid ?: @"?", class_getName([foreign class]), lblBid ?: @"?",
-              (void *)owner, ownBid ?: @"?",
-              (int)foreign.hidden, (float)foreign.alpha,
-              (float)f.origin.x, (float)f.origin.y, (float)f.size.width, (float)f.size.height,
-              iv.superview ? class_getName([iv.superview class]) : "nil");
-    } @catch (NSException *e) {}
-}
+// ─── MKDockForeignProbe (dock 串名专用埋点) 已移除 (.71)：RDLog 改为 no-op 后无诊断输出 ───
 
 static BOOL MKDockStrayHide(SBIconView *iv, BOOL *outStray) {
     if (outStray) *outStray = NO;
@@ -2292,7 +2247,6 @@ static BOOL MKDockStrayHide(SBIconView *iv, BOOL *outStray) {
             acted = YES;
             if (outStray) *outStray = YES;
         }
-        if (foreign) MKDockForeignProbe(iv, foreign, dockCtx, acted);
         return dockCtx;
     }
     BOOL hit = dockCtx;
@@ -4263,35 +4217,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
 // 飞回主屏时显示的是这张 bitmap 而非活 label —— 完全绕过 setHidden/MKLabelDidMoveToWindowHook/让步门控所有拦截。
 // 在截图【之前】扫 snapView 子树里「该藏却可见」的 label，有即打 SNAP-PRE-NAME（受 sProbeLog 门控）。
 // 纯诊断、不改行为；release/debug 都不藏名，只报。若命中，v2.0.10+ 真修法：截图前先藏、截图后复原。
-static void MKSafeSnapshotProbe(UIView *snapView) {
-    if (!snapView || !sDebugLog || !sHiddenBids || sHiddenBids.count == 0) return;
-    @try {
-        __block int hit = 0;
-        NSMutableArray *st = [NSMutableArray arrayWithObject:snapView];
-        while (st.count > 0 && hit < 8) {
-            UIView *c = [st lastObject]; [st removeLastObject];
-            // label-like 判定：UILabel 类 或 类名含 "Label"
-            BOOL isL = [c isKindOfClass:[UILabel class]] ||
-                        (strstr(class_getName([c class]), "Label") != NULL);
-            if (isL && !c.hidden && c.alpha > 0.0f) {
-                // 该 label 所属图标 bid（用几何反解，不依赖关联键）
-                NSString *b = MKLabelToBid(c);
-                BOOL mustHide = (b.length && [sHiddenBids containsObject:b]);
-                if (!mustHide && sHiddenLabelToBid) {
-                    NSString *mb = [sHiddenLabelToBid objectForKey:(id)c];
-                    if (mb.length && [sHiddenBids containsObject:mb]) { mustHide = YES; b = mb; }
-                }
-                if (mustHide) {
-                    hit++;
-                    RDLog(@"SNAP-PRE-NAME: cls=%@ bid=%@ frame=%@ snapCls=%@",
-                          NSStringFromClass([c class]), b, NSStringFromCGRect(c.frame),
-                          NSStringFromClass([snapView class]));
-                }
-            }
-            [st addObjectsFromArray:c.subviews];
-        }
-    } @catch (NSException *e) {}
-}
+// ─── MKSafeSnapshotProbe (截图前 SNAP-PRE-NAME 探针) 已移除 (.71) ───
 
 // v2.0.66.43: 关窗守卫遇到 SBFolderIcon 时, 遍历子树对运行中 App 的 label 强制藏名。
 // 补 MKProbeFolderThumb(纯诊断, 门控 sDebugLog) 不藏名的缺口: 缩略图迷你图标不是 SBIconView,
@@ -4336,32 +4262,7 @@ static void MKHideFolderThumbLabels(UIView *folderIcon) {
 // 主屏藏名 hook 与现有 walker 都没覆盖 -> 里面 app 名称/我们的指示器几率性「闪一下」。
 // 此函数 dump 其子树每个后代: class / 可见性(hidden/alpha/layer.opacity) / 是否带我们的指示器(tag==kDotTag 或类名含 Indicator),
 // 用以定位泄漏点(是活 SBIconView 还是合成图、名/指示器哪个在闪)。有界(最多 48 行)防刷屏。
-static void MKProbeFolderThumb(UIView *folderIcon) {
-    if (!sDebugLog || !folderIcon) return;
-    if (sThumbLogCount >= 48) return;
-    NSMutableArray *ts = [NSMutableArray arrayWithArray:folderIcon.subviews];
-    int tdepth = 0;
-    while (ts.count > 0 && tdepth < 8) {
-        NSMutableArray *nxt = [NSMutableArray array];
-        for (UIView *tv in ts) {
-            Class tcls = object_getClass(tv);
-            const char *tn = class_getName(tcls);
-            BOOL isLabel  = (strstr(tn, "Label") != NULL);
-            BOOL isOurInd = (tv.tag == kDotTag) || (strstr(tn, "Indicator") != NULL);
-            BOOL vis = (!tv.hidden && tv.alpha > 0.0f) || (tv.layer.opacity > 0.0f);
-            if (isLabel || isOurInd || vis) {
-                sThumbLogCount++;
-                RDLog(@"THUMB-CHILD sup=%@ cls=%@ h=%d a=%.2f op=%.2f label=%d ourInd=%d frm=%@",
-                      NSStringFromClass(object_getClass(folderIcon)), NSStringFromClass(tcls),
-                      (int)tv.hidden, (float)tv.alpha, (float)tv.layer.opacity,
-                      isLabel?1:0, isOurInd?1:0, NSStringFromCGRect(tv.frame));
-                if (sThumbLogCount >= 48) return;
-            }
-            [nxt addObjectsFromArray:tv.subviews];
-        }
-        ts = nxt; tdepth++;
-    }
-}
+// ─── MKProbeFolderThumb (缩略图 THUMB-CHILD 探针) 已移除 (.71) ───
 
 // v2.0.43: 关文件夹过渡窗(sFolderClosing)内创建/重定位「文件夹缩略图运行点」时若直接 alpha=1 显,
 // 会随缩略图缩回「啪」地瞬现(用户报的 ① 缩略图点闪)。改为淡入(alpha 0->1, 0.28s easeOut),
@@ -4421,7 +4322,6 @@ static void MKArmFolderCloseGuard(void) {
                             BOOL isFolderIcon = (strcmp(curName, "SBFolderIcon") == 0 || strcmp(curName, "SBIconFolderIcon") == 0);
                             if (isFolderIcon) {
                                 MKHideFolderThumbLabels(cur); // v2.0.66.43: 每 tick 对缩略图子树运行中 App label 强制藏名(补 CAAnimation 路径, 缩略图迷你图标非 SBIconView 原不覆盖)
-                                MKProbeFolderThumb(cur); // v2.0.42: 抓缩略图迷你图标(名/指示器)闪现
                             } else if (ivCls2 && [cur isKindOfClass:ivCls2]) {
                                 SBIconView *iv = (SBIconView *)cur;
                                 NSString *b = MKGetCachedBid(iv);
@@ -4475,7 +4375,6 @@ static void MKArmFolderCloseGuard(void) {
                                     const char *curName3 = class_getName(object_getClass(cur));
                                     BOOL isFolderIcon3 = (strcmp(curName3, "SBFolderIcon") == 0 || strcmp(curName3, "SBIconFolderIcon") == 0);
                                     if (isFolderIcon3) {
-                                        MKProbeFolderThumb(cur); // v2.0.42
                                     } else if (ivCls3 && [cur isKindOfClass:ivCls3]) {
                                         SBIconView *iv = (SBIconView *)cur;
                                         NSString *b = MKGetCachedBid(iv);
@@ -4659,12 +4558,10 @@ static void MKArmFolderCloseGuard(void) {
 %hook UIView
 
 - (UIView *)snapshotViewAfterScreenUpdates:(BOOL)afterUpdates {
-    MKSafeSnapshotProbe((UIView *)self);
     return %orig;
 }
 
 - (UIView *)resizableSnapshotViewFromRect:(CGRect)rect afterScreenUpdates:(BOOL)afterUpdates withCapInsets:(UIEdgeInsets)capInsets {
-    MKSafeSnapshotProbe((UIView *)self);
     return %orig;
 }
 
@@ -4914,7 +4811,7 @@ static void MKRefreshFolderIcons(void) {
 
     // v2.0.66.39: 启动日志彻底精简 —— 单行版本戳也收进 sDebugLog(诊断关时彻底零输出, 仅 @catch 异常仍可见); 多行改动清单同收进 sDebugLog。
     if (sDebugLog) {
-        RDLog(@"======== RunningDotIndicator v2.0.66.47 loaded ========");
+        RDLog(@"======== RunningDotIndicator v2.0.66.71 loaded ========");
         RDLog(@"======== RDBUILD v2.0.66.38: 物理位置判定补刀(MKLabelPhysicallyInDock)治「主屏 label 漂到 dock 位置显示(祖先链仍主屏)」的串名(前版 fctx 仅靠类名祖先链覆盖不到); + 收进 sDebugLog(生产安静); 行为零变化 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.30: NEG-SETTEXT 最终捕获版(彻底无门控) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.31: DOCK-RANDOM-FIX 根治 dock 随机串名 + 移除 1s 扫描定时器 ========");
