@@ -1469,26 +1469,20 @@ static UIColor *MKCachedIconColorForBundleID(NSString *bid) {
 
 // ─── 文件日志 ────────────────────────────────────────────────
 static void RDLog(NSString *fmt, ...) {
-    (void)fmt; // v2.0.66.69: 暂定最终版 —— 诊断/探针全关闭, RDLog 退化为 no-op(保留调用点规避 -Werror 未用变量)
+    (void)fmt; // v2.0.66.70: 行为回退 .47(瞬时藏); 诊断/探针调用点全部保留(本构建 RDLog 仍 no-op, 需要时再启用).
 }
 
-// ─── 集中渐隐藏名（v2.0.66.69）────────────────────
-// 家屏/退回桌面：0.22s 平滑淡出；文件夹缩略图不走此 helper(改 .47 瞬时钉死, 见各调用点).
+// ─── 集中藏名（回退 v2.0.66.69 → .47 行为：瞬时钉死, 无渐隐）──────────────────
+// 家屏/退回桌面/文件夹缩略图 统一瞬时藏: layer.opacity=0 + layer.hidden=YES + removeAllAnimations。
 // 关键约束: 只动 lbl.layer.opacity/layer.hidden 底层, 绝不通 UIView.alpha/UIView.hidden setter(避免重入 swizzle 递归致注销).
-// 无"渐隐锁": 每次调用都 removeAllAnimations + 重新淡出(幂等). 锁会导致 iOS reveal(经 setAlpha:/setIconLabelAlpha: 回调)被跳过、
-//   无法杀 iOS 自身 reveal CAAnimation => 名被"运行器再见渐入"显回(.68 回归). 去锁后 reveal 即被 removeAllAnimations 杀掉并重新淡出.
+// 无"渐隐锁"、无 animateWithDuration: .68 的 0.22s 渐隐 + kMKFadingKey 锁 导致 iOS reveal 回调被跳过、无法杀 iOS 自身 reveal CAAnimation
+//   => 名被"运行器再见渐入"显回(.68 回归). 回退 .47 后 reveal 一来即被 removeAllAnimations 杀掉并瞬时重钉, 名 stay 隐藏, 零闪现.
 static void MKHideLabelFade(UIView *lbl, CGFloat startA) {
     if (!lbl) return;
-    lbl.layer.hidden = NO;
-    if (startA <= 0.01f) { lbl.layer.opacity = 0.0f; lbl.layer.hidden = YES; return; } // 已隐, 直接 snap
+    (void)startA; // .47 瞬时藏, 不依赖起始 alpha
     [lbl.layer removeAllAnimations];
-    lbl.layer.opacity = startA;
-    [UIView animateWithDuration:0.22 delay:0.0
-        options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
-        animations:^{ lbl.layer.opacity = 0.0f; }
-        completion:^(BOOL mkFin){
-            if (mkFin) lbl.layer.hidden = YES;
-        }];
+    lbl.layer.opacity = 0.0f;
+    lbl.layer.hidden = YES;
 }
 
 // ─── 限流日志（同一 bundleID 最多记录 5 次 RUNNING）──────────────
@@ -2588,8 +2582,8 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
                     [mkRLbl.layer removeAllAnimations];
                 }
             } else {
-                // v2.0.66.69: 家屏/退回桌面 运行中 app 名平滑渐隐钉藏(唯一出口 MKHideLabelFade)
-                //   a 设为当前 label alpha 使 orig 不改 layer.opacity(渐隐动画不被 iOS 覆盖); layer.opacity 直写断 setter 重入递归.
+                // v2.0.66.70: 家屏/退回桌面 运行中 app 名瞬时钉死(.47 风格, 唯一出口 MKHideLabelFade)
+                //   a 保持当前 alpha(不改 orig 行为); layer.opacity/hidden 直写断 setter 重入递归(瞬时藏, 无动画).
                 CGFloat mkFadeStart = mkRLbl.alpha;
                 a = mkFadeStart;
                 MKAssocLabelBid(mkRLbl, bid);
@@ -2919,7 +2913,7 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
             UIView *rl = MKGetCachedLabel((SBIconView *)self);
             MKLogRevealAttempt([NSString stringWithFormat:@"(diag)setIconLabelAlpha: hasBid=%d run=%d", (int)hasBid, (int)running], a, bid, (rl ? object_getClass(rl) : object_getClass(self)));
         }
-        if (mustHide) {   // v2.0.66.69: 藏名 bid 成员或运行中 app: 家屏/退回桌面走集中渐隐(MKHideLabelFade); 文件夹缩略图瞬时钉死(.47)
+        if (mustHide) {   // v2.0.66.70: 藏名 bid 成员或运行中 app: 家屏/退回桌面/文件夹缩略图统一瞬时钉死(.47 风格, 唯一出口 MKHideLabelFade)
             CGFloat mkFadeStart = 0.0f;
             UIView *lbl = MKGetCachedLabel((SBIconView *)self);
             if (!lbl && [self respondsToSelector:@selector(labelView)]) {
@@ -2939,8 +2933,8 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
                     }
                     // 非运行 App 缩略图: 不改 a(orig 照常显名)
                 } else {
-                    // v2.0.66.69: 家屏/退回桌面 藏名 bid 成员或运行中 app —— 集中渐隐钉藏(唯一出口 MKHideLabelFade)
-                    //   a 设为当前 label alpha 使 orig 不改 layer.opacity(渐隐动画不被 iOS 覆盖); layer.opacity 直写断 setter 重入递归.
+                    // v2.0.66.70: 家屏/退回桌面 藏名 bid 成员或运行中 app —— 瞬时钉死(.47 风格, 唯一出口 MKHideLabelFade)
+                    //   a 保持当前 alpha(不改 orig 行为); layer.opacity/hidden 直写断 setter 重入递归(瞬时藏, 无动画).
                     mkFadeStart = lbl.alpha;
                     a = mkFadeStart;
                     if (bid.length) MKAssocLabelBid(lbl, bid);
@@ -5444,7 +5438,7 @@ static int sProbeHit = 0;  // v2.0.66.49 探针限流计数器（全局，所有
                 ((UIView *)lv).layer.hidden = YES;
                 [((UIView *)lv).layer removeAllAnimations];
             } else {
-                // v2.0.66.69: 主屏/退回桌面 —— 平滑淡出(removeAllAnimations 杀 iOS 自身 reveal CAAnimation, 防"运行器再见渐入"回弹)
+                // v2.0.66.70: 主屏/退回桌面 —— 瞬时钉死(.47 风格; removeAllAnimations 杀 iOS 自身 reveal CAAnimation, 防"运行器再见渐入"回弹)
                 CGFloat mkFadeStart = ((UIView *)lv).alpha;
                 MKHideLabelFade((UIView *)lv, mkFadeStart);
             }
@@ -5464,20 +5458,20 @@ static void MKProbeSelfCheck(void) {
         Class cIcon = NSClassFromString(@"SBIcon");
         Class cLLV  = NSClassFromString(@"SBIconLegibilityLabelView");
         Class cIV   = NSClassFromString(@"SBIconView");
-        RDLog(@"PROBE-SELFCHECK v2.0.66.69 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.70 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
               NSStringFromClass(cIcon),
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayName)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayNameForLocation:)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleID)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleIdentifier)] : 0);
-        RDLog(@"PROBE-SELFCHECK v2.0.66.69 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.70 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
               NSStringFromClass(cLLV),
               cLLV ? [cLLV instancesRespondToSelector:@selector(setText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setString:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setAttributedText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(_updateLabelImage)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(legibilityLabel)] : 0);
-        RDLog(@"PROBE-SELFCHECK v2.0.66.69 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.70 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
               NSStringFromClass(cIV),
               cIV ? [cIV instancesRespondToSelector:@selector(_updateLabel)] : 0,
               cIV ? [cIV instancesRespondToSelector:@selector(setIconLabelAlpha:)] : 0,
