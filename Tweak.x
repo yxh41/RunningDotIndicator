@@ -2581,7 +2581,7 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
             a = 0.0f;
         } else if (mkRunningHide) {
             // v2.0.66.54: 运行中 app 的 label 经 setAlpha:>0 复显时补刀钉藏
-            // v2.0.66.65 A2: 自驱动淡出(同 setIconLabelAlpha), 还原 .47 平滑渐隐藏, 不再瞬切空名
+            // v2.0.66.66 A2: 自驱动淡出(同 setIconLabelAlpha), 还原 .47 平滑渐隐藏, 不再瞬切空名
             CGFloat mkTargetA = a;
             a = 0.0f;
             if (mkFolderAnimOffA) {
@@ -2589,12 +2589,15 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
                 ((UIView *)self).alpha = 0.0f;
                 static int s65faA = 0; if (s65faA < 20) { s65faA++; RDLog(@"MK65-FOLDER-ANIM-OFF via=Alpha bid=%@", bid); }
             } else if (((UIView *)self).alpha > 0.01f) {
+                // v2.0.66.66: MRC 下 animate block 不 retain 捕获对象 → 图标飞出释放 label 致 use-after-free 注销; 手动 retain 保活 + 改 layer.opacity 避免重入 setAlpha hook
                 [((UIView *)self).layer removeAllAnimations];
                 CGFloat mkStartA = ((UIView *)self).alpha;
                 ((UIView *)self).alpha = mkStartA;
+                UIView *mkFadeV = (UIView *)self;
                 [UIView animateWithDuration:0.22 delay:0.0
                     options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
-                    animations:^{ ((UIView *)self).alpha = 0.0f; } completion:nil];
+                    animations:^{ mkFadeV.layer.opacity = 0.0f; }
+                    completion:^(BOOL mkFin){ (void)mkFin; }];
                 static int s65fadeA = 0;
                 if (s65fadeA < 20) { s65fadeA++; RDLog(@"MK65-FADE via=Alpha target=%.2f start=%.2f bid=%@", (float)mkTargetA, (float)mkStartA, bid); }
             } else {
@@ -2612,7 +2615,7 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
                 MKLogRevealAttempt(@"(diag)setAlpha:", inA, useBid, object_getClass(self));
         } else if (MKViewInFolderThumb((UIView *)self)) {
             // v2.0.66.1: 缩略图内运行 App 名称 label 经 setAlpha: 复显时兜底钉藏(仅运行 App + 仅缩略图上下文)
-            // v2.0.66.65 A2: 自驱动淡出(关窗中走 mkFolderAnimOffA 瞬钉)
+            // v2.0.66.66 A2: 自驱动淡出(关窗中走 mkFolderAnimOffA 瞬钉)
             NSString *fb = MKFolderThumbBid((UIView *)self);
             if (fb.length && sHiddenBids && [sHiddenBids containsObject:fb]) {
                 CGFloat mkTargetA = a;
@@ -2622,12 +2625,15 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
                     ((UIView *)self).alpha = 0.0f;
                     static int s65faT = 0; if (s65faT < 20) { s65faT++; RDLog(@"MK65-FOLDER-ANIM-OFF via=AlphaThumb bid=%@", fb); }
                 } else if (((UIView *)self).alpha > 0.01f) {
+                    // v2.0.66.66: 同 mkRunningHide —— MRC retain 保活 + layer.opacity 防重入/use-after-free
                     [((UIView *)self).layer removeAllAnimations];
                     CGFloat mkStartA = ((UIView *)self).alpha;
                     ((UIView *)self).alpha = mkStartA;
+                    UIView *mkFadeV = (UIView *)self;
                     [UIView animateWithDuration:0.22 delay:0.0
                         options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
-                        animations:^{ ((UIView *)self).alpha = 0.0f; } completion:nil];
+                        animations:^{ mkFadeV.layer.opacity = 0.0f; }
+                        completion:^(BOOL mkFin){ (void)mkFin; }];
                     static int s65fadeT = 0;
                     if (s65fadeT < 20) { s65fadeT++; RDLog(@"MK65-FADE via=AlphaThumb target=%.2f start=%.2f bid=%@", (float)mkTargetA, (float)mkStartA, fb); }
                 } else {
@@ -2638,7 +2644,7 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
             // v2.0.66.37: fctx 强制藏名补刀——foreign 容器(dock/负一屏/widget)名经 setAlpha:>0 复显
             // (同窗口同 superview, didMoveToWindow/didMoveToSuperview 不触发)时在此压住; 零分配判定, 主屏/文件夹不受影响。
             // v2.0.66.38: 另补物理位置判定(MKLabelPhysicallyInDock)覆盖「主屏 label 漂到 dock 位置显示(祖先链仍主屏)」的串名。
-            // v2.0.66.65: 仅 reveal(a>0)杀动画(防③/串名回弹), 渐隐(a≈0)保留动画; dock 无名为正常, 不影响。
+            // v2.0.66.66: 仅 reveal(a>0)杀动画(防③/串名回弹), 渐隐(a≈0)保留动画; dock 无名为正常, 不影响。
             CGFloat mkTargetA = a;
             a = 0.0f;
             if (mkTargetA > 0.01f) [((UIView *)self).layer removeAllAnimations];
@@ -2944,7 +2950,7 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
             MKLogRevealAttempt([NSString stringWithFormat:@"(diag)setIconLabelAlpha: hasBid=%d run=%d", (int)hasBid, (int)running], a, bid, (rl ? object_getClass(rl) : object_getClass(self)));
         }
         if (mustHide) {   // 藏名 bid 成员或运行中 app: 钉死 alpha=0 压制 iOS 经此 setter 补回的回弹
-            // v2.0.66.65 A2: 自驱动淡出(见 if(lbl) 块), 还原 .47 平滑渐隐藏; 此处 a 是 iOS 传入的【目标值】:
+            // v2.0.66.66 A2: 自驱动淡出(见 if(lbl) 块), 还原 .47 平滑渐隐藏; 此处 a 是 iOS 传入的【目标值】:
             //   a≈0 => iOS 意图【藏名(渐隐)】, 如运行 app 退回桌面时的淡出 => 仅压 a=0、让 orig 在动画上下文跑 => 平滑淡出(.47 手感);
             //   a>0 => iOS 意图【显名(reveal)】=> 杀动画并瞬藏, 防回弹闪(②/③ 揭示路径)。
             // 旧 blanket 无条件 removeAllAnimations+hidden=YES 把渐隐动画也杀了 => "直接空名称" 回归。
@@ -2965,13 +2971,14 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
                     lbl.alpha = 0.0f;
                     static int s65fa = 0; if (s65fa < 20) { s65fa++; RDLog(@"MK65-FOLDER-ANIM-OFF via=IconAlpha bid=%@", bid); }
                 } else if (lbl.alpha > 0.01f) {
-                    // A2: 自驱动淡出 —— 清 iOS 在跑的 reveal 动画, 恢复显示起点, 自驱动 0.22s 淡到 0(模型 a=0 由 orig 保持, 显示层平滑过渡)
+                    // A2: 自驱动淡出 —— MRC 手动 retain 保活 + 改 layer.opacity 避免重入 setIconLabelAlpha hook; 防图标飞出释放 label 致 use-after-free 注销(v2.0.66.66)
                     [lbl.layer removeAllAnimations];
                     CGFloat mkStartA = lbl.alpha;
                     lbl.alpha = mkStartA;
                     [UIView animateWithDuration:0.22 delay:0.0
                         options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
-                        animations:^{ lbl.alpha = 0.0f; } completion:nil];
+                        animations:^{ lbl.layer.opacity = 0.0f; }
+                        completion:^(BOOL mkFin){ (void)mkFin; }];
                     static int s65fade = 0;
                     if (s65fade < 20) { s65fade++; RDLog(@"MK65-FADE via=IconAlpha target=%.2f start=%.2f bid=%@", (float)mkTargetA, (float)mkStartA, bid); }
                 } else {
@@ -3422,7 +3429,7 @@ static void MKUpdate(SBIconView *self) {
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:fBid];
                 if (sHiddenBids) [sHiddenBids addObject:fBid]; // v1.6.85: 文件夹合成 key 也要藏名
-                if (sDebugLog) RDLog(@"FICON-CREATE v2.0.66.65: %@ rep=%@ fixed=%d container=%s frame=%@", fBid, rep, fixedColor, fContainerCls, NSStringFromCGRect(indicatorFrame));
+                if (sDebugLog) RDLog(@"FICON-CREATE v2.0.66.66: %@ rep=%@ fixed=%d container=%s frame=%@", fBid, rep, fixedColor, fContainerCls, NSStringFromCGRect(indicatorFrame));
                 MKFadeInFolderIndicatorIfClosing(indicator); // v2.0.43: 关窗期淡入, 消除缩略图点瞬现
             } else {
                 if (indicator.superview != overlay) {
@@ -3701,7 +3708,7 @@ static void MKUpdate(SBIconView *self) {
 
             // v1.5.9: 添加指示器创建日志（方便追踪横条显示问题）
             // v1.6.55: 创建行自带版本戳，日志被截断也能一眼确认构建版本
-            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.66.65: %@ shape=%d animate=%d label=%@",
+            if (sDebugLog) RDLog(@"Indicator CREATE v2.0.66.66: %@ shape=%d animate=%d label=%@",
                   bundleID, (int)cfg.shape, shouldAnimate,
                   label ? @"YES" : @"NO(FALLBACK)");
             // v2.0.66.2: 顺带修主屏 beta 小黄点回收残留(见 MKGetCachedBid 回收清理)
@@ -5494,20 +5501,20 @@ static void MKProbeSelfCheck(void) {
         Class cIcon = NSClassFromString(@"SBIcon");
         Class cLLV  = NSClassFromString(@"SBIconLegibilityLabelView");
         Class cIV   = NSClassFromString(@"SBIconView");
-        RDLog(@"PROBE-SELFCHECK v2.0.66.65 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.66 SBIcon=%@ displayName=%d dNFL=%d appBundleID=%d appBundleIdentifier=%d",
               NSStringFromClass(cIcon),
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayName)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(displayNameForLocation:)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleID)] : 0,
               cIcon ? [cIcon instancesRespondToSelector:@selector(applicationBundleIdentifier)] : 0);
-        RDLog(@"PROBE-SELFCHECK v2.0.66.65 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.66 LLV=%@ setText=%d setString=%d setAttr=%d _updateLabelImage=%d legibilityLabel=%d",
               NSStringFromClass(cLLV),
               cLLV ? [cLLV instancesRespondToSelector:@selector(setText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setString:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(setAttributedText:)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(_updateLabelImage)] : 0,
               cLLV ? [cLLV instancesRespondToSelector:@selector(legibilityLabel)] : 0);
-        RDLog(@"PROBE-SELFCHECK v2.0.66.65 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
+        RDLog(@"PROBE-SELFCHECK v2.0.66.66 IV=%@ _updateLabel=%d setIconLabelAlpha=%d label=%d setLabel=%d",
               NSStringFromClass(cIV),
               cIV ? [cIV instancesRespondToSelector:@selector(_updateLabel)] : 0,
               cIV ? [cIV instancesRespondToSelector:@selector(setIconLabelAlpha:)] : 0,
@@ -5604,7 +5611,7 @@ static void MKRefreshFolderIcons(void) {
 
     // v2.0.66.39: 启动日志彻底精简 —— 单行版本戳也收进 sDebugLog(诊断关时彻底零输出, 仅 @catch 异常仍可见); 多行改动清单同收进 sDebugLog。
     if (sDebugLog) {
-        RDLog(@"======== RunningDotIndicator v2.0.66.65 loaded ========");
+        RDLog(@"======== RunningDotIndicator v2.0.66.66 loaded ========");
         RDLog(@"======== RDBUILD v2.0.66.38: 物理位置判定补刀(MKLabelPhysicallyInDock)治「主屏 label 漂到 dock 位置显示(祖先链仍主屏)」的串名(前版 fctx 仅靠类名祖先链覆盖不到); + 收进 sDebugLog(生产安静); 行为零变化 ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.30: NEG-SETTEXT 最终捕获版(彻底无门控) ========");
         RDLog(@"======== RDBUILD-NOTE v2.0.66.31: DOCK-RANDOM-FIX 根治 dock 随机串名 + 移除 1s 扫描定时器 ========");
