@@ -153,7 +153,6 @@ static char kMKIconKey;      // 缓存的 icon 指针（检测视图回收复用
 static char kMKLabelIconKey;  // v2.0.3: label→SBIconView 直接指针关联键（层级无关，关文件夹动画重父 label 时不失效）
 static char kMKIndicatorBidKey; // v1.6.63: 指示器归属的 bid（防回收复用导致"乱跑"）
 static char kMKOurBetaKey;     // v2.0.33: 标记「我们脱离的小黄点」——退出时只移除这些，不碰系统原生 TestFlight 黄点徽章
-static char kMKDockPinnedKey;  // v2.0.66.47: 标记「被 MKDockStrayHide 钉藏的 dock 外来 label」——防其(可能存在的)合法属主复显造成每帧互搏闪烁；由 MKGetCachedLabelEx 在该 label 重获合法属主时清除（对称 restore，绝不永久消失）
 // v1.6.60: bid → SBIconView 弱引用注册表（替代不可靠的窗口遍历刷新）
 // iOS 16 SpringBoard 在文件夹/滚动/转场等活跃态下，主屏图标视图常不在
 // [UIApplication sharedApplication].windows 的常规遍历可达路径，导致 MKRefreshIconForBundleID
@@ -749,13 +748,6 @@ static UIView *MKGetCachedLabelEx(SBIconView *iv, UIView **outForeign) {
             if (outForeign) *outForeign = label;   // v2.0.66.47: 带出案发对象（原地丢弃 → 上层永远看不见）
             label = nil;
         } else {
-            // v2.0.66.47 【对称 restore 落点之一 —— 必须在此, 否则名字会永久消失】
-            // 场景: dock 侧钉藏 label L 时会清掉 L 的 kMKLabelIconKey; L 的真实属主(主屏 iv_B)
-            // 下一帧走本缓存命中路径时 owner 已是 nil → 校验通过 → 若在此直接 return,
-            // kMKDockPinnedKey 就再没有任何机会被清除, 两个 setter hook 会把 iv_B 的名字钉死到天荒地老。
-            // 先读后写: 正常帧只多一次关联对象【读】(未钉即跳过), 不分配、不写, 守住热路径零分配铁律。
-            if (objc_getAssociatedObject(label, &kMKDockPinnedKey))
-                objc_setAssociatedObject(label, &kMKDockPinnedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             return label;  // 仍然有效
         }
     }
@@ -776,12 +768,7 @@ static UIView *MKGetCachedLabelEx(SBIconView *iv, UIView **outForeign) {
             // 使 MKLabelToBid 的 superview 层级查找全部失效 → 漏藏 → 名称闪现。
             // 直接指针随 label 对象自身走，重父/重建时仍可被 MKLabelToBid 取出，绕过层级解出 bid。
             objc_setAssociatedObject(label, &kMKLabelIconKey, iv, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            // v2.0.66.47 【对称 restore 落点之二】—— 该 label 已重新获得合法属主，解除 dock 钉藏标记。
-            // 与上方缓存命中路径成对存在，二者共同保证「被我们钉藏的 label 一旦回到合法属主名下即解钉」，
-            // 名字绝不永久消失（这是本次改动最大的风险，必须双路闭合）。同样是先读后写、零分配。
             if (outForeign) *outForeign = nil;     // 已找到本 iv 的合法 label，前面那次陈旧缓存不再视为案发对象
-            if (objc_getAssociatedObject(label, &kMKDockPinnedKey))
-                objc_setAssociatedObject(label, &kMKDockPinnedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
     }
     return label;
@@ -2136,10 +2123,6 @@ static BOOL MKDockStrayHide(SBIconView *iv, BOOL *outStray) {
             foreign.layer.opacity = 0.0f;
             foreign.opaque = NO;
             [foreign.layer removeAllAnimations];
-            // 钉标记: 防「该 label 的合法属主(另一个活着的 iconView)在本帧内把它复显」造成互搏闪烁
-            // —— 闪烁比静态串名更难看。解钉在 MKGetCachedLabelEx 的两条合法返回路径(缓存命中 / 重新绑定)
-            // 双路闭合, 该 label 一回到合法属主名下即自动解钉, 名字不会永久消失。
-            objc_setAssociatedObject(foreign, &kMKDockPinnedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             acted = YES;
             if (outStray) *outStray = YES;
         }
@@ -2248,6 +2231,13 @@ static void *MKResolveOrigIMP(NSMutableDictionary *byClass, CFMutableDictionaryR
 // 返回 useBid（非 nil = 该藏名）；具体「压制复显」由调用方据自身语义执行(setHidden 改 hidden / setAlpha 改 a 后调 orig)。
 static NSString *MKShouldHideLabel(UIView *label, NSString *bid, BOOL *outMapOnly) {
     NSString *mapBid = (sHiddenLabelToBid ? [sHiddenLabelToBid objectForKey:(id)label] : nil);
+    // β5: 清过期弱键关联 —— label 对象被跨 icon 复用(同指针不释放)而其当前实时 bid 已变为另一个
+    // 有效 bid 时, 旧 mapBid 属回收残留; 此时不采信旧 mapBid 并清掉, 避免误藏/误判。
+    // 仅当当前 bid 有效且与 mapBid 不同才清(瞬态 bid=nil 不误清, 与 MKGetCachedBid 回收清扫行为一致)。
+    if (mapBid.length && bid.length && ![mapBid isEqualToString:bid]) {
+        [sHiddenLabelToBid removeObjectForKey:(id)label];
+        mapBid = nil;
+    }
     BOOL hasBid = (bid && sHiddenBids && [sHiddenBids containsObject:bid]);
     BOOL inMap  = (mapBid.length && sHiddenBids && [sHiddenBids containsObject:mapBid]);
     if (hasBid || inMap) {
@@ -2267,12 +2257,7 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
         // v2.0.3: 关文件夹窗口内有界定向诊断（仅 debug 开 + sFolderClosing 时）
         
         NSString *useBid = nil; BOOL mapOnly = NO;
-        if (objc_getAssociatedObject((UIView *)self, &kMKDockPinnedKey)) {
-            // v2.0.66.47: dock 钉藏防拉锯 —— 本 label 刚被 MKDockStrayHide 在 dock 容器内钉藏，
-            // 其(可能存在的)合法属主若在同帧走自己的路径把它复显，会与我们互搏成闪烁(比静态串名更难看)。
-            // 该钉标记生命周期极短: 下一帧 MKGetCachedLabelEx 一旦为它绑定合法属主即自动解除，绝不永久生效。
-            hidden = YES;
-        } else if ((useBid = MKShouldHideLabel((UIView *)self, bid, &mapOnly))) {   // v2.0.9 的「关闭动画窗口内让步原生」已在 v2.0.12 撤销：关合窗口内文件夹内 label 也强制藏名(不让步原生)，根治 sub-16ms settle 单帧闪现(第④点残留真凶)。证据 rd_log(63): FOLDER-CLOSE-VISIBLE=0 表明无 strobe 互搏，去掉安全。
+        if ((useBid = MKShouldHideLabel((UIView *)self, bid, &mapOnly))) {   // v2.0.9 的「关闭动画窗口内让步原生」已在 v2.0.12 撤销：关合窗口内文件夹内 label 也强制藏名(不让步原生)，根治 sub-16ms settle 单帧闪现(第④点残留真凶)。证据 rd_log(63): FOLDER-CLOSE-VISIBLE=0 表明无 strobe 互搏，去掉安全。
             hidden = YES; // 有指示器 -> 名字必须隐藏，压制系统任何复显
             // v1.6.99: MKShouldHideLabel 已写回直接关联键 + 掐动画(标记自持，根除关文件夹缩回/主屏重叠闪现，详见 helper 注释)
             
@@ -2285,10 +2270,10 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
                 MKAssocLabelBid((UIView *)self, fb);
                 [((UIView *)self).layer removeAllAnimations];
             }
-        } else if (MKForeignContainerCtx((UIView *)self) || MKLabelPhysicallyInDock((UIView *)self)) {
+        } else if (MKForeignContainerCtx((UIView *)self)) {
             // v2.0.66.37: fctx 强制藏名补刀——foreign 容器(dock/负一屏/widget)名经 setHidden:NO 复显
             // (同窗口同 superview, didMoveToWindow/didMoveToSuperview 不触发)时在此压住; 零分配判定, 主屏/文件夹不受影响。
-            // v2.0.66.38: 另补物理位置判定(MKLabelPhysicallyInDock)覆盖「主屏 label 漂到 dock 位置显示(祖先链仍主屏)」的串名。
+            // β2: 移除原 MKLabelPhysicallyInDock 物理纵带补刀(形态 B 改由 MKDockStrayHide 每帧兜底), 收敛 swizzle 面。
             hidden = YES;
             [((UIView *)self).layer removeAllAnimations];
         }
@@ -2307,10 +2292,7 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
         // v2.0.3: 关文件夹窗口内有界定向诊断（setAlpha: 复显路径）
         
         NSString *useBid = nil; BOOL mapOnly = NO;
-        if (objc_getAssociatedObject((UIView *)self, &kMKDockPinnedKey)) {
-            // v2.0.66.47: dock 钉藏防拉锯 —— 详见 MKSetHiddenHook 同款注释。
-            a = 0.0f;
-        } else if ((useBid = MKShouldHideLabel((UIView *)self, bid, &mapOnly))) {   // v2.0.12: 撤销 v2.0.9 关合窗口内让步原生(label 在文件夹内也强制藏名), 根治 sub-16ms settle 单帧闪现。详见 MKSetHiddenHook 同款注释。
+        if ((useBid = MKShouldHideLabel((UIView *)self, bid, &mapOnly))) {   // v2.0.12: 撤销 v2.0.9 关合窗口内让步原生(label 在文件夹内也强制藏名), 根治 sub-16ms settle 单帧闪现。详见 MKSetHiddenHook 同款注释。
             CGFloat inA = a; // v2.0.41: 留存传入值(下面会覆写)供 REVEAL-ATTEMPT 判据
             a = 0.0f; // 同上，压制 alpha 复显
             // v1.6.99: MKShouldHideLabel 已写回直接关联键 + 掐动画(标记自持，根除关文件夹缩回/主屏重叠闪现，详见 helper 注释)
@@ -2325,10 +2307,10 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
                 MKAssocLabelBid((UIView *)self, fb);
                 [((UIView *)self).layer removeAllAnimations];
             }
-        } else if (MKForeignContainerCtx((UIView *)self) || MKLabelPhysicallyInDock((UIView *)self)) {
+        } else if (MKForeignContainerCtx((UIView *)self)) {
             // v2.0.66.37: fctx 强制藏名补刀——foreign 容器(dock/负一屏/widget)名经 setAlpha:>0 复显
             // (同窗口同 superview, didMoveToWindow/didMoveToSuperview 不触发)时在此压住; 零分配判定, 主屏/文件夹不受影响。
-            // v2.0.66.38: 另补物理位置判定(MKLabelPhysicallyInDock)覆盖「主屏 label 漂到 dock 位置显示(祖先链仍主屏)」的串名。
+            // β2: 移除原 MKLabelPhysicallyInDock 物理纵带补刀(形态 B 改由 MKDockStrayHide 每帧兜底), 收敛 swizzle 面。
             a = 0.0f;
             [((UIView *)self).layer removeAllAnimations];
         }
@@ -2341,10 +2323,9 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
     }
 }
 
-// v2.0.66.42: 位移即时校验 hook —— 见 MKHookOneLabelClass 内 setFrame:/setCenter: 安装注释。
-// 系统先 setHidden:NO 复显 label(此刻 frame 仍主屏, 物理判定 NO 放行), 之后 setFrame:/setCenter: 把位置搬到 dock;
-// 既有 setHidden/setAlpha/didMoveToSuperview 三 hook 不钩位移 → 漏藏。此处在每次位移后即时校验 dock 纵带, 命中即藏名。
-// 仅 label 当前可见(alpha>0 且非 hidden)才做 convertRect(window 坐标 midY 比 dock 纵带), 零分配早退, 滚动/动画期开销可忽略。
+// β2: 原 v2.0.66.42 位移即时校验(物理 dock 纵带藏名)已禁用 —— 形态 B(主屏 label 漂到 dock 位置)改由
+// MKDockStrayHide 的每帧 owner 校验兜底。本 hook 现仅透传 orig, 保留安装以最小化 diff; 若 β2 验证稳,
+// 后续可整体移除 setFrame:/setCenter: 钩子(β3 收 swizzle 面)。
 static void MKSetFrameHook(id self, SEL _cmd, CGRect f) {
     void(*orig)(id,SEL,CGRect) = (void(*)(id,SEL,CGRect))MKResolveOrigIMP(sOrigSetFrameByClass, sOrigSetFrameByClassCF, self);
     if (orig && orig != (void(*)(id,SEL,CGRect))MKSetFrameHook) {
@@ -2354,7 +2335,7 @@ static void MKSetFrameHook(id self, SEL _cmd, CGRect f) {
     @try {
         UIView *lbl = (UIView *)self;
         if (lbl.hidden || lbl.alpha <= 0.01f) return; // 已藏/不可见 → 零分配早退
-        if (MKLabelPhysicallyInDock(lbl)) {
+        if (NO) {   // β2: 禁用物理 dock 判定(形态 B 改由 MKDockStrayHide 每帧兜底), 收敛 swizzle 面
             lbl.hidden = YES;
             lbl.alpha = 0.0f;
             lbl.layer.opacity = 0.0f;
@@ -2372,7 +2353,7 @@ static void MKSetCenterHook(id self, SEL _cmd, CGPoint c) {
     @try {
         UIView *lbl = (UIView *)self;
         if (lbl.hidden || lbl.alpha <= 0.01f) return;
-        if (MKLabelPhysicallyInDock(lbl)) {
+        if (NO) {   // β2: 禁用物理 dock 判定(形态 B 改由 MKDockStrayHide 每帧兜底), 收敛 swizzle 面
             lbl.hidden = YES;
             lbl.alpha = 0.0f;
             lbl.layer.opacity = 0.0f;
@@ -2468,7 +2449,7 @@ static void MKLabelDidMoveToSuperviewHook(id self, SEL _cmd) {
         // 覆盖「仅换父、window 不变」的显形路径(与 didMoveToWindow 双保险, 灭亚秒级闪现);
         // 守卫在 MKForeignContainerCtx 内(MKLabelInHomeGrid)确保主屏网格名不被误杀。
         NSString *fctx = MKForeignContainerCtx(lbl);
-        if (fctx || MKLabelPhysicallyInDock(lbl)) {
+        if (fctx) {   // β2: 移除原 MKLabelPhysicallyInDock 物理纵带补刀(形态 B 改由 MKDockStrayHide 每帧兜底)
             lbl.hidden = YES;
             lbl.alpha = 0.0f;
             lbl.layer.opacity = 0.0f;
