@@ -1414,16 +1414,16 @@ static void MKAddToRunningSet(NSString *bid) {
         return;
     }
     if (!sRunningSet) sRunningSet = [NSMutableSet set];
-    BOOL wasNew = ![sRunningSet containsObject:bid];
+    // v2.0.66.79 (A6): 原 BOOL wasNew = ![sRunningSet containsObject:bid]; 已删除 ——
+    // .58 的「进运行态同步推送钉藏」(MKHideLabelForRunningBid) 在 .71 回退时一并删掉,
+    // 该变量随之成为 write-only 死值(仅靠 Makefile -Wno-unused-but-set-variable 才编得过)。
     [sRunningSet addObject:bid];
-    
 }
 
 static void MKRemoveFromRunningSet(NSString *bid) {
     if (!bid.length) return;
-    BOOL wasIn = sRunningSet && [sRunningSet containsObject:bid];
+    // v2.0.66.79 (A6): 原 BOOL wasIn = ... 同为 .58 推送日志遗留的 write-only 死值, 已删除。
     [sRunningSet removeObject:bid];
-    
 }
 
 static BOOL MKIsAppRunning(NSString *bundleID) {
@@ -2291,7 +2291,8 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
         
         NSString *useBid = nil; BOOL mapOnly = NO;
         if ((useBid = MKShouldHideLabel((UIView *)self, bid, &mapOnly))) {   // v2.0.12: 撤销 v2.0.9 关合窗口内让步原生(label 在文件夹内也强制藏名), 根治 sub-16ms settle 单帧闪现。详见 MKSetHiddenHook 同款注释。
-            CGFloat inA = a; // v2.0.41: 留存传入值(下面会覆写)供 REVEAL-ATTEMPT 判据
+            // v2.0.66.79 (A6): 原 CGFloat inA = a; 已删除 —— .41 的 REVEAL-ATTEMPT 诊断判据遗留,
+            // 探针在 .71 移除后成为 write-only 死值。
             a = 0.0f; // 同上，压制 alpha 复显
             // v1.6.99: MKShouldHideLabel 已写回直接关联键 + 掐动画(标记自持，根除关文件夹缩回/主屏重叠闪现，详见 helper 注释)
             
@@ -2943,7 +2944,8 @@ static void MKUpdate(SBIconView *self) {
                 // 逐帧即显示圆点, 不再强制藏 0.7s 制造"第二波"。锁屏态仍由 sLocked 守卫隐藏。
                 BOOL mkShouldHide = sLocked || (sFolderClosing && mkInFolderLive);
                 if (mkOv.hidden != mkShouldHide) {
-                    BOOL mkWasHidden = mkOv.hidden;
+                    // v2.0.66.79 (A6): 原 BOOL mkWasHidden = mkOv.hidden; 已删除 ——
+                    // 它只喂下方 PERFRAME-FIX 诊断行, 探针在 .71 移除后成为 write-only 死值。
                     if (!mkShouldHide) {
                         // v2.0.66.32: 解锁即时揭示改由 MKUnlockRestore 显式 un-hide 负责(原生携带, 无独立淡入),
                         // 不依赖此处逐帧不变量在 overlay 上做动画。此处只确保 overlay 解除隐藏,
