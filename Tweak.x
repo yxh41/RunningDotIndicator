@@ -178,7 +178,7 @@ static BOOL  sLocked        = NO;  // v1.6.69: 设备是否处于锁屏态（解
 static NSTimeInterval sLockAt = 0;   // v1.6.70: 最近一次锁屏时刻；用于 MKUpdate 时间闸门自动复位（不依赖解锁通知）
 static BOOL  sUnlockFading = NO;  // v2.0.50: MKUnlockRestore 显式淡入进行中，抑制逐帧不变量重复叠淡入（防重抖）
 static dispatch_source_t sFolderCloseGuard = NULL;  // v2.0.1: 关文件夹缩回动画期间(~0.5s)持续堵窗定时器，防新建 label 漏藏
-static BOOL  sDebugLog      = NO;  // 仅 RDLogRunning 调试守卫仍引用(运行期恒假, 优化器死剥); 调试/探针门控与探针计数已全部清除(.73/.74), 此变量仅作该守卫占位。
+// v2.0.66.78 (A4): sDebugLog 已删除 —— 唯一引用者 RDLogRunning 同批删除, 该变量运行期恒假, 无其他读者。
 static char kMKFIconBidsKey;  // v1.6.76: 文件夹图标缓存的「内部后台运行中 App」bid 数组
 static char kMKFIconGenKey;    // v1.6.76: 该缓存的代际（sFolderContentGen 变化时失效）
 static NSUInteger sFolderContentGen = 0; // v1.6.76: 文件夹内容代际；App 运行态变化时 +1 使缓存失效
@@ -1379,10 +1379,9 @@ static UIColor *MKCachedIconColorForBundleID(NSString *bid) {
 
 // ─── 文件日志（RDLog 已统一改为 no-op 宏，见文件顶部；此函数定义已移除，运行期不再写任何诊断到 rd_log.txt）──
 
-// ─── 限流日志（同一 bundleID 最多记录 5 次 RUNNING）──────────────
-static void RDLogRunning(NSString *bid) {
-    if (!sDebugLog) return; // v1.6.26: 默认安静，仅调试模式记录 RUNNING 噪声
-}
+// ─── 限流日志 RDLogRunning 已删除 (v2.0.66.78 / A4) ───
+// 函数体自 .73 起仅剩 `if (!sDebugLog) return;`(sDebugLog 运行期恒假) → 空体死函数;
+// RDLog 本身是编译期 no-op 宏, 无任何副作用。连同 sDebugLog 变量与唯一调用点一并删除。
 
 // ─── 紧急开关 ────────────────────────────────────────────────
 static BOOL MKIsDisabled() {
@@ -2177,11 +2176,10 @@ static CFMutableDictionaryRef sOrigSetAlphaByClassCF = NULL;
 static CFMutableDictionaryRef sOrigDidMoveToWindowByClassCF = NULL;
 static CFMutableDictionaryRef sOrigDidMoveToSuperviewByClassCF = NULL;
 static CFMutableDictionaryRef sOrigSetIconLabelAlphaByClassCF = NULL; // v2.0.66.34-perf: 第 5 个 hook(setIconLabelAlpha:) 的零分配镜像
-// v2.0.66.42: 第 6/7 个 hook(setFrame:/setCenter:) 的原始 IMP + 零分配镜像——位移即时校验用(堵「先 setHidden:NO 复显、后 setFrame:/setCenter: 搬到 dock」的纯位移漏藏缺口)
-static NSMutableDictionary *sOrigSetFrameByClass = nil;
-static NSMutableDictionary *sOrigSetCenterByClass = nil;
-static CFMutableDictionaryRef sOrigSetFrameByClassCF = NULL;
-static CFMutableDictionaryRef sOrigSetCenterByClassCF = NULL;
+// v2.0.66.78 (A1): 原第 6/7 个 hook(setFrame:/setCenter:) 的 IMP 镜像容器已删除 ——
+// β2 起这两个 hook 的唯一有效逻辑被 if(NO) 关掉(形态 B 改由 MKDockStrayHide 每帧 owner 校验兜底),
+// hook 体退化为纯透传; setFrame:/setCenter: 是布局最热路径, 整棵 label 子类树每次布局白过两次 trampoline。
+// 本版按 β3 原定计划整体摘除(hook 函数 + 安装码 + 容器), 运行期行为严格等价 .75。
 
 // v2.0.12: 原 MKLabelHostInFolder() 已删除——v2.0.9 用它实现「关合窗口内对文件夹内 label 让步原生」，
 // 而 v2.0.12 已撤销该让步(关合窗口内文件夹内 label 一律强藏,见 MKSetHiddenHook/MKSetAlphaHook/
@@ -2323,45 +2321,9 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
     }
 }
 
-// β2: 原 v2.0.66.42 位移即时校验(物理 dock 纵带藏名)已禁用 —— 形态 B(主屏 label 漂到 dock 位置)改由
-// MKDockStrayHide 的每帧 owner 校验兜底。本 hook 现仅透传 orig, 保留安装以最小化 diff; 若 β2 验证稳,
-// 后续可整体移除 setFrame:/setCenter: 钩子(β3 收 swizzle 面)。
-static void MKSetFrameHook(id self, SEL _cmd, CGRect f) {
-    void(*orig)(id,SEL,CGRect) = (void(*)(id,SEL,CGRect))MKResolveOrigIMP(sOrigSetFrameByClass, sOrigSetFrameByClassCF, self);
-    if (orig && orig != (void(*)(id,SEL,CGRect))MKSetFrameHook) {
-        @try { orig(self, _cmd, f); }
-        @catch (NSException *e) { RDLog(@"MKSetFrameHook orig EXCEPTION: %@", e.reason); }
-    }
-    @try {
-        UIView *lbl = (UIView *)self;
-        if (lbl.hidden || lbl.alpha <= 0.01f) return; // 已藏/不可见 → 零分配早退
-        if (NO) {   // β2: 禁用物理 dock 判定(形态 B 改由 MKDockStrayHide 每帧兜底), 收敛 swizzle 面
-            lbl.hidden = YES;
-            lbl.alpha = 0.0f;
-            lbl.layer.opacity = 0.0f;
-            [lbl.layer removeAllAnimations];
-            
-        }
-    } @catch (NSException *e) { RDLog(@"MKSetFrameHook EXCEPTION: %@", e.reason); }
-}
-static void MKSetCenterHook(id self, SEL _cmd, CGPoint c) {
-    void(*orig)(id,SEL,CGPoint) = (void(*)(id,SEL,CGPoint))MKResolveOrigIMP(sOrigSetCenterByClass, sOrigSetCenterByClassCF, self);
-    if (orig && orig != (void(*)(id,SEL,CGPoint))MKSetCenterHook) {
-        @try { orig(self, _cmd, c); }
-        @catch (NSException *e) { RDLog(@"MKSetCenterHook orig EXCEPTION: %@", e.reason); }
-    }
-    @try {
-        UIView *lbl = (UIView *)self;
-        if (lbl.hidden || lbl.alpha <= 0.01f) return;
-        if (NO) {   // β2: 禁用物理 dock 判定(形态 B 改由 MKDockStrayHide 每帧兜底), 收敛 swizzle 面
-            lbl.hidden = YES;
-            lbl.alpha = 0.0f;
-            lbl.layer.opacity = 0.0f;
-            [lbl.layer removeAllAnimations];
-            
-        }
-    } @catch (NSException *e) { RDLog(@"MKSetCenterHook EXCEPTION: %@", e.reason); }
-}
+// v2.0.66.78 (A1): MKSetFrameHook / MKSetCenterHook 已整体删除(β3 收 swizzle 面)。
+// 二者自 β2 起 if(NO) 死分支化, 仅剩透传 orig; 形态 B(主屏 label 漂到 dock 位置)由
+// MKDockStrayHide 每帧 owner 校验兜底, 与本 hook 无依赖关系。删之运行期零行为变化。
 
 // v2.0.7: 创建点拦截 —— label 一旦进入 window（新建/重父/动画层迁入）即刻检查归属，
 // 若其所属图标 bid∈sHiddenBids 则立刻 hidden + 种回关联键。这堵死「新建对象无关联键、
@@ -2621,8 +2583,6 @@ static void MKHookOneLabelClass(Class cls) {
     if (!sOrigSetHiddenByClass) {
         sOrigSetHiddenByClass = [NSMutableDictionary dictionary];
         sOrigSetAlphaByClass  = [NSMutableDictionary dictionary];
-        sOrigSetFrameByClass  = [NSMutableDictionary dictionary];
-        sOrigSetCenterByClass = [NSMutableDictionary dictionary];
     }
     // v2.0.66.34-perf: 懒建零分配 CFDict 镜像(指针键, 不 retain)
     if (!sOrigSetHiddenByClassCF) {
@@ -2631,10 +2591,9 @@ static void MKHookOneLabelClass(Class cls) {
         sOrigDidMoveToWindowByClassCF = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
         sOrigDidMoveToSuperviewByClassCF = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
         sOrigSetIconLabelAlphaByClassCF = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
-        sOrigSetFrameByClassCF = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
-        sOrigSetCenterByClassCF = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
     }
-    if ([sOrigSetHiddenByClass objectForKey:k] && [sOrigSetAlphaByClass objectForKey:k] && [sOrigSetFrameByClass objectForKey:k] && [sOrigSetCenterByClass objectForKey:k]) return; // 全部已钩，幂等
+    // v2.0.66.78 (A1): 幂等判据去掉 setFrame:/setCenter: 两项(hook 已删)
+    if ([sOrigSetHiddenByClass objectForKey:k] && [sOrigSetAlphaByClass objectForKey:k]) return; // 全部已钩，幂等
     // v1.6.87: 仅当本类「真正重写」setHidden:/setAlpha: 才替换 IMP。
     // 此前对任意（含继承来的）Method 都 method_setImplementation，会把基类 orig 捕成
     // MKSetHiddenHook 自身 → 调用时死循环/向错误 self 发未识别 selector → 解锁安全模式。
@@ -2655,43 +2614,10 @@ static void MKHookOneLabelClass(Class cls) {
         CFDictionarySetValue(sOrigSetAlphaByClassCF, (const void *)cls, (const void *)orig);
         method_setImplementation(m2, (IMP)MKSetAlphaHook);
     }
-    // v2.0.66.42: 位移即时校验 —— 系统可能先 setHidden:NO 复显 label(此刻 frame 仍在主屏→物理判定 NO 放行),
-    // 之后才用 setFrame:/setCenter: 把位置搬到 dock; 既有 setHidden/setAlpha/didMoveToSuperview 三 hook 不钩位移 → 漏藏。
-    // 此处每次位移后即时校验 dock 纵带, 命中即藏名, 堵死「纯位移不触发 setHidden」缺口。
-    // 用 class_replace/class_add 强制在本类挂 override(无论本类是否重写, 确保纯位移路径必被捕获; 若仅 method_setImplementation
-    // 且本类未重写 setFrame: 则钩不上)。orig 取 superclass IMP(未重写时)。
-    if (!sOrigSetFrameByClass) sOrigSetFrameByClass = [NSMutableDictionary dictionary];
-    if ([sOrigSetFrameByClass objectForKey:k] == nil) {
-        Method mf = class_getInstanceMethod(cls, @selector(setFrame:));
-        Method supMf = sup ? class_getInstanceMethod(sup, @selector(setFrame:)) : NULL;
-        if (mf && supMf) {
-            IMP origF = NULL;
-            if (class_getInstanceMethod(cls, @selector(setFrame:)) != supMf) {
-                origF = class_replaceMethod(cls, @selector(setFrame:), (IMP)MKSetFrameHook, method_getTypeEncoding(mf));
-            } else {
-                class_addMethod(cls, @selector(setFrame:), (IMP)MKSetFrameHook, method_getTypeEncoding(supMf));
-                origF = method_getImplementation(supMf);
-            }
-            if (origF) { [sOrigSetFrameByClass setObject:[NSValue valueWithPointer:(void *)origF] forKey:k];
-                CFDictionarySetValue(sOrigSetFrameByClassCF, (const void *)cls, (const void *)origF); }
-        }
-    }
-    if (!sOrigSetCenterByClass) sOrigSetCenterByClass = [NSMutableDictionary dictionary];
-    if ([sOrigSetCenterByClass objectForKey:k] == nil) {
-        Method mc = class_getInstanceMethod(cls, @selector(setCenter:));
-        Method supMc = sup ? class_getInstanceMethod(sup, @selector(setCenter:)) : NULL;
-        if (mc && supMc) {
-            IMP origC = NULL;
-            if (class_getInstanceMethod(cls, @selector(setCenter:)) != supMc) {
-                origC = class_replaceMethod(cls, @selector(setCenter:), (IMP)MKSetCenterHook, method_getTypeEncoding(mc));
-            } else {
-                class_addMethod(cls, @selector(setCenter:), (IMP)MKSetCenterHook, method_getTypeEncoding(supMc));
-                origC = method_getImplementation(supMc);
-            }
-            if (origC) { [sOrigSetCenterByClass setObject:[NSValue valueWithPointer:(void *)origC] forKey:k];
-                CFDictionarySetValue(sOrigSetCenterByClassCF, (const void *)cls, (const void *)origC); }
-        }
-    }
+    // v2.0.66.78 (A1): 原 v2.0.66.42 的 setFrame:/setCenter: 强制 override 安装码已整体删除。
+    // 两个 hook 自 β2 起纯透传(有效逻辑在 if(NO) 内), 而 class_replaceMethod/class_addMethod 会在
+    // 每个 label 子类上真装一层 trampoline —— 布局热路径每帧白付两次调用开销。形态 B 的实际防线是
+    // MKDockStrayHide 的每帧 owner 校验, 不依赖此处, 故删之零行为变化。
     // v2.0.7: 创建点拦截 —— 安全替换 didMoveToWindow:（用 class_replaceMethod / class_addMethod，
     // 即便本类未重写也只在本类加 override，绝不污染 superclass IMP → 不触发 ___forwarding___ 陷阱）。
     // label 一旦被 addSubview 进 window（新建/重父/动画层迁入）即刻被 MKLabelDidMoveToWindowHook 接管，
@@ -3146,7 +3072,7 @@ static void MKUpdate(SBIconView *self) {
             return;  // 不创建指示器，等300ms后 MKRefreshIconForBundleID 回调
         }
 
-        RDLogRunning(bundleID);
+        // v2.0.66.78 (A4): 原 RDLogRunning(bundleID) 调用已删除(空体死函数)。
 
         // ── App 正在运行 → 隐藏名字，显示指示器 ──
             MKDetachBetaOnce((UIView *)self); // v2.0.30: beta App 先把小黄点脱离 label，避免被藏名牵连
@@ -3811,12 +3737,9 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     if (!bid) return;
 
     // v1.6.70: 文件夹内图标不再强制"显示名称并 return"——运行中 App 走下方
-    // running 分支（隐藏名称、显示指示器在文件夹 overlay）；非运行中 App 落到
-    // !running 分支恢复名称。下方 if(MKIsIconInFolder) 块仅在 sDebugLog 时打点；
-    // 注意：MKIsIconInFolder 本身还参与真实分支判断（如 2397/3349/3378 的文件夹内/外区分），并非仅诊断用途。
-    if (MKIsIconInFolder((UIView *)self)) {
-        
-    }
+    // running 分支（隐藏名称、显示指示器在文件夹 overlay）；非运行中 App 落到 !running 分支恢复名称。
+    // v2.0.66.78 (A5): 原此处的空 if(MKIsIconInFolder(self)) {} 块已删除(诊断残留, 无副作用)。
+    // ⚠️ MKIsIconInFolder 函数本身【不可删】—— 仍在其他多处参与真实分支判断(文件夹内/外区分)。
 
     BOOL running = MKIsAppRunning(bid);
     BOOL isForeground = MKIsForeground(bid);
@@ -4020,41 +3943,11 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
 // 纯诊断、不改行为；release/debug 都不藏名，只报。若命中，v2.0.10+ 真修法：截图前先藏、截图后复原。
 // ─── MKSafeSnapshotProbe (截图前 SNAP-PRE-NAME 探针) 已移除 (.71) ───
 
-// v2.0.66.43: 关窗守卫遇到 SBFolderIcon 时, 遍历子树对运行中 App 的 label 强制藏名。
-// 补 MKProbeFolderThumb(纯诊断, 门控 sDebugLog) 不藏名的缺口: 缩略图迷你图标不是 SBIconView,
-// 关窗守卫原只对 SBIconView 藏名 → 缩略图子树完全不在藏名范围 → iOS 经 CAAnimation(render server)
-// 复显 label 时不走 setHidden/setAlpha/setIconLabelAlpha → 三个 hook 全不触发 → 漏藏。
-// 此函数每 tick(8ms) 扫一遍缩略图子树, 覆盖 CAAnimation 路径的复显(盲区从"整个关窗期"缩到 8ms)。
-// 复用 MKViewInFolderThumb(精确匹配 SBFolderIconImageView, 不误伤文件夹自身名) + MKFolderThumbBid(解析 bid)。
-// 仅关窗 1.2s 内生效(sFolderCloseGuard 运行期), 零分配, 不影响待机。
-static void MKHideFolderThumbLabels(UIView *folderIcon) {
-    if (!folderIcon || !sHiddenBids || sHiddenBids.count == 0) return;
-    @try {
-        NSMutableArray *ts = [NSMutableArray arrayWithArray:folderIcon.subviews];
-        int tdepth = 0;
-        while (ts.count > 0 && tdepth < 8) {
-            NSMutableArray *nxt = [NSMutableArray array];
-            for (UIView *tv in ts) {
-                const char *tn = class_getName(object_getClass(tv));
-                BOOL isLabel = [tv isKindOfClass:[UILabel class]] || (strstr(tn, "Label") != NULL);
-                if (isLabel && (!tv.hidden || tv.alpha > 0.0f || tv.layer.opacity > 0.0f)) {
-                    if (MKViewInFolderThumb(tv)) {
-                        NSString *fb = MKFolderThumbBid(tv);
-                        if (fb.length && [sHiddenBids containsObject:fb]) {
-                            tv.hidden = YES;
-                            tv.alpha = 0.0f;
-                            tv.layer.opacity = 0.0f;
-                            [tv.layer removeAllAnimations];
-                            MKAssocLabelBid(tv, fb);
-                        }
-                    }
-                }
-                [nxt addObjectsFromArray:tv.subviews];
-            }
-            ts = nxt; tdepth++;
-        }
-    } @catch (NSException *e) {}
-}
+// v2.0.66.78 (A3): MKHideFolderThumbLabels 已删除 —— 唯一调用点(关窗守卫主循环的 isFolderIcon 分支)
+// 判据把【视图类名】拿去比【模型类名】"SBFolderIcon"(视图侧真名 SBFolderIconView) → 条件恒假,
+// 该函数自 .43 引入起从未执行过一次。留之则 -Werror unused-function 编不过, 故整体删除。
+// 【类名判据铁律】判"是不是文件夹缩略图/文件夹图标"一律用已验证函数 MKViewInFolderThumb(isKindOfClass)
+// 或 MKIsFolderIcon(先取 [iv icon] 再比模型名), 禁止手写 strcmp(视图类名, "SB*Icon")。
 
 // 现抽成独立函数，由 SBFolderController -viewWillDisappear:（关闭起始，sFolderOpen 仍 YES）与
 // didMoveToWindow(nil)（结束兜底）共调用，使 0.016s 基础强制藏（每帧对缓存 label 藏名）在缩回动画进行中即运行；不再全树 BFS（回归 2.0.5 方式）。
@@ -4109,11 +4002,13 @@ static void MKArmFolderCloseGuard(void) {
                         NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
                         while (stack.count > 0) {
                             UIView *cur = [stack lastObject]; [stack removeLastObject];
-                            const char *curName = class_getName(object_getClass(cur));
-                            BOOL isFolderIcon = (strcmp(curName, "SBFolderIcon") == 0 || strcmp(curName, "SBIconFolderIcon") == 0);
-                            if (isFolderIcon) {
-                                MKHideFolderThumbLabels(cur); // v2.0.66.43: 每 tick 对缩略图子树运行中 App label 强制藏名(补 CAAnimation 路径, 缩略图迷你图标非 SBIconView 原不覆盖)
-                            } else if (ivCls2 && [cur isKindOfClass:ivCls2]) {
+                            // v2.0.66.78 (A3): 原 isFolderIcon 分支已删除 ——
+                            // 判据 strcmp(class_getName(object_getClass(cur)), "SBFolderIcon") 拿【视图类名】比
+                            // 【模型类名】(SBFolderIcon 是 SBIcon 子类, 视图侧真名 SBFolderIconView) → 恒假,
+                            // 自 .43 起从未执行过一次, MKHideFolderThumbLabels 同为死代码故一并删除。
+                            // ⚠️ 不要"修活"它: .76 修活过(判据换 MKViewInFolderThumb), 实机证实解决不了文件夹闪
+                            // (根因在 iOS 快照/compositor 层), 只会白增藏名面。
+                            if (ivCls2 && [cur isKindOfClass:ivCls2]) {
                                 SBIconView *iv = (SBIconView *)cur;
                                 NSString *b = MKGetCachedBid(iv);
                                 // v2.0.12: 彻底删除 v2.0.9 引入、v2.0.10 收窄的「末拍让步原生」。
@@ -4264,24 +4159,13 @@ static void MKArmFolderCloseGuard(void) {
 %end
 
 // ====================================================================
-// v2.0.10: UIView 快照截图探针（定位「截图带名飞回」漏点）。
-// 关合缩回动画里 SpringBoard 常用这两个方法给图标拍「此刻长啥样」的快照，
-// 截图拍的那刻若名字仍可见 → 快照图里【带着名字】飞回主屏（显示的是 bitmap 不是活 label，
-// 完全绕过 setHidden / MkLabelDidMoveToWindowHook / 让步门控 所有拦截）。
-// 在两个方法【截图之前】调用 MKSafeSnapshotProbe 扫子树里「该藏却可见」的 label，
-// 有即打 SNAP-PRE-NAME（受 sProbeLog 门控）。纯诊断，不改行为（不藏名）。
-// 若命中 → v2.0.10+ 真修法：截图前先藏、截图后复原。
-%hook UIView
-
-- (UIView *)snapshotViewAfterScreenUpdates:(BOOL)afterUpdates {
-    return %orig;
-}
-
-- (UIView *)resizableSnapshotViewFromRect:(CGRect)rect afterScreenUpdates:(BOOL)afterUpdates withCapInsets:(UIEdgeInsets)capInsets {
-    return %orig;
-}
-
-%end
+// v2.0.66.78 (A2): 原 %hook UIView 的两个快照 hook(snapshotViewAfterScreenUpdates: /
+// resizableSnapshotViewFromRect:afterScreenUpdates:withCapInsets:) 已整体删除。
+// 探针(MKSafeSnapshotProbe)已在 .71 移除后, 两个方法体只剩 return %orig —— 纯透传。
+// 而 %hook UIView 是【全系统 UIView 级】方法替换: SpringBoard 每一次转场/切换动画的
+// 内部截图都要绕经我们的 trampoline, 零收益纯风险面。删之运行期零行为变化。
+// 注: .77 已实机证实文件夹开合闪属 iOS 快照/compositor 层 crossfade, 在此处 hook 藏名
+// (截图前藏、截图后复原)会把爆炸半径扩到全系统转场, 明确不做。
 
 // ====================================================================
 // v1.6.26: 移除冗余 hook
