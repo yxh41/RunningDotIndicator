@@ -44,9 +44,14 @@ const CGFloat MKBadgeFrameExtra = 15.0f;
     if (cfg.locationMode == MKLocationBadge) {
         CGFloat t = cfg.badgeThickness;
         CGFloat inset = cfg.badgeInset;
+        // v2.0.66.83: frame 四周各扩了 MKBadgeFrameExtra，W/H 必须扣掉扩边换算回图标实际尺寸，
+        // 否则右上/左下/右下的端点会偏移 2*extra(30pt) 落到图标外 → 看不到（左上端点不引用 W/H 故幸免）
+        CGFloat W = rect.size.width  - 2 * MKBadgeFrameExtra;
+        CGFloat H = rect.size.height - 2 * MKBadgeFrameExtra;
+        if (W < 1) W = rect.size.width;
+        if (H < 1) H = rect.size.height;
         CGFloat rc = self.iconCornerRadius;
-        if (rc <= 0) rc = MIN(rect.size.width, rect.size.height) * 0.225f;
-        CGFloat W = rect.size.width, H = rect.size.height;
+        if (rc <= 0) rc = MIN(W, H) * 0.225f;
         // inset=0: 弧线沿 squircle 内沿 (端点 (extra, extra+rc) 等, 完全贴图标圆角曲率)
         // inset>0: 沿角落单位向量外移，形状保持 (恒为 squircle 1/4，不会因 R 增大变形/出 frame)
         CGFloat s = inset * 0.70710678f;  // 1/√2
