@@ -40,7 +40,7 @@ const CGFloat MKBadgeFrameExtra = 15.0f;
 
     // v2.0.66.82: 角标模式 —— 沿图标 squircle 1/4 弧（三次贝塞尔，完全贴图标圆角曲率）
     // inset 改为整体往所选角落方向平移（√2/2 归一化），形状保持 squircle 不变形
-    // frame 已扩 kBadgeFrameExtra(15pt) 四周，drawRect 内先平移 (extra, extra) 到 icon 坐标系
+    // frame 已扩 MKBadgeFrameExtra(15pt) 四周，drawRect 内先平移 (extra, extra) 到 icon 坐标系
     if (cfg.locationMode == MKLocationBadge) {
         CGFloat t = cfg.badgeThickness;
         CGFloat inset = cfg.badgeInset;
@@ -58,11 +58,11 @@ const CGFloat MKBadgeFrameExtra = 15.0f;
             default /*BottomRight*/:       tx =   s; ty =   s; break;
         }
         // 先平移 (extra, extra) 到 icon 坐标系，再平移 (tx, ty) 到角落外
-        // 整合为 (kBadgeFrameExtra + tx, kBadgeFrameExtra + ty)
+        // 整合为 (MKBadgeFrameExtra + tx, MKBadgeFrameExtra + ty)
         // 端点用 icon 坐标系 (0,rc)/(rc,0) 等
         CGContextRef ctx = UIGraphicsGetCurrentContext();
         if (!ctx) return;
-        CGContextTranslateCTM(ctx, kBadgeFrameExtra + tx, kBadgeFrameExtra + ty);
+        CGContextTranslateCTM(ctx, MKBadgeFrameExtra + tx, MKBadgeFrameExtra + ty);
 
         // squircle 1/4 三次贝塞尔近似 (Apple continuous corner 控制点比例 0.528)
         CGFloat k = 0.528f;
