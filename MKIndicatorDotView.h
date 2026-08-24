@@ -9,6 +9,10 @@
 #import <UIKit/UIKit.h>
 #import "MKConfig.h"
 
+// v2.0.66.82: 角标模式 indicator frame 四周扩展量 = max inset(12) + max half-thickness(3)
+// Tweak.x(MKIndicatorFrameInOverlay) 和 MKIndicatorDotView.m(drawRect 平移) 共享
+extern const CGFloat MKBadgeFrameExtra;
+
 @interface MKIndicatorDotView : UIView
 
 // 根据当前 MKConfig 刷新外观(颜色/形状/不透明度)

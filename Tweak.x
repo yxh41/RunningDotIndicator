@@ -282,7 +282,9 @@ static UIView *MKOverlayForContainer(UIView *container) {
     return ov;
 }
 
-#pragma mark - 角标模式辅助（v2.0.66.80, .81 修 strncmp 死码）
+#pragma mark - 角标模式辅助（v2.0.66.80, .81 修 strncmp 死码, .82 改 squircle+扩 frame）
+// v2.0.66.82: frame 扩展常量 MKBadgeFrameExtra 定义在 MKIndicatorDotView.h（extern），
+// Tweak.x(MKIndicatorFrameInOverlay) 和 MKIndicatorDotView.m(drawRect) 共享
 // 取图标图片视图(SBIconImageView / SBIconImageCrossfadeView)，用于角标贴附图标圆角
 // v2.0.66.81: 原 strncmp(n,"SBIconImage",12) 比较长度写成12，"SBIconImage" 仅11字符+null=12，
 //   第12字节 '\0' 与任何 SBIconImage* 类名第12字节(字母)不等 → 恒不匹配 → 永远回退到 SBIconView
@@ -454,7 +456,12 @@ static CGRect MKIndicatorFrameInOverlay(SBIconView *iv, UIView *overlay, MKConfi
     if (cfg.locationMode == MKLocationBadge) {
         // 角标模式：指示器贴在图标图片圆角内沿，按图标图片真实 bounds 计算（不依赖 label 位置）
         UIView *base = MKIconImageView((UIView *)iv) ?: (UIView *)iv;
-        return [overlay convertRect:base.bounds fromView:base];
+        CGRect r = [overlay convertRect:base.bounds fromView:base];
+        // v2.0.66.82: 四周各扩 MKBadgeFrameExtra(15pt)，容纳 max inset(12) + max half-thickness(3)
+        // 供 inset>0 时弧线整体外移到角落外 + stroke 圆头不裁。
+        // drawRect 内对应按 (MKBadgeFrameExtra, MKBadgeFrameExtra) 平移到 icon 坐标系。
+        return CGRectMake(r.origin.x - MKBadgeFrameExtra, r.origin.y - MKBadgeFrameExtra,
+                          r.size.width + 2 * MKBadgeFrameExtra, r.size.height + 2 * MKBadgeFrameExtra);
     }
     CGFloat indW = (cfg.shape == MKShapeDot) ? cfg.dotSize : cfg.barWidth;
     CGFloat indH = (cfg.shape == MKShapeDot) ? cfg.dotSize : cfg.barHeight;
