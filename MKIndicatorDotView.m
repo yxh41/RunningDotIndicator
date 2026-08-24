@@ -6,6 +6,7 @@
 //
 
 #import "MKIndicatorDotView.h"
+#import <math.h>
 
 @implementation MKIndicatorDotView
 
@@ -33,6 +34,30 @@
 - (void)drawRect:(CGRect)rect {
     MKConfig *cfg = [MKConfig sharedConfig];
     UIColor *color = self.indicatorColor ?: cfg.color;
+
+    // v2.0.66.80: 角标模式 —— 画单角弧线（贴图标圆角内沿），提前 return
+    if (cfg.locationMode == MKLocationBadge) {
+        CGFloat t = cfg.badgeThickness;
+        CGFloat inset = cfg.badgeInset;
+        CGFloat rc = self.iconCornerRadius;
+        if (rc <= 0) rc = MIN(rect.size.width, rect.size.height) * 0.225f;
+        CGFloat R = rc - inset - t / 2.0f;
+        if (R < t / 2.0f) R = t / 2.0f;
+        CGFloat W = rect.size.width, H = rect.size.height;
+        CGPoint c; CGFloat start, end; BOOL cw;
+        switch (self.badgeCorner) {
+            case MKBadgeCornerTopLeft:     c = CGPointMake(rc, rc);         start = -M_PI_2; end = -M_PI;   cw = NO;  break;
+            case MKBadgeCornerTopRight:    c = CGPointMake(W - rc, rc);     start = -M_PI_2; end = 0.0f;   cw = YES; break;
+            case MKBadgeCornerBottomLeft:  c = CGPointMake(rc, H - rc);     start = M_PI;   end = M_PI_2;  cw = NO;  break;
+            default /*BottomRight*/:       c = CGPointMake(W - rc, H - rc); start = 0.0f;   end = M_PI_2;  cw = YES; break;
+        }
+        [color setStroke];
+        UIBezierPath *arc = [UIBezierPath bezierPathWithArcCenter:c radius:R startAngle:start endAngle:end clockwise:cw];
+        arc.lineWidth = t;
+        arc.lineCapStyle = kCGLineCapRound;
+        [arc stroke];
+        return;
+    }
 
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (!ctx) return;

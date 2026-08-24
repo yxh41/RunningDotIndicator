@@ -17,4 +17,8 @@
 // per-icon 颜色（AutoIcon 模式时覆盖 cfg.color）
 @property (nonatomic, strong) UIColor *indicatorColor;
 
+// v2.0.66.80: 角标模式参数
+@property (nonatomic, assign) CGFloat iconCornerRadius;  // 图标图片真实圆角
+@property (nonatomic, assign) MKBadgeCorner badgeCorner; // 角标所在角落
+
 @end

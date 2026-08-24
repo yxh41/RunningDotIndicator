@@ -17,6 +17,18 @@ typedef NS_ENUM(NSInteger, MKColorMode) {
     MKColorModeAutoIcon = 1   // 从图标取主色调(dominant color)（Lynx2 风格）
 };
 
+typedef NS_ENUM(NSInteger, MKLocationMode) {
+    MKLocationReplace = 0,  // 替换名称（原默认）
+    MKLocationBadge   = 1   // 角标模式：贴图标角落，不抢名字
+};
+
+typedef NS_ENUM(NSInteger, MKBadgeCorner) {
+    MKBadgeCornerTopLeft     = 0,  // 左上（默认，避开系统通知 badge/小黄点）
+    MKBadgeCornerTopRight    = 1,
+    MKBadgeCornerBottomLeft  = 2,
+    MKBadgeCornerBottomRight = 3
+};
+
 @interface MKConfig : NSObject
 
 + (instancetype)sharedConfig;
@@ -34,6 +46,12 @@ typedef NS_ENUM(NSInteger, MKColorMode) {
 @property (nonatomic, readonly) CGFloat    opacity;        // 不透明度, 默认 1.0
 @property (nonatomic, readonly) BOOL       folderIndicators;   // 桌面文件夹是否显示指示器, 默认 YES
 @property (nonatomic, readonly) BOOL       keepBetaDot;     // 是否保留运行中 TestFlight/beta App 的小黄点, 默认 YES
+
+// 位置模式：替换名称 / 角标模式
+@property (nonatomic, readonly) MKLocationMode locationMode;   // 默认 MKLocationReplace
+@property (nonatomic, readonly) MKBadgeCorner   badgeCorner;   // 角标角落, 默认 左上
+@property (nonatomic, readonly) CGFloat    badgeThickness; // 角标线条粗细(pt), 默认 4, 钳制 2-10
+@property (nonatomic, readonly) CGFloat    badgeInset;     // 角标与图标内线距离(pt), 默认 0(贴合), 钳制 0-12
 
 // 把 #RRGGBB / #RGB 解析为 UIColor
 + (UIColor *)colorFromHex:(NSString *)hex;

@@ -121,6 +121,31 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
     return YES;
 }
 
+// v2.0.66.80: 位置模式，默认替换名称
+- (MKLocationMode)locationMode {
+    id v = _prefs[@"locationMode"];
+    return v ? (MKLocationMode)[v integerValue] : MKLocationReplace;
+}
+// v2.0.66.80: 角标角落，默认左上
+- (MKBadgeCorner)badgeCorner {
+    id v = _prefs[@"badgeCorner"];
+    if (!v) return MKBadgeCornerTopLeft;
+    NSInteger c = [v integerValue];
+    return (c >= 0 && c <= 3) ? (MKBadgeCorner)c : MKBadgeCornerTopLeft;
+}
+// v2.0.66.80: 角标粗细，默认 4，钳制 2-10
+- (CGFloat)badgeThickness {
+    id v = _prefs[@"badgeThickness"];
+    CGFloat t = v ? [v floatValue] : 4.0f;
+    return (t < 2.0f) ? 2.0f : (t > 10.0f ? 10.0f : t);
+}
+// v2.0.66.80: 角标与图标内线距离，默认 0(贴合)，钳制 0-12
+- (CGFloat)badgeInset {
+    id v = _prefs[@"badgeInset"];
+    CGFloat i = v ? [v floatValue] : 0.0f;
+    return (i < 0.0f) ? 0.0f : (i > 12.0f ? 12.0f : i);
+}
+
 + (UIColor *)colorFromHex:(NSString *)hex {
     if (![hex isKindOfClass:[NSString class]] || ![hex length]) {
         return [UIColor systemGreenColor];

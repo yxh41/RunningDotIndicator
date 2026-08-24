@@ -281,6 +281,35 @@ static UIView *MKOverlayForContainer(UIView *container) {
     }
     return ov;
 }
+
+#pragma mark - 角标模式辅助（v2.0.66.80）
+// 取图标图片视图(SBIconImageView / SBIconImageCrossfadeView)，用于角标贴附图标圆角
+static UIView *MKIconImageView(UIView *iv) {
+    if (!iv) return nil;
+    for (UIView *sub in iv.subviews) {
+        const char *n = class_getName([sub class]);
+        if (strncmp(n, "SBIconImage", 12) == 0) return sub;
+    }
+    return nil;
+}
+// 取图标图片真实圆角（continuousCornerRadius，iOS13+ 图标圆角真正来源；普通 cornerRadius 常为 0）
+static CGFloat MKIconCornerRadius(UIView *iv) {
+    UIView *imv = MKIconImageView(iv);
+    UIView *target = imv ?: iv;
+    CALayer *layer = target.layer;
+    if ([layer respondsToSelector:@selector(continuousCornerRadius)]) {
+        NSNumber *cr = [layer valueForKey:@"continuousCornerRadius"];
+        if (cr && [cr floatValue] > 0) return [cr floatValue];
+    }
+    if (layer.cornerRadius > 0) return layer.cornerRadius;
+    CGFloat m = MIN(target.bounds.size.width, target.bounds.size.height);
+    return m * 0.225f;
+}
+// 角标模式下不抢名字位置 → 所有藏名逻辑统一失效
+static BOOL MKHideNames(void) {
+    return [MKConfig sharedConfig].locationMode != MKLocationBadge;
+}
+
 // v1.6.66: 递归查找某类的首个后代视图（关闭文件夹时定位主屏滚动容器 SBIconScrollView）
 static UIView *MKFindDescendantView(UIView *root, NSString *clsName) {
     if (!root || !clsName) return nil;
@@ -417,6 +446,11 @@ static void MKUnlockRestore(void) {
 // 无 live 视图（图标离屏/被回收）→ 返回 CGRectZero，调用方保留其最后位置不重算。
 static CGRect MKIndicatorFrameInOverlay(SBIconView *iv, UIView *overlay, MKConfig *cfg) {
     if (!iv || !overlay || !cfg) return CGRectZero;
+    if (cfg.locationMode == MKLocationBadge) {
+        // 角标模式：指示器贴在图标图片圆角内沿，按图标图片真实 bounds 计算（不依赖 label 位置）
+        UIView *base = MKIconImageView((UIView *)iv) ?: (UIView *)iv;
+        return [overlay convertRect:base.bounds fromView:base];
+    }
     CGFloat indW = (cfg.shape == MKShapeDot) ? cfg.dotSize : cfg.barWidth;
     CGFloat indH = (cfg.shape == MKShapeDot) ? cfg.dotSize : cfg.barHeight;
     UIView *label = MKGetCachedLabel(iv);
@@ -2228,6 +2262,8 @@ static void *MKResolveOrigIMP(NSMutableDictionary *byClass, CFMutableDictionaryR
 // outMapOnly: 仅经指针弱键命中(直接 bid 未中) —— 对应原 OVERLAP-GAP 诊断条件 !hasBid && inMap。
 // 返回 useBid（非 nil = 该藏名）；具体「压制复显」由调用方据自身语义执行(setHidden 改 hidden / setAlpha 改 a 后调 orig)。
 static NSString *MKShouldHideLabel(UIView *label, NSString *bid, BOOL *outMapOnly) {
+    // v2.0.66.80: 角标模式不抢名字位置 → 源头切断所有藏名判定（名字永不藏）
+    if ([MKConfig sharedConfig].locationMode == MKLocationBadge) return nil;
     NSString *mapBid = (sHiddenLabelToBid ? [sHiddenLabelToBid objectForKey:(id)label] : nil);
     // β5: 清过期弱键关联 —— label 对象被跨 icon 复用(同指针不释放)而其当前实时 bid 已变为另一个
     // 有效 bid 时, 旧 mapBid 属回收残留; 此时不采信旧 mapBid 并清掉, 避免误藏/误判。
@@ -2260,7 +2296,7 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
             // v1.6.99: MKShouldHideLabel 已写回直接关联键 + 掐动画(标记自持，根除关文件夹缩回/主屏重叠闪现，详见 helper 注释)
             
             // v2.0.64: 删除原 REVEAL-ATTEMPT 分支 —— hidden 已在上行置 YES，!hidden 恒为 NO，该分支实际不可达(纯 debug 死代码)
-        } else if (MKViewInFolderThumb((UIView *)self)) {
+        } else if (MKHideNames() && MKViewInFolderThumb((UIView *)self)) {
             // v2.0.66.1: 缩略图内运行 App 名称 label 经 setHidden: 复显时兜底钉藏(仅运行 App + 仅缩略图上下文)
             NSString *fb = MKFolderThumbBid((UIView *)self);
             if (fb.length && sHiddenBids && [sHiddenBids containsObject:fb]) {
@@ -2268,7 +2304,7 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
                 MKAssocLabelBid((UIView *)self, fb);
                 [((UIView *)self).layer removeAllAnimations];
             }
-        } else if (MKForeignContainerCtx((UIView *)self)) {
+        } else if (MKHideNames() && MKForeignContainerCtx((UIView *)self)) {
             // v2.0.66.37: fctx 强制藏名补刀——foreign 容器(dock/负一屏/widget)名经 setHidden:NO 复显
             // (同窗口同 superview, didMoveToWindow/didMoveToSuperview 不触发)时在此压住; 零分配判定, 主屏/文件夹不受影响。
             // β2: 移除原 MKLabelPhysicallyInDock 物理纵带补刀(形态 B 改由 MKDockStrayHide 每帧兜底), 收敛 swizzle 面。
@@ -2298,7 +2334,7 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
             
             // v2.0.66-diag: 关窗内 iOS 经 setAlpha:>0 复显【任意图标(含非运行 app)】label 也记(REVEAL-ATTEMPT); useBid=nil 即非运行,可区分
             
-        } else if (MKViewInFolderThumb((UIView *)self)) {
+        } else if (MKHideNames() && MKViewInFolderThumb((UIView *)self)) {
             // v2.0.66.1: 缩略图内运行 App 名称 label 经 setAlpha: 复显时兜底钉藏(仅运行 App + 仅缩略图上下文)
             NSString *fb = MKFolderThumbBid((UIView *)self);
             if (fb.length && sHiddenBids && [sHiddenBids containsObject:fb]) {
@@ -2306,7 +2342,7 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
                 MKAssocLabelBid((UIView *)self, fb);
                 [((UIView *)self).layer removeAllAnimations];
             }
-        } else if (MKForeignContainerCtx((UIView *)self)) {
+        } else if (MKHideNames() && MKForeignContainerCtx((UIView *)self)) {
             // v2.0.66.37: fctx 强制藏名补刀——foreign 容器(dock/负一屏/widget)名经 setAlpha:>0 复显
             // (同窗口同 superview, didMoveToWindow/didMoveToSuperview 不触发)时在此压住; 零分配判定, 主屏/文件夹不受影响。
             // β2: 移除原 MKLabelPhysicallyInDock 物理纵带补刀(形态 B 改由 MKDockStrayHide 每帧兜底), 收敛 swizzle 面。
@@ -2348,7 +2384,7 @@ static void MKLabelDidMoveToWindowHook(id self, SEL _cmd) {
             // v2.0.41: 关窗内 label 进 window 即带名可见(属运行 App)时记一笔(REVEAL-ATTEMPT)
             
             NSString *bid = MKLabelToBid(lbl); // v2.0.7: 含几何兜底，瞬态也能解出
-            if (bid && sHiddenBids && [sHiddenBids containsObject:bid]) {
+            if (bid && sHiddenBids && [sHiddenBids containsObject:bid] && MKHideNames()) {
                 lbl.hidden = YES;
                 lbl.alpha = 0.0f;
                 lbl.layer.opacity = 0.0f;
@@ -2360,7 +2396,7 @@ static void MKLabelDidMoveToWindowHook(id self, SEL _cmd) {
             // 在「进 window 创建点」即强制藏名, 先于系统任何显示路径, 灭亚秒级闪现; 此前仅 MKStrayNameProbe 的 if(ctx)
             // 于 setHidden/setAlpha/1s 轮询时藏, 漏掉「直接 addSubview 进已可见父视图」(不调 setHidden/setAlpha)的显形路径。
             NSString *fctx = MKForeignContainerCtx(lbl);
-            if (fctx) {
+            if (fctx && MKHideNames()) {
                 lbl.hidden = YES;
                 lbl.alpha = 0.0f;
                 lbl.layer.opacity = 0.0f;
@@ -2399,7 +2435,7 @@ static void MKLabelDidMoveToSuperviewHook(id self, SEL _cmd) {
         UIView *curIV = nil;
         UIView *a = lbl.superview;
         while (a) { if (ivCls && [a isKindOfClass:ivCls]) { curIV = a; break; } a = a.superview; }
-        if (curIV && curIV != storedOwner) {
+        if (curIV && curIV != storedOwner && MKHideNames()) {
             // 真·跨图标复用：旧属主(如文件夹/其它 app)文字串到新槽位 → 清过期键 + 隐藏
             objc_setAssociatedObject(lbl, &kMKLabelIconKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             MKAssocLabelBid(lbl, nil);
@@ -2412,7 +2448,7 @@ static void MKLabelDidMoveToSuperviewHook(id self, SEL _cmd) {
         // 覆盖「仅换父、window 不变」的显形路径(与 didMoveToWindow 双保险, 灭亚秒级闪现);
         // 守卫在 MKForeignContainerCtx 内(MKLabelInHomeGrid)确保主屏网格名不被误杀。
         NSString *fctx = MKForeignContainerCtx(lbl);
-        if (fctx) {   // β2: 移除原 MKLabelPhysicallyInDock 物理纵带补刀(形态 B 改由 MKDockStrayHide 每帧兜底)
+        if (fctx && MKHideNames()) {   // β2: 移除原 MKLabelPhysicallyInDock 物理纵带补刀(形态 B 改由 MKDockStrayHide 每帧兜底)
             lbl.hidden = YES;
             lbl.alpha = 0.0f;
             lbl.layer.opacity = 0.0f;
@@ -2496,7 +2532,7 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
         // v2.0.66-diag: 关窗内 iOS 经 setIconLabelAlpha:>0 复显【文件夹内任意图标(含非运行 app)】label 都记(REVEAL-ATTEMPT)，
         // 区分「a 层运行 app(cached-bid 翻转,可修)」vs「非运行/b 层(本 hook 看不到→日志零命中,近似无解)」。via 串含 hasBid。
         
-        if (hasBid) {   // 仅藏名 bid 成员：钉死 alpha=0 压制 iOS 经此 setter 补回的回弹
+        if (hasBid && MKHideNames()) {   // 仅藏名 bid 成员：钉死 alpha=0 压制 iOS 经此 setter 补回的回弹
             a = 0.0f;
             UIView *lbl = MKGetCachedLabel((SBIconView *)self);
             if (lbl) {
@@ -2507,7 +2543,7 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
         } else {
             // v2.0.66.31: dock 上下文钉 alpha=0 —— 覆盖「随机名(非运行中 app)经 setIconLabelAlpha: 补回可见」的复用回弹(创建点钩子漏掉的瞬态)。
             // 仅当本 SBIconView 在 dock 容器内生效; 主屏/文件夹走原 hasBid 逻辑, 不受影响。
-            if (MKLabelInDock((UIView *)self)) {
+            if (MKLabelInDock((UIView *)self) && MKHideNames()) {
                 a = 0.0f;
                 UIView *dlbl = MKGetCachedLabel((SBIconView *)self);
                 if (dlbl) {
@@ -2820,7 +2856,10 @@ static void MKUpdate(SBIconView *self) {
                     }
                     // 顺带加固 label 隐藏不变量（呼应 v1.6.82，防与圆点重叠）
                     UIView *lbl = MKGetCachedLabel((SBIconView *)self);
-                    if (lbl) { lbl.hidden = YES; lbl.alpha = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO; MKAssocLabelBid(lbl, fBid); }
+                    if (lbl) {
+                        if (MKHideNames()) { lbl.hidden = YES; lbl.alpha = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO; MKAssocLabelBid(lbl, fBid); }
+                        else { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; MKAssocLabelBid(lbl, nil); }
+                    }
                 }
                 
                 return;
@@ -2849,7 +2888,10 @@ static void MKUpdate(SBIconView *self) {
             NSString *rep = MKFolderChosenBid(contained);
             UIView *label = MKGetCachedLabel(self);
             
-            if (label) { label.hidden = YES; label.alpha = 0.0f; label.layer.opacity = 0.0f; label.opaque = NO; MKAssocLabelBid(label, fBid); }
+            if (label) {
+                if (MKHideNames()) { label.hidden = YES; label.alpha = 0.0f; label.layer.opacity = 0.0f; label.opaque = NO; MKAssocLabelBid(label, fBid); }
+                else { label.hidden = NO; label.alpha = 1.0f; label.layer.opacity = 1.0f; label.opaque = YES; MKAssocLabelBid(label, nil); }
+            }
             UIView *container = MKContainerForIconView((UIView *)self);
             UIView *overlay = MKOverlayForContainer(container);
             if (!overlay) {
@@ -2862,6 +2904,8 @@ static void MKUpdate(SBIconView *self) {
                 indicator = [[MKIndicatorDotView alloc] initWithFrame:indicatorFrame];
                 indicator.tag = kDotTag;
                 objc_setAssociatedObject(indicator, &kMKIndicatorBidKey, fBid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                [(MKIndicatorDotView *)indicator setIconCornerRadius:MKIconCornerRadius((UIView *)self)];
+                [(MKIndicatorDotView *)indicator setBadgeCorner:fCfg.badgeCorner];
                 [(MKIndicatorDotView *)indicator applyConfig];
                 if (!fixedColor && rep.length) {
                     UIColor *c = MKCachedIconColorForBundleID(rep);
@@ -2870,7 +2914,7 @@ static void MKUpdate(SBIconView *self) {
                 [overlay addSubview:indicator];
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:fBid];
-                if (sHiddenBids) [sHiddenBids addObject:fBid]; // v1.6.85: 文件夹合成 key 也要藏名
+                if (sHiddenBids && MKHideNames()) [sHiddenBids addObject:fBid]; // v1.6.85: 文件夹合成 key 也要藏名
                 
                 MKFadeInFolderIndicatorIfClosing(indicator); // v2.0.43: 关窗期淡入, 消除缩略图点瞬现
             } else {
@@ -3064,12 +3108,19 @@ static void MKUpdate(SBIconView *self) {
         // 标签渐隐已完成（alpha=0），但仍需保持隐藏状态防止系统恢复
         if (isPending) {
             
-            if (label) {
+            if (label && MKHideNames()) {
                 label.hidden = YES;
                 label.alpha = 0.0f;
                 label.layer.opacity = 0.0f;
                 label.opaque = NO;
                 MKAssocLabelBid(label, bundleID);
+            } else if (label) {
+                // 角标模式：名字保持可见
+                label.hidden = NO;
+                label.alpha = 1.0f;
+                label.layer.opacity = 1.0f;
+                label.opaque = YES;
+                MKAssocLabelBid(label, nil);
             }
             return;  // 不创建指示器，等300ms后 MKRefreshIconForBundleID 回调
         }
@@ -3079,11 +3130,20 @@ static void MKUpdate(SBIconView *self) {
         // ── App 正在运行 → 隐藏名字，显示指示器 ──
             MKDetachBetaOnce((UIView *)self); // v2.0.30: beta App 先把小黄点脱离 label，避免被藏名牵连
             if (label) {
-                label.hidden = YES;
-                label.alpha = 0.0f;
-                label.layer.opacity = 0.0f;
-                label.opaque = NO;
-                MKAssocLabelBid(label, bundleID);
+                if (MKHideNames()) {
+                    label.hidden = YES;
+                    label.alpha = 0.0f;
+                    label.layer.opacity = 0.0f;
+                    label.opaque = NO;
+                    MKAssocLabelBid(label, bundleID);
+                } else {
+                    // 角标模式：名字保持可见
+                    label.hidden = NO;
+                    label.alpha = 1.0f;
+                    label.layer.opacity = 1.0f;
+                    label.opaque = YES;
+                    MKAssocLabelBid(label, nil);
+                }
             } else {
             // v1.5.5 诊断：App 在运行但找不到标签
             
@@ -3115,6 +3175,8 @@ static void MKUpdate(SBIconView *self) {
             indicator = [[MKIndicatorDotView alloc] initWithFrame:indicatorFrame];
             indicator.tag = kDotTag;
             objc_setAssociatedObject(indicator, &kMKIndicatorBidKey, bundleID, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v1.6.63: 记录归属，供防乱跑校验
+            [(MKIndicatorDotView *)indicator setIconCornerRadius:MKIconCornerRadius((UIView *)self)];
+            [(MKIndicatorDotView *)indicator setBadgeCorner:cfg.badgeCorner];
             [(MKIndicatorDotView *)indicator applyConfig];
 
             // v1.6.11: AutoIcon 模式 — 从图标取主色调作为指示器颜色
@@ -3139,7 +3201,7 @@ static void MKUpdate(SBIconView *self) {
                 [overlay addSubview:indicator];
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:bundleID];
-                if (sHiddenBids) [sHiddenBids addObject:bundleID]; // v1.6.85: 标记此 bid 名字必须隐藏
+                if (sHiddenBids && MKHideNames()) [sHiddenBids addObject:bundleID]; // v1.6.85: 标记此 bid 名字必须隐藏
                 CGFloat finalAlpha = cfg.opacity;
                 
                 [UIView animateWithDuration:0.2 animations:^{
@@ -3149,7 +3211,7 @@ static void MKUpdate(SBIconView *self) {
                 [overlay addSubview:indicator];
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:bundleID];
-                if (sHiddenBids) [sHiddenBids addObject:bundleID]; // v1.6.85: 标记此 bid 名字必须隐藏
+                if (sHiddenBids && MKHideNames()) [sHiddenBids addObject:bundleID]; // v1.6.85: 标记此 bid 名字必须隐藏
             }
             [overlay bringSubviewToFront:indicator];  // v1.6.71: 确保指示器在文件夹 overlay 顶层（z-order）
             
@@ -3315,7 +3377,7 @@ static void MKRefreshAllIcons() {
                     // v2.0.66.46: dock 串名事件兜底 —— 内联进本趟 BFS, 零额外遍历
                     // (取代 v2.0.66.45 在函数尾部再独立 BFS 一整棵树的 MKDockBandSweep)。
                     // 必须放在 MKUpdate 之后: MKUpdate 会为非运行 App 复显名称, 先藏会被它覆盖。
-                    MKDockStrayHide((SBIconView *)current, NULL);
+                    if (MKHideNames()) MKDockStrayHide((SBIconView *)current, NULL);
                 }
                 for (UIView *child in current.subviews) {
                     [stack addObject:child];
@@ -3380,6 +3442,7 @@ static void MKRefreshIconForBundleID(NSString *bid) {
 static void MKFadeOutLabelForBundleID(NSString *bid) {
     MKSafe(^{
         if (!sInitDone || !bid.length) return;
+        if (!MKHideNames()) return;  // 角标模式：名字永不渐隐，保持可见
         MKAddFadingLabel(bid);  // v1.5.8: 标记渐隐状态
 
         BOOL fadeStarted = NO;  // v1.6.0: 追踪是否实际启动了渐隐动画
@@ -3645,7 +3708,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
             // 改判据：只要该 App 仍在后台运行（名字本就该被圆点替代），无论指示器对象
             // 此刻在否都强制保留隐藏。与 v1.6.96 "sHiddenBids 权威"不变量一致；
             // 关闭后主屏图标 MKUpdate 会接管重显指示器，名字继续由藏名规则压制。
-            if (bid2 && (MKFindIndicator(bid2) || (MKIsAppRunning(bid2) && !MKIsForeground(bid2)))) {
+            if (bid2 && (MKFindIndicator(bid2) || (MKIsAppRunning(bid2) && !MKIsForeground(bid2))) && MKHideNames()) {
                 label.hidden = YES;
                 label.alpha = 0.0f;
                 label.layer.opacity = 0.0f;
@@ -3682,7 +3745,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     // 形态 B(label 仅物理漂到 dock 纵带、层级仍主屏)整段跳过 → 每帧藏名对当前复发的串名完全失效。
     {
         BOOL strayHidden = NO;
-        if (MKDockStrayHide((SBIconView *)self, &strayHidden)) {
+        if (MKHideNames() && MKDockStrayHide((SBIconView *)self, &strayHidden)) {
             return;  // 真 dock 图标: 名字已钉藏, 不走下方主屏/文件夹逻辑; 指示器几何由 MKUpdate 全局管理
         }
         if (strayHidden) {
@@ -3723,7 +3786,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
             // v2.0.4: sHiddenBids 权威（见上方注释）。只要 fBid 仍在集合即强制藏名，
             // 不再依赖指示器对象当场在场——对齐 App 分支 2782 的不变量。
             BOOL mustHide = (MKFindIndicator(fBid) != nil) || (sHiddenBids && [sHiddenBids containsObject:fBid]);
-            if (mustHide) {
+            if (mustHide && MKHideNames()) {
                 UIView *label = MKGetCachedLabel((SBIconView *)self);
                 if (label && label.superview) {
                     label.hidden = YES;
@@ -3765,7 +3828,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     // 与层级无关；只要本 bid 仍在 sHiddenBids（App 后台运行、名字须隐藏）即强制藏名。
     // 同时把 bid 种回 label 直接关联键，使源头级 setHidden: hook 稳定命中。
     BOOL mustHide = (indicator != nil) || (bid.length && sHiddenBids && [sHiddenBids containsObject:bid]);
-    if (mustHide) {   // v2.0.12: 撤销 v2.0.9 关合窗口内文件夹内 icon 让步原生(无条件强制藏名), 根治 sub-16ms settle 单帧闪现(第④点残留)。详见 MKSetHiddenHook 同款注释。
+    if (mustHide && MKHideNames()) {   // v2.0.12: 撤销 v2.0.9 关合窗口内文件夹内 icon 让步原生(无条件强制藏名), 根治 sub-16ms settle 单帧闪现(第④点残留)。详见 MKSetHiddenHook 同款注释。
         MKDetachBetaOnce((UIView *)self); // v2.0.30: beta App 每帧兜底脱离（仅当小黄点仍在 label 内才动，脱离后跳过）
         // v2.0.8: 主路径仍藏缓存 label；额外 BFS 当前子树，藏任何 label-like 子视图——
         // 缩回动画中 SpringBoard 给内层 App 新建/重父的 label 是【新对象】，MKGetCachedLabel
@@ -3840,7 +3903,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     // v1.6.82: 通用不变量——只要本 bid 当前有指示器（圆点），名字必须隐藏，
     // 否则滚动/转场布局把 label 复显会与圆点重叠。注意 folder 容器图标的 bid 是
     // __folder__%p（非 App），MKIsAppRunning 恒为 NO，旧条件 running&&!fg 会漏藏它 → 改判 indicator。
-    if (sScrolling) {
+    if (sScrolling && MKHideNames()) {
         if (indicator) {
             UIView *label = MKGetCachedLabel(self);
             if (label && label.superview) {
@@ -3869,7 +3932,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
             // 立即把名称强制隐藏——否则回桌面转场动画会把 label 复显(系统图标入场
             // 把 alpha 拉回 1)，与 300ms 后建出的指示器同显一瞬 = 名称与指示器重叠。
             // 原先在 isFading 时直接 return 不藏名，正是重叠窗口的成因。
-            if (MKIsPending(bid) || MKIsFadingLabel(bid)) {
+            if ((MKIsPending(bid) || MKIsFadingLabel(bid)) && MKHideNames()) {
                 UIView *label = MKGetCachedLabel(self);
                 if (label && label.superview) {
                     label.hidden = YES;
@@ -3901,7 +3964,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     if (!cfg || !cfg.enabled) { MKUpdate(self); return; }
 
     label = MKGetCachedLabel(self);   // v1.6.97: 复用 2683 已声明函数级 label，避免同作用域重定义（-Werror 编译失败）
-    if (label && label.superview) {
+    if (label && label.superview && MKHideNames()) {
         label.hidden = YES;
         label.alpha = 0.0f;
         label.layer.opacity = 0.0f;
@@ -4020,7 +4083,7 @@ static void MKArmFolderCloseGuard(void) {
                                 // 证据(rd_log(63)): 关合窗口内 FOLDER-CLOSE-VISIBLE=0 / SNAP-PRE-NAME=0 / 无 Indicator 重建 → 根本不 strobe 互搏。
                                 // 故关合窗口内对文件夹内 label 干脆【全程强藏】, 不留任何让步窗口。FloatyFolder 识别由 MKIsIconInFolder 单独负责, 不受影响。
                                 // (无 yieldNative 变量, 避免 -Werror 未使用告警)
-                                if (b.length && sHiddenBids && [sHiddenBids containsObject:b]) {
+                                if (b.length && sHiddenBids && [sHiddenBids containsObject:b] && MKHideNames()) {
                                     UIView *lbl = MKGetCachedLabel(iv);
                                     // v2.0.5 探针 B：关文件夹窗口内，本该隐藏的 label 仍可见 = 泄漏。
                                     // 分两类报：① 缓存 label 可见（guard 抓到，至多晚 1 帧）→ via=guard；
@@ -4112,7 +4175,7 @@ static void MKArmFolderCloseGuard(void) {
                     // 层级查找（关文件夹动画中 label 被重父/新建 → 查找失效 → 漏藏 → 名称闪现）。
                     NSString *b = MKGetCachedBid(iv);
                     UIView *lbl = MKGetCachedLabel(iv);
-                    if (lbl && b.length && sHiddenBids && [sHiddenBids containsObject:b]) {
+                    if (lbl && b.length && sHiddenBids && [sHiddenBids containsObject:b] && MKHideNames()) {
                         lbl.hidden = YES; lbl.alpha = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO;
                         MKAssocLabelBid(lbl, b);  // 种回直接关联键，使源头级 hook 稳定命中
                     }
@@ -4130,7 +4193,7 @@ static void MKArmFolderCloseGuard(void) {
                         // v2.0.1: 同子树段 —— 改用图标自身 bid + 种回关联键
                         NSString *b = MKGetCachedBid(iv);
                         UIView *lbl = MKGetCachedLabel(iv);
-                        if (lbl && b.length && sHiddenBids && [sHiddenBids containsObject:b]) {
+                        if (lbl && b.length && sHiddenBids && [sHiddenBids containsObject:b] && MKHideNames()) {
                             lbl.hidden = YES; lbl.alpha = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO;
                             MKAssocLabelBid(lbl, b);
                         }
