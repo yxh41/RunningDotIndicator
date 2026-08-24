@@ -133,13 +133,13 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
     NSInteger c = [v integerValue];
     return (c >= 0 && c <= 3) ? (MKBadgeCorner)c : MKBadgeCornerTopLeft;
 }
-// v2.0.66.80: 角标粗细，默认 4，钳制 2-10
+// v2.0.66.81: 角标粗细，默认 4，钳制 1-6，支持小数（drawRect 直接读 float）
 - (CGFloat)badgeThickness {
     id v = _prefs[@"badgeThickness"];
     CGFloat t = v ? [v floatValue] : 4.0f;
-    return (t < 2.0f) ? 2.0f : (t > 10.0f ? 10.0f : t);
+    return (t < 1.0f) ? 1.0f : (t > 6.0f ? 6.0f : t);
 }
-// v2.0.66.80: 角标与图标内线距离，默认 0(贴合)，钳制 0-12
+// v2.0.66.81: 角标与图标距离，默认 0(内贴图标边角)，越大越向外离图标越远，钳制 0-12
 - (CGFloat)badgeInset {
     id v = _prefs[@"badgeInset"];
     CGFloat i = v ? [v floatValue] : 0.0f;

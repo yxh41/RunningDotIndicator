@@ -36,13 +36,15 @@
     UIColor *color = self.indicatorColor ?: cfg.color;
 
     // v2.0.66.80: 角标模式 —— 画单角弧线（贴图标圆角内沿），提前 return
+    // v2.0.66.81: inset 语义反转 — 0=内贴图标边角(弧线外边贴圆角内沿)，越大越向外离图标越远。
     if (cfg.locationMode == MKLocationBadge) {
         CGFloat t = cfg.badgeThickness;
         CGFloat inset = cfg.badgeInset;
         CGFloat rc = self.iconCornerRadius;
         if (rc <= 0) rc = MIN(rect.size.width, rect.size.height) * 0.225f;
-        CGFloat R = rc - inset - t / 2.0f;
-        if (R < t / 2.0f) R = t / 2.0f;
+        // inset=0: R=rc-t/2，弧线外边(R+t/2)=rc 贴圆角内沿；inset 增大: R 增大，弧线外凸离图标越远
+        CGFloat R = rc - t / 2.0f + inset;
+        if (R < t / 2.0f) R = t / 2.0f;   // rc 极小时兜底，防负半径
         CGFloat W = rect.size.width, H = rect.size.height;
         CGPoint c; CGFloat start, end; BOOL cw;
         switch (self.badgeCorner) {

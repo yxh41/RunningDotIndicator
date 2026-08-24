@@ -282,13 +282,18 @@ static UIView *MKOverlayForContainer(UIView *container) {
     return ov;
 }
 
-#pragma mark - 角标模式辅助（v2.0.66.80）
+#pragma mark - 角标模式辅助（v2.0.66.80, .81 修 strncmp 死码）
 // 取图标图片视图(SBIconImageView / SBIconImageCrossfadeView)，用于角标贴附图标圆角
+// v2.0.66.81: 原 strncmp(n,"SBIconImage",12) 比较长度写成12，"SBIconImage" 仅11字符+null=12，
+//   第12字节 '\0' 与任何 SBIconImage* 类名第12字节(字母)不等 → 恒不匹配 → 永远回退到 SBIconView
+//   (含名字标签区) → 左下/右下弧线圆心下移名字高度，"距离远"。修：长度改11 + 递归查找兜底嵌套。
 static UIView *MKIconImageView(UIView *iv) {
     if (!iv) return nil;
     for (UIView *sub in iv.subviews) {
         const char *n = class_getName([sub class]);
-        if (strncmp(n, "SBIconImage", 12) == 0) return sub;
+        if (strncmp(n, "SBIconImage", 11) == 0) return sub;
+        UIView *found = MKIconImageView(sub);   // 递归兜底：crossfade 等容器嵌套
+        if (found) return found;
     }
     return nil;
 }
@@ -3677,6 +3682,19 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
                                     CFStringRef name, const void *object,
                                     CFDictionaryRef userInfo) {
     [[MKConfig sharedConfig] reload];
+    // v2.0.66.81: 角标参数(badgeCorner/thickness/inset)变更时刷新已存在的指示器。
+    // thickness/inset 在 drawRect 直接读 cfg → setNeedsDisplay 即重画；
+    // badgeCorner 是属性需重设；iconCornerRadius 不变(图标本身没变)故不重设。
+    // locationMode 变更由下方 MKRefreshAllIcons/MKRefreshFolderIcons 重建/恢复名字处理。
+    if (sBidToIndicator) {
+        MKConfig *cfg = [MKConfig sharedConfig];
+        for (UIView *ind in [sBidToIndicator objectEnumerator]) {
+            if ([ind isKindOfClass:[MKIndicatorDotView class]]) {
+                [(MKIndicatorDotView *)ind setBadgeCorner:cfg.badgeCorner];
+                [ind setNeedsDisplay];
+            }
+        }
+    }
     MKRefreshAllIcons();
     MKRefreshFolderIcons();
 }

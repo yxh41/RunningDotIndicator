@@ -50,8 +50,8 @@ typedef NS_ENUM(NSInteger, MKBadgeCorner) {
 // 位置模式：替换名称 / 角标模式
 @property (nonatomic, readonly) MKLocationMode locationMode;   // 默认 MKLocationReplace
 @property (nonatomic, readonly) MKBadgeCorner   badgeCorner;   // 角标角落, 默认 左上
-@property (nonatomic, readonly) CGFloat    badgeThickness; // 角标线条粗细(pt), 默认 4, 钳制 2-10
-@property (nonatomic, readonly) CGFloat    badgeInset;     // 角标与图标内线距离(pt), 默认 0(贴合), 钳制 0-12
+@property (nonatomic, readonly) CGFloat    badgeThickness; // 角标线条粗细(pt), 默认 4, 钳制 1-6, 支持小数
+@property (nonatomic, readonly) CGFloat    badgeInset;     // 角标与图标距离(pt), 默认 0(内贴图标边角), 越大越向外, 钳制 0-12
 
 // 把 #RRGGBB / #RGB 解析为 UIColor
 + (UIColor *)colorFromHex:(NSString *)hex;

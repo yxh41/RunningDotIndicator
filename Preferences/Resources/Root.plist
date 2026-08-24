@@ -406,7 +406,7 @@
 			<key>label</key>
 			<string>角标设置</string>
 			<key>footerText</key>
-			<string>以下选项仅在「角标模式」下生效。</string>
+			<string>以下选项仅在「角标模式」下生效。距离：0=内贴图标边角，数值越大越向外远离图标。粗细支持小数。</string>
 		</dict>
 
 		<dict>
@@ -452,14 +452,12 @@
 			<key>default</key>
 			<real>4</real>
 			<key>min</key>
-			<real>2</real>
+			<real>1</real>
 			<key>max</key>
-			<real>10</real>
-			<key>isSegmented</key>
-			<true/>
-			<key>segmentCount</key>
-			<integer>8</integer>
+			<real>6</real>
 			<key>showValue</key>
+			<true/>
+			<key>isContinuous</key>
 			<true/>
 			<key>PostNotification</key>
 			<string>com.mk.runningdotindicator.reload</string>
