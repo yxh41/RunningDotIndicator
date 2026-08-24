@@ -32,6 +32,8 @@ static const CGFloat kLabelAreaH = 14.0f; // 图标下方名称区域典型高�
 @property (nonatomic, strong) UIView   *previewIcon;     // 头图里的模拟 App 图标
 @property (nonatomic, strong) UIView   *previewGlyph;    // 图标内白色 glyph
 @property (nonatomic, strong) UIView   *previewIndicator;// 实时预览指示点/横条
+@property (nonatomic, strong) UILabel  *previewName;     // v2.0.66.84: 角标模式下显示的图标名称
+@property (nonatomic, strong) CAShapeLayer *previewBadge;// v2.0.66.84: 角标模式实时预览弧线
 @property (nonatomic, strong) UILabel  *previewTitle;    // 头图标题行
 @property (nonatomic, strong) UILabel  *previewCaption;   // 头图副标题
 @property (nonatomic, assign) BOOL      heroAnimated;     // 入场动画只播一次
@@ -154,12 +156,31 @@ static UIColor *MKColorFromHex(NSString *hex) {
         ind.layer.masksToBounds = YES;
         [content addSubview:ind];
 
+        // v2.0.66.84: 角标模式预览 —— 图标下方保留名称 + 图标角落画 squircle 弧线
+        UILabel *name = [[UILabel alloc] initWithFrame:CGRectZero];
+        name.font = [UIFont systemFontOfSize:10 weight:UIFontWeightRegular];
+        name.textAlignment = NSTextAlignmentCenter;
+        name.text = @"App";
+        if (@available(iOS 13.0, *)) name.textColor = [UIColor labelColor];
+        else name.textColor = [UIColor blackColor];
+        name.hidden = YES;
+        [content addSubview:name];
+
+        // 弧线层挂在 content 上（不挂 icon，避免被 icon 的 masksToBounds 裁掉外移部分）
+        CAShapeLayer *badge = [CAShapeLayer layer];
+        badge.fillColor   = [UIColor clearColor].CGColor;
+        badge.lineCap     = kCALineCapRound;
+        badge.hidden      = YES;
+        [content.layer addSublayer:badge];
+
         self.heroView          = hero;
         self.previewIcon        = icon;
         self.previewGlyph       = glyph;
         self.previewTitle       = title;
         self.previewCaption     = cap;
         self.previewIndicator   = ind;
+        self.previewName        = name;
+        self.previewBadge       = badge;
     } @catch (NSException *e) {
         self.heroView = nil;
     }
@@ -168,6 +189,20 @@ static UIColor *MKColorFromHex(NSString *hex) {
 // 根据当前配置重算预览指示点的位置/尺寸/圆角
 - (void)updateIndicatorFrame {
     if (!self.previewIndicator || !self.previewIcon) return;
+
+    // v2.0.66.84: 角标模式 —— 隐藏圆点/横条，改在图标角落画 squircle 1/4 弧，名称保留
+    NSInteger locMode = [[self readValueForKey:@"locationMode" default:@0 expectedClass:[NSNumber class]] integerValue];
+    if (locMode == 1) {
+        self.previewIndicator.hidden = YES;
+        self.previewName.hidden      = NO;
+        self.previewBadge.hidden     = NO;
+        [self updateBadgePreview];
+        return;
+    }
+    self.previewIndicator.hidden = NO;
+    self.previewName.hidden      = YES;
+    self.previewBadge.hidden     = YES;
+
     NSInteger shape = [[self readValueForKey:@"shape" default:@0 expectedClass:[NSNumber class]] integerValue];
     CGFloat dot = [[self readValueForKey:@"dotSize"  default:@6  expectedClass:[NSNumber class]] floatValue];
     CGFloat bw  = [[self readValueForKey:@"barWidth"  default:@24 expectedClass:[NSNumber class]] floatValue];
@@ -188,6 +223,70 @@ static UIColor *MKColorFromHex(NSString *hex) {
     CGFloat ix = CGRectGetMidX(self.previewIcon.frame) - w / 2.0f;
     self.previewIndicator.frame = CGRectMake(ix, iy, w, h);
     self.previewIndicator.layer.cornerRadius = h / 2.0f;
+}
+
+// v2.0.66.84: 角标模式实时预览 —— 与 MKIndicatorDotView.m drawRect 同一套几何
+// (squircle 1/4 三次贝塞尔 k=0.528，inset 沿角落单位向量平移整段弧线)
+- (void)updateBadgePreview {
+    if (!self.previewBadge || !self.previewIcon) return;
+
+    NSInteger corner = [[self readValueForKey:@"badgeCorner" default:@0 expectedClass:[NSNumber class]] integerValue];
+    CGFloat t = [[self readValueForKey:@"badgeThickness" default:@4.0f expectedClass:[NSNumber class]] floatValue];
+    CGFloat inset = [[self readValueForKey:@"badgeInset" default:@0.0f expectedClass:[NSNumber class]] floatValue];
+    if (t < 1.0f) t = 1.0f; else if (t > 6.0f) t = 6.0f;
+    if (inset < 0.0f) inset = 0.0f; else if (inset > 12.0f) inset = 12.0f;
+
+    // 预览图标 52pt / 圆角 12pt；按真实图标比例(60pt/13.5pt)等比缩放粗细与距离，视觉更接近实机
+    CGFloat scale = kIconSize / 60.0f;
+    CGFloat tt = t * scale;
+    CGFloat ss = inset * scale * 0.70710678f;   // 1/√2
+
+    CGRect ic = self.previewIcon.frame;         // 与弧线层同处 content 坐标系
+    CGFloat W = ic.size.width, H = ic.size.height;
+    CGFloat rc = kIconRadius;
+    CGFloat ox = ic.origin.x, oy = ic.origin.y;
+    switch (corner) {
+        case 1:  ox += ss;  oy -= ss;  break;   // 右上
+        case 2:  ox -= ss;  oy += ss;  break;   // 左下
+        case 3:  ox += ss;  oy += ss;  break;   // 右下
+        default: ox -= ss;  oy -= ss;  break;   // 左上
+    }
+
+    CGFloat k = 0.528f;
+    UIBezierPath *p = [UIBezierPath bezierPath];
+    switch (corner) {
+        case 1:  // 右上
+            [p moveToPoint:CGPointMake(ox + W - rc, oy)];
+            [p addCurveToPoint:CGPointMake(ox + W, oy + rc)
+                 controlPoint1:CGPointMake(ox + W - rc * k, oy)
+                 controlPoint2:CGPointMake(ox + W, oy + rc * (1 - k))];
+            break;
+        case 2:  // 左下
+            [p moveToPoint:CGPointMake(ox + rc, oy + H)];
+            [p addCurveToPoint:CGPointMake(ox, oy + H - rc)
+                 controlPoint1:CGPointMake(ox + rc * k, oy + H)
+                 controlPoint2:CGPointMake(ox, oy + H - rc * (1 - k))];
+            break;
+        case 3:  // 右下
+            [p moveToPoint:CGPointMake(ox + W, oy + H - rc)];
+            [p addCurveToPoint:CGPointMake(ox + W - rc, oy + H)
+                 controlPoint1:CGPointMake(ox + W, oy + H - rc * (1 - k))
+                 controlPoint2:CGPointMake(ox + W - rc * k, oy + H)];
+            break;
+        default: // 左上
+            [p moveToPoint:CGPointMake(ox, oy + rc)];
+            [p addCurveToPoint:CGPointMake(ox + rc, oy)
+                 controlPoint1:CGPointMake(ox, oy + rc * (1 - k))
+                 controlPoint2:CGPointMake(ox + rc * k, oy)];
+            break;
+    }
+    self.previewBadge.frame     = self.previewIcon.superview.bounds;
+    self.previewBadge.path      = p.CGPath;
+    self.previewBadge.lineWidth = tt;
+
+    // 名称占回图标下方（角标模式不藏名）
+    self.previewName.frame = CGRectMake(ic.origin.x - 6.0f, CGRectGetMaxY(ic) + 3.0f,
+                                       ic.size.width + 12.0f, kLabelAreaH);
 }
 
 // 头图内子视图排版：图标(左) + 指示器(图标下居中) + 标题/副标题(右)，与 v1.6.18 一致
@@ -221,10 +320,22 @@ static UIColor *MKColorFromHex(NSString *hex) {
         // 预览指示点 = 当前生效色
         self.previewIndicator.backgroundColor = col;
         self.previewIndicator.alpha = opacity;
+        // v2.0.66.84: 角标弧线同色同透明度
+        self.previewBadge.strokeColor = col.CGColor;
+        self.previewBadge.opacity     = opacity;
         // 图标也用强调色，整体更协调
         self.previewIcon.backgroundColor = col;
 
-        if (mode == 1) {
+        NSInteger locMode = [[self readValueForKey:@"locationMode" default:@0 expectedClass:[NSNumber class]] integerValue];
+        if (locMode == 1) {
+            NSInteger corner = [[self readValueForKey:@"badgeCorner" default:@0 expectedClass:[NSNumber class]] integerValue];
+            NSArray *names = @[@"左上", @"右上", @"左下", @"右下"];
+            NSString *cn = (corner >= 0 && corner < 4) ? names[corner] : names[0];
+            self.previewTitle.text   = @"实时预览 · 角标模式";
+            self.previewCaption.text = (mode == 1)
+                ? [NSString stringWithFormat:@"%@角 · 主色调近似", cn]
+                : [NSString stringWithFormat:@"%@角 · 名称保留", cn];
+        } else if (mode == 1) {
             self.previewTitle.text   = @"实时预览 · 主色调";
             self.previewCaption.text = @"主色调模式下为近似预览";
         } else {
@@ -419,7 +530,14 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
         CFPreferencesAppSynchronize((__bridge CFStringRef)kPrefsDomain);
     }
     // 同步刷新界面显示
-    [self reloadSpecifier:specifier animated:YES];
+    // v2.0.66.84: 连续滑块（badgeThickness/badgeInset 等 isContinuous）在拖动中每 tick 都会
+    //   进来一次，此时 reloadSpecifier 会重建 cell → 滑块被打断/回弹，无法平滑拖动。
+    //   故仅对非滑块 cell 做 reload；滑块靠头图实时预览反馈即可。
+    NSString *cellCls = [specifier propertyForKey:@"cell"];
+    BOOL isSlider = (cellCls && [cellCls rangeOfString:@"Slider"].location != NSNotFound);
+    if (!isSlider) {
+        [self reloadSpecifier:specifier animated:YES];
+    }
 
     // 广播 Darwin 通知
     CFNotificationCenterPostNotification(

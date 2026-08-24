@@ -293,15 +293,31 @@ static UIView *MKIconImageView(UIView *iv) {
     if (!iv) return nil;
     for (UIView *sub in iv.subviews) {
         const char *n = class_getName([sub class]);
+        // v2.0.66.84: 文件夹图标的图片视图类名是 SBFolderIconImageView（不以 SBIconImage 开头），
+        //   而它内部嵌着一格格迷你 App 图标、每个迷你图标各自带 SBIconImageView。
+        //   原实现深度优先递归 → 先命中【迷你图标】的 SBIconImageView 就返回 → 角标按迷你图标
+        //   (约 1/3 尺寸、位于文件夹内部) 的 bounds 定位 → 文件夹 4 个角全部"距离远"。
+        //   修：先比 SBFolderIconImage 前缀，保证在钻进缩略图之前就命中文件夹本体图片视图。
+        if (strncmp(n, "SBFolderIconImage", 17) == 0) return sub;
         if (strncmp(n, "SBIconImage", 11) == 0) return sub;
         UIView *found = MKIconImageView(sub);   // 递归兜底：crossfade 等容器嵌套
         if (found) return found;
     }
     return nil;
 }
+// v2.0.66.84: 角标定位基准视图。若命中的图片视图宽度明显小于图标视图（说明仍误命中了
+// 文件夹缩略图内的迷你图标，或该系统版本类名不符预期），返回 nil 让调用方走正方形兜底。
+static UIView *MKBadgeBaseView(UIView *iv) {
+    UIView *base = MKIconImageView(iv);
+    if (!base) return nil;
+    CGFloat bw = base.bounds.size.width;
+    CGFloat ivw = iv ? iv.bounds.size.width : 0;
+    if (ivw > 1.0f && bw < ivw * 0.5f) return nil;   // 误命中迷你图标 → 判废
+    return base;
+}
 // 取图标图片真实圆角（continuousCornerRadius，iOS13+ 图标圆角真正来源；普通 cornerRadius 常为 0）
 static CGFloat MKIconCornerRadius(UIView *iv) {
-    UIView *imv = MKIconImageView(iv);
+    UIView *imv = MKBadgeBaseView(iv);   // v2.0.66.84: 用带判废的基准视图，避免取到迷你图标的小圆角
     UIView *target = imv ?: iv;
     CALayer *layer = target.layer;
     if ([layer respondsToSelector:@selector(continuousCornerRadius)]) {
@@ -309,7 +325,9 @@ static CGFloat MKIconCornerRadius(UIView *iv) {
         if (cr && [cr floatValue] > 0) return [cr floatValue];
     }
     if (layer.cornerRadius > 0) return layer.cornerRadius;
-    CGFloat m = MIN(target.bounds.size.width, target.bounds.size.height);
+    // v2.0.66.84: 兜底按图标图片正方形边长算（不用含名字区的 SBIconView 高度）
+    CGFloat m = imv ? MIN(target.bounds.size.width, target.bounds.size.height)
+                    : target.bounds.size.width;
     return m * 0.225f;
 }
 // 角标模式下不抢名字位置 → 所有藏名逻辑统一失效
@@ -455,8 +473,17 @@ static CGRect MKIndicatorFrameInOverlay(SBIconView *iv, UIView *overlay, MKConfi
     if (!iv || !overlay || !cfg) return CGRectZero;
     if (cfg.locationMode == MKLocationBadge) {
         // 角标模式：指示器贴在图标图片圆角内沿，按图标图片真实 bounds 计算（不依赖 label 位置）
-        UIView *base = MKIconImageView((UIView *)iv) ?: (UIView *)iv;
-        CGRect r = [overlay convertRect:base.bounds fromView:base];
+        // v2.0.66.84: 用 MKBadgeBaseView（带"误命中迷你图标判废"）。判废/取不到时兜底为
+        //   SBIconView 顶部的正方形图标区（宽=iv 宽，高=宽），而不是含名字区的整个 iv.bounds
+        //   —— 后者会让下方两角下移一个名字高度。
+        UIView *base = MKBadgeBaseView((UIView *)iv);
+        CGRect r;
+        if (base) {
+            r = [overlay convertRect:base.bounds fromView:base];
+        } else {
+            CGFloat side = MIN(iv.bounds.size.width, iv.bounds.size.height);
+            r = [overlay convertRect:CGRectMake(0, 0, side, side) fromView:(UIView *)iv];
+        }
         // v2.0.66.82: 四周各扩 MKBadgeFrameExtra(15pt)，容纳 max inset(12) + max half-thickness(3)
         // 供 inset>0 时弧线整体外移到角落外 + stroke 圆头不裁。
         // drawRect 内对应按 (MKBadgeFrameExtra, MKBadgeFrameExtra) 平移到 icon 坐标系。
