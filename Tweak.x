@@ -2636,6 +2636,36 @@ static BOOL MKViewInFolderThumb(UIView *v) {
     return NO;
 }
 
+// v2.0.66.87 (B2): 角标模式下 label 的【条件恢复】—— 替代原先三处无条件写回。
+//
+// 原实现（.80~.86）在角标模式下把 label 显式写成 hidden=NO / alpha=1 / opacity=1 /
+// opaque=YES + MKAssocLabelBid(nil)，每帧每图标都写。问题:
+//   · 系统本来就维持 label 可见 → 绝大多数帧是与系统抢控制权的无意义写;
+//   · 会抹掉系统自己设的中间态(编辑抖动、文件夹开合过渡期的 alpha 插值);
+//   · opaque=YES 尤其危险 —— 系统从不这么设(原生 name label 是透明背景), 影响合成路径。
+// 现改为: 只在 label 确实处于【被我们藏住】的状态时才恢复一次, 稳态零写入。
+//
+// 判据与 MKMigrateLocationMode 一致 —— 只认「我们藏的」:
+//   带 kMKLabelBidKey 关联键(MKAssocLabelBid 写入) 或 命中 sHiddenLabelToBid 指针表。
+// 系统自己藏的(stray 名字被 MKFixStrayNames 擦掉 / 编辑态)一律不碰, 否则会把刚擦掉的
+// stray 名字重新翻出来(.85 血案同源)。stray 容器内亦只清键不复显。
+static void MKRestoreLabelIfOurs(UIView *label) {
+    if (!label) return;
+    if (!label.hidden && label.alpha > 0.99f) return;   // 已可见 → 零写入(最常见路径)
+    NSString *ourBid = objc_getAssociatedObject(label, &kMKLabelBidKey);
+    BOOL ours = (ourBid.length != 0);
+    if (!ours && sHiddenLabelToBid && [sHiddenLabelToBid objectForKey:(id)label]) ours = YES;
+    if (!ours) return;                                   // 系统藏的 → 不碰
+    if (MKViewInFolderThumb(label) || MKForeignContainerCtx(label)) {
+        MKAssocLabelBid(label, nil);                     // 原生无名字容器 → 只清键不复显
+        return;
+    }
+    label.hidden = NO;
+    label.alpha = 1.0f;
+    label.layer.opacity = 1.0f;
+    MKAssocLabelBid(label, nil);
+}
+
 // v2.0.66.1: 缩略图内迷你图标(或其名称 label)解析所属 App bid。
 // 优先 MKGetCachedBid(走图标缓存)，失败(关窗瞬态 icon 链接未就绪)则直接读 icon.applicationBundleID 兜底，
 // 确保运行 App 的 bid 总能解析到 → 才能被 sHiddenBids 命中而钉藏(灭关窗后 ~2s 周期复显)。
@@ -3302,12 +3332,9 @@ static void MKUpdate(SBIconView *self) {
                 label.opaque = NO;
                 MKAssocLabelBid(label, bundleID);
             } else if (label) {
-                // 角标模式：名字保持可见
-                label.hidden = NO;
-                label.alpha = 1.0f;
-                label.layer.opacity = 1.0f;
-                label.opaque = YES;
-                MKAssocLabelBid(label, nil);
+                // v2.0.66.87 (B2): 角标模式 —— 名字本就该可见, 交还系统。
+                // 只在确实被我们藏住时恢复一次(稳态零写入), 不再无条件写回。
+                MKRestoreLabelIfOurs(label);
             }
             return;  // 不创建指示器，等300ms后 MKRefreshIconForBundleID 回调
         }
@@ -3324,12 +3351,8 @@ static void MKUpdate(SBIconView *self) {
                     label.opaque = NO;
                     MKAssocLabelBid(label, bundleID);
                 } else {
-                    // 角标模式：名字保持可见
-                    label.hidden = NO;
-                    label.alpha = 1.0f;
-                    label.layer.opacity = 1.0f;
-                    label.opaque = YES;
-                    MKAssocLabelBid(label, nil);
+                    // v2.0.66.87 (B2): 角标模式 —— 交还系统, 仅条件恢复(见 MKRestoreLabelIfOurs)
+                    MKRestoreLabelIfOurs(label);
                 }
             } else {
             // v1.5.5 诊断：App 在运行但找不到标签
@@ -3786,6 +3809,23 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
         // v1.6.31: 只在 App 确实在我们的 running set 中（用户打开/用过）才做标签/指示器逻辑。
         // 纯后台被 iOS 拉起、从未前台过的 App 不在集合里 → 直接跳过，名字保持原样、不亮指示器。
         if (!MKIsAppRunning(bid)) return;
+        // ── v2.0.66.87 (B1): 角标模式立即建指示器, 整套渐隐排期交还系统 ──
+        // 下面 250ms 渐隐 + 300ms 延迟建 + 800ms 备用刷新这一整套排期, 唯一设计动机写在
+        // 原注释里: 「等返回动画结束 + 标签渐隐接近完成」再建指示器, 免名字与圆点重叠一瞬。
+        // 角标模式【不藏名、不抢名字位】→ 动机整体消失, 而代价是实打实的:
+        //   · MKAddPending/MKAddAnimateIndicator 进两个状态集, 而 layoutSubviews 里
+        //     `MKIsPending || MKIsFadingLabel` 那处早退是【无条件】的(.85 改)
+        //     → 300ms 内该图标 layoutSubviews 全部被跳过, 指示器晚 300ms 才出现;
+        //   · 两个 dispatch_after 各带一次全量 MKRefreshIconForBundleID, 主线程忙时堆积;
+        //   · 300ms 内 App 又回前台 → 走 MKRestoreLabelForBundleID(自 .85 已早退成空操作) 纯空转。
+        // 渐显动画标记保留 —— 那是我们【自己的 overlay 指示器】的 alpha 动画, 与藏名无关。
+        if (!MKHideNames()) {
+            MKAddAnimateIndicator(bid);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                MKRefreshIconForBundleID(bid);
+            });
+            return;
+        }
         // ── App 返回后台 → v1.5.8: 标签渐隐 + 指示器渐显 ──
         // 标签不再瞬间消失：250ms 渐隐 alpha 1→0
         // 300ms 后创建指示器并 200ms 渐显 alpha 0→cfg.opacity
@@ -3873,21 +3913,99 @@ static void MKDelayedInit() {
     MKRefreshFolderIcons();
 }
 
+// v2.0.66.87: locationMode 切换一次性迁移 —— 恢复所有被我们藏过的 label + 清权威集合。
+//
+// 【为什么必须有这段】原先「替换 → 角标」切换时恢复名字的唯一执行路径是
+// MKUpdate running 分支的 else（把 label 无条件写回 hidden=NO/alpha=1）。
+// .87 要把那三处 else 改成「条件恢复」(B2, 只在确实被藏时才写) 就必须先有一条
+// 显式的迁移路径, 否则一旦某图标此刻不在窗口层级里(离屏/文件夹内/dock 回收槽),
+// 它的 label 永远等不到那次写回 → 名字保持 hidden=YES 永不复原。
+// MKRestoreLabelForBundleID 帮不上: 它自 .85 起 `if (!MKHideNames()) return;` 已早退。
+//
+// 判据: 只认「我们藏的」—— label 带 kMKLabelBidKey 关联键(MKAssocLabelBid 写入)
+// 或 bid ∈ sHiddenBids。系统自己藏的 label(dock/负一屏 stray、编辑抖动中间态)
+// 一律不碰 —— 否则会把 MKFixStrayNames() 刚擦掉的 stray 名字重新翻出来(.85 血案同源)。
+static void MKMigrateLocationMode(void) {
+    MKSafe(^{
+        if (!sInitDone) return;
+        NSArray *windows = [UIApplication sharedApplication].windows;
+        for (UIWindow *window in windows) {
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
+            while (stack.count > 0) {
+                UIView *current = [stack lastObject];
+                [stack removeLastObject];
+                // 只认 label-like 视图（与 layoutSubviews 兜底同款零分配判定）
+                BOOL isL = [current isKindOfClass:[UILabel class]] ||
+                           (strstr(class_getName([current class]), "Label") != NULL);
+                if (isL && (current.hidden || current.alpha <= 0.01f)) {
+                    NSString *ourBid = objc_getAssociatedObject(current, &kMKLabelBidKey);
+                    BOOL ours = (ourBid.length != 0);
+                    if (!ours && sHiddenLabelToBid && [sHiddenLabelToBid objectForKey:(id)current]) ours = YES;
+                    if (ours) {
+                        // stray 容器内的 label 不复显 —— 这些位置原生无名字, 复显 = 制造 bug。
+                        // MKFixStrayNames() 恒真, 下一帧也会再擦一遍, 但这里先别添乱。
+                        if (MKViewInFolderThumb(current) || MKForeignContainerCtx(current)) {
+                            objc_setAssociatedObject(current, &kMKLabelBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                        } else {
+                            current.hidden = NO;
+                            current.alpha = 1.0f;
+                            current.layer.opacity = 1.0f;
+                            [current.layer removeAllAnimations];
+                            objc_setAssociatedObject(current, &kMKLabelBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                        }
+                    }
+                }
+                for (UIView *child in current.subviews) {
+                    [stack addObject:child];
+                }
+            }
+        }
+        // 权威集合清空: 两个方向都该清。
+        //  · → 角标: sHiddenBids 恒空是该模式的不变量, 残留会让源级 setHidden/setAlpha hook 继续强藏。
+        //  · → 替换: 残留的旧表项对应的 label 可能已被回收复用, 留着只会误藏。
+        //    正确的表项会在下面 MKRefreshAllIcons → MKUpdate 藏名时重新写入。
+        if (sHiddenBids) [sHiddenBids removeAllObjects];
+        if (sHiddenLabelToBid) [sHiddenLabelToBid removeAllObjects];
+        // 排期状态集合也清: 角标模式不再排 300ms/800ms(见 MKStateDidChange), 残留 bid 会让
+        // layoutSubviews 的 `MKIsPending || MKIsFadingLabel` 无条件早退一直命中 → 指示器建不出来。
+        if (sPendingBIDs)    [sPendingBIDs removeAllObjects];
+        if (sFadingLabelBIDs) [sFadingLabelBIDs removeAllObjects];
+    });
+}
+
 static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observer,
                                     CFStringRef name, const void *object,
                                     CFDictionaryRef userInfo) {
+    // v2.0.66.87: locationMode 变化检测必须在 reload 之前取旧值
+    static MKLocationMode sLastLocationMode = MKLocationReplace;
+    static BOOL sLastModeValid = NO;
+    MKLocationMode oldMode = sLastLocationMode;
+    BOOL hadOld = sLastModeValid;
     [[MKConfig sharedConfig] reload];
+    MKLocationMode newMode = [MKConfig sharedConfig].locationMode;
+    sLastLocationMode = newMode;
+    sLastModeValid = YES;
+    if (hadOld && oldMode != newMode) MKMigrateLocationMode();
     // v2.0.66.81: 角标参数(badgeCorner/thickness/inset)变更时刷新已存在的指示器。
-    // thickness/inset 在 drawRect 直接读 cfg → setNeedsDisplay 即重画；
-    // badgeCorner 是属性需重设；iconCornerRadius 不变(图标本身没变)故不重设。
-    // locationMode 变更由下方 MKRefreshAllIcons/MKRefreshFolderIcons 重建/恢复名字处理。
+    // thickness/inset 在 drawRect 直接读 cfg → setNeedsDisplay 即重画；badgeCorner 是属性需重设。
+    // v2.0.66.87: iconCornerRadius 也必须重设 —— 原注释「图标本身没变故不重设」漏了一种情形:
+    //   setIconCornerRadius 只在【指示器创建时】调一次(MKUpdate L3365)。从替换模式切到角标模式
+    //   时指示器往往已存在(MKFindIndicator 非 nil → 不走创建分支) → 用的是当初创建那一刻取到
+    //   的值; 若那时图标图层尚未布好 continuousCornerRadius, 取到的是兜底 m*0.2237。
+    //   .82 时代弧线本就不准看不出, .87 改同心圆角后 rc 直接决定外轮廓是否等距 → 必须校正。
     if (sBidToIndicator) {
         MKConfig *cfg = [MKConfig sharedConfig];
-        for (UIView *ind in [sBidToIndicator objectEnumerator]) {
-            if ([ind isKindOfClass:[MKIndicatorDotView class]]) {
-                [(MKIndicatorDotView *)ind setBadgeCorner:cfg.badgeCorner];
-                [ind setNeedsDisplay];
+        NSArray *bids = [[sBidToIndicator keyEnumerator] allObjects];
+        for (NSString *bid in bids) {
+            UIView *ind = [sBidToIndicator objectForKey:bid];
+            if (![ind isKindOfClass:[MKIndicatorDotView class]]) continue;
+            [(MKIndicatorDotView *)ind setBadgeCorner:cfg.badgeCorner];
+            SBIconView *iv = sBidToIconView ? [sBidToIconView objectForKey:bid] : nil;
+            if (iv) {
+                CGFloat rc = MKIconCornerRadius((UIView *)iv);
+                if (rc > 0) [(MKIndicatorDotView *)ind setIconCornerRadius:rc];
             }
+            [ind setNeedsDisplay];
         }
     }
     MKRefreshAllIcons();
@@ -3926,6 +4044,12 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
                 label.alpha = 0.0f;
                 label.layer.opacity = 0.0f;
                 label.opaque = NO;
+            } else if (!MKHideNames()) {
+                // v2.0.66.87 (B2): 角标模式 —— 交还系统, 仅条件恢复(见 MKRestoreLabelIfOurs)。
+                // 注意本 else 是两模式共用: 替换模式下走下面的无条件恢复分支【一字不改】——
+                // 那里覆盖的是「App 已退出/前台 → 名字必须复原」, 而替换模式下我们确实
+                // 是名字的主动持有者, 无条件写回是正确且必要的(判据失效时也能兜住)。
+                MKRestoreLabelIfOurs(label);
             } else {
                 label.hidden = NO;
                 label.alpha = 1.0f;
@@ -4184,15 +4308,18 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
             //   为假 → 不再早退, 每帧都往下走 MKUpdate(self)。而 pending 表示"指示器创建
             //   已排期(300ms 后)", fading 表示"名字正在渐隐中", 两者都应等排期自然落地,
             //   此处提前 MKUpdate 会与排期竞争重复创建。故早退无条件, 藏名仍受门控。
-            if (MKIsPending(bid) || MKIsFadingLabel(bid)) {
-                if (MKHideNames()) {
-                    UIView *label = MKGetCachedLabel(self);
-                    if (label && label.superview) {
-                        label.hidden = YES;
-                        label.alpha = 0.0f;
-                        label.layer.opacity = 0.0f;
-                        label.opaque = NO;
-                    }
+            // v2.0.66.87 (B1): 角标模式已不再排 300ms/800ms → 两个集合是该模式的
+            //   【恒空不变量】, 早退永不该命中。但切模式那一刻可能有 ≤800ms 的残留 bid
+            //   (MKMigrateLocationMode 已清一次, 这里再兜一道防竞态: 迁移与排期回调
+            //    的执行顺序无保证)。若残留而这里仍无条件早退 → 该图标 layoutSubviews
+            //   被永久跳过、指示器建不出来。故角标模式跳过早退。
+            if ((MKIsPending(bid) || MKIsFadingLabel(bid)) && MKHideNames()) {
+                UIView *label = MKGetCachedLabel(self);
+                if (label && label.superview) {
+                    label.hidden = YES;
+                    label.alpha = 0.0f;
+                    label.layer.opacity = 0.0f;
+                    label.opaque = NO;
                 }
                 return;
             }
