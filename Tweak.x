@@ -3109,11 +3109,14 @@ static void MKUpdate(SBIconView *self) {
         if (MKIsDisabled()) {
             MKRemoveAllIndicators();
             UIView *label = MKGetCachedLabel(self);
+            // v2.0.66.90 (B2): opaque=YES → NO。系统从不给透明背景的图标名 label 设 opaque,
+            // 设 YES 会让 CA 跳过下层合成 → 渲染未定义内容一帧(闪)。此分支仅在插件被禁用时
+            // 走到, 不是闪名主路径, 但同属客观错误, 一并纠正。复显本身保留(禁用必须还名字)。
             if (label) {
                 label.hidden = NO;
                 label.alpha = 1.0f;
                 label.layer.opacity = 1.0f;
-                label.opaque = YES;
+                label.opaque = NO;
                 MKAssocLabelBid(label, nil);
             }
             return;
@@ -3123,11 +3126,12 @@ static void MKUpdate(SBIconView *self) {
         if (!cfg || !cfg.enabled) {
             MKRemoveAllIndicators();
             UIView *label = MKGetCachedLabel(self);
+            // v2.0.66.90 (B2): 同上, opaque=YES → NO。
             if (label) {
                 label.hidden = NO;
                 label.alpha = 1.0f;
                 label.layer.opacity = 1.0f;
-                label.opaque = YES;
+                label.opaque = NO;
                 MKAssocLabelBid(label, nil);
             }
             return;
@@ -3183,8 +3187,31 @@ static void MKUpdate(SBIconView *self) {
                     // 顺带加固 label 隐藏不变量（呼应 v1.6.82，防与圆点重叠）
                     UIView *lbl = MKGetCachedLabel((SBIconView *)self);
                     if (lbl) {
+                        // ★ v2.0.66.90 【B2 —— 本轮头号修复：角标模式不写回 label 可见性】★
+                        //  用户实机 .89: 角标模式下【完全合拢文件夹后名字闪一下, 不是每次】。
+                        //  .88/.89 一直在查「谁还在藏名」, 方向错了 —— 藏名路径此时已全部门控完毕
+                        //  (主屏 label 在 HomeGrid 内, MKForeignContainerCtx 白名单必返 nil)。
+                        //  真凶在【反方向】: 角标模式下我们从不藏名, 却仍在多处无条件写
+                        //  hidden=NO / alpha=1 / layer.opacity=1 / opaque=YES 去「恢复」它。
+                        //
+                        //  两层危害:
+                        //   ① opaque=YES 对 SpringBoard 的图标名 UILabel 是【客观错误】——
+                        //      它背景透明, 系统从不这么设。opaque=YES 等于告诉 CoreAnimation
+                        //      「本层完全不透明, 不必合成下层」→ 该区域按不透明处理, 而实际绘制
+                        //      内容大量透明像素 → 渲染出未定义内容(黑/白块或上帧残留)一帧,
+                        //      随后 UILabel 内部按 backgroundColor 自行纠回 → 肉眼即「闪一下」。
+                        //   ② 在 iOS 跑 crossfade 的窗口内直接改 model 值(alpha/opacity),
+                        //      与 presentation layer 冲突 → 同样一帧跳变。
+                        //  关文件夹时 SBFolderView.didMoveToWindow(nil) 会【同步 + 异步各一次】
+                        //  MKRefreshSubviews(主屏) → 遍历全部图标走到这里 → 落在 crossfade 窗口
+                        //  内就闪、落在窗口外就不闪 → 精确对应「合拢后闪一下、不是每次」。
+                        //
+                        //  修法: 角标模式下这些写回是【纯粹的抢控制权无意义写】(我们从未藏过它,
+                        //  没有任何东西需要恢复) → 整段删除, 只保留 MKAssocLabelBid 清键
+                        //  (纯关联对象, 不触发任何渲染)。替换模式行为保持 —— 仅把 opaque=YES
+                        //  一并纠正为 NO(修客观错误, 方向是「少干预」, 不会导致名字不显示)。
                         if (MKHideNames()) { lbl.hidden = YES; lbl.alpha = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO; MKAssocLabelBid(lbl, fBid); }
-                        else { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; MKAssocLabelBid(lbl, nil); }
+                        else MKAssocLabelBid(lbl, nil);
                     }
                 }
                 
@@ -3195,7 +3222,12 @@ static void MKUpdate(SBIconView *self) {
             if (contained.count == 0) {
                 
                 UIView *lbl = MKGetCachedLabel(self);
-                if (lbl) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; MKAssocLabelBid(lbl, nil); }
+                // v2.0.66.90 (B2): 角标模式不写回可见性(我们从未藏它, 无可恢复);
+                // 替换模式保留写回, opaque 由 YES 纠正为 NO。详见上方 B2 完整说明。
+                if (lbl) {
+                    if (MKHideNames()) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = NO; }
+                    MKAssocLabelBid(lbl, nil);
+                }
                 UIView *fi = MKFindIndicator(fBid);
                 if (fi) MKRemoveIndicatorForBid(fBid);
                 return;
@@ -3209,7 +3241,12 @@ static void MKUpdate(SBIconView *self) {
             if (!fCfg || (MKHideNames() && !fCfg.folderIndicators)) {
                 
                 UIView *lbl = MKGetCachedLabel(self);
-                if (lbl) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; MKAssocLabelBid(lbl, nil); }
+                // v2.0.66.90 (B2): 角标模式不写回可见性(我们从未藏它, 无可恢复);
+                // 替换模式保留写回, opaque 由 YES 纠正为 NO。详见上方 B2 完整说明。
+                if (lbl) {
+                    if (MKHideNames()) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = NO; }
+                    MKAssocLabelBid(lbl, nil);
+                }
                 UIView *fi = MKFindIndicator(fBid);
                 if (fi) MKRemoveIndicatorForBid(fBid);
                 return;
@@ -3220,8 +3257,10 @@ static void MKUpdate(SBIconView *self) {
             UIView *label = MKGetCachedLabel(self);
             
             if (label) {
+                // v2.0.66.90 (B2): 角标模式不写回可见性 —— 这是【文件夹有运行 App】的主路径,
+                // 也就是关合文件夹后必然走到的那一支, 闪名的直接来源。详见上方 B2 完整说明。
                 if (MKHideNames()) { label.hidden = YES; label.alpha = 0.0f; label.layer.opacity = 0.0f; label.opaque = NO; MKAssocLabelBid(label, fBid); }
-                else { label.hidden = NO; label.alpha = 1.0f; label.layer.opacity = 1.0f; label.opaque = YES; MKAssocLabelBid(label, nil); }
+                else MKAssocLabelBid(label, nil);
             }
             UIView *container = MKContainerForIconView((UIView *)self);
             UIView *overlay = MKOverlayForContainer(container);
@@ -3416,12 +3455,22 @@ static void MKUpdate(SBIconView *self) {
             // ── App 不在运行 / 在前台 → 移除指示器，恢复名字 ──
             if (indicator) MKRemoveIndicatorForBid(bundleID);
             MKRestoreBetaOrphan((UIView *)self); // v2.0.30: 移除我们脱离的孤儿小黄点，系统自建原 label 点
+            // ★ v2.0.66.90 (B2): 这是【每个非运行/前台图标每次 MKUpdate 必经】的复显路径 ——
+            //   关文件夹触发 MKRefreshSubviews(主屏) 时全屏图标都会走到这里, 是闪名的主路径之一。
+            //   角标模式我们从不藏名 → 无条件写回是抢控制权的无意义写, 且 opaque=YES 对透明背景的
+            //   name label 是客观错误(CA 跳过下层合成 → 渲染未定义内容一帧)。改为与 L3486/L3504
+            //   同构的条件恢复: 稳态零写入, 只在确实被我们藏住时(切模式残留)恢复一次。
+            //   替换模式路径不变(仍需无条件复显), 仅把 opaque=YES 纠正为 NO。
             if (label) {
-                label.hidden = NO;
-                label.alpha = 1.0f;
-                label.layer.opacity = 1.0f;
-                label.opaque = YES;
-                MKAssocLabelBid(label, nil);
+                if (MKHideNames()) {
+                    label.hidden = NO;
+                    label.alpha = 1.0f;
+                    label.layer.opacity = 1.0f;
+                    label.opaque = NO;
+                    MKAssocLabelBid(label, nil);
+                } else {
+                    MKRestoreLabelIfOurs(label);
+                }
             }
             MKRemovePending(bundleID);  // v1.5.6+: 清除 pending 状态
             MKRemoveFadingLabel(bundleID); // v1.5.8: 清除渐隐状态
@@ -3854,7 +3903,7 @@ static void MKRestoreLabelForBundleID(NSString *bid) {
                                 label.hidden = NO;
                                 label.alpha = 1.0f;
                                 label.layer.opacity = 1.0f;
-                                label.opaque = YES;
+                                label.opaque = NO;   // v2.0.66.90 (B2): YES → NO(客观错误纠正)
                                 MKAssocLabelBid(label, nil);
                             }];
                         }
@@ -4177,7 +4226,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
                 label.hidden = NO;
                 label.alpha = 1.0f;
                 label.layer.opacity = 1.0f;
-                label.opaque = YES;
+                label.opaque = NO;   // v2.0.66.90 (B2): YES → NO(客观错误纠正; 本分支仅替换模式可达)
                 MKAssocLabelBid(label, nil);
             }
         }

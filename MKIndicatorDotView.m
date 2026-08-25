@@ -38,36 +38,31 @@ const CGFloat MKBadgeFrameExtra = 15.0f;
     MKConfig *cfg = [MKConfig sharedConfig];
     UIColor *color = self.indicatorColor ?: cfg.color;
 
-    // v2.0.66.87: 角标模式 —— 沿图标【真·连续圆角】(Apple continuous corner / squircle) 画单角弧。
+    // v2.0.66.90: 角标模式几何【回归 .82 方案】—— 用户实机对比「设置页实时预览 vs 桌面」
+    // 后拍板选预览那一版(方案 B)。三版沿边跨度对照(60pt 图标, rc=13.422pt):
+    //   · .82  单段三次贝塞尔 k=0.528，跨度 = rc      ≈ 13.4pt   ← 现行(用户选定)
+    //   · .87  完整连续圆角 3 段，跨度 = 1.528665·R  ≈ 20.5pt   (实机「太长、两头拱上直边」)
+    //   · .88  只留中段真圆弧，跨度 ≈ 0.512·R        ≈  6.9pt   (实机「太短、不如预览好看」)
+    // 结论：.87 过长、.88 过短，.82 恰在中间且是用户唯一明确点名"更好"的那一版。
     //
-    // ⚠️ 推翻 .82 的两个错误实现（均已数值验证，60pt 图标 rc=13.422pt 为基准）：
-    //  ① .82 用「单段三次贝塞尔 k=0.528」称作 squircle —— 它与真·四分之一圆弧(k=0.5523)
-    //     最大只差 0.17pt，本质就是圆弧，与 squircle 的曲率分布毫无关系。
-    //     Apple 连续圆角每角实为【3 段】：cubic(入弯, 曲率 0→1/R) + 真圆弧(仅扫 90°(1-s)=42.42°)
-    //     + cubic(出弯, 曲率 1/R→0)。曲率连续(G2)是「看得出不一样」的感知根源；
-    //     普通圆角在直边→圆弧接点处曲率从 0 跳到 1/r(G1)。
-    //  ② .82 端点跨度用 rc —— 真实圆角段沿边延伸 p=(1+s)*rc=1.528665*rc，
-    //     用 rc 只覆盖 65.4%，弧线两头提前离开圆角、翘到直边上。
+    // ⚠️ 保留 .87 的数学结论备查，但【不再据此改动几何】：
+    //   .82 的 k=0.528 与真·四分之一圆弧(k=0.5523)最大只差 0.17pt，本质是圆弧而非真 squircle；
+    //   Apple 连续圆角每角实为 3 段(cubic 入弯 + 圆弧 + cubic 出弯)、曲率连续(G2)。
+    //   即：.82 在数学上「不是真连续圆角」，但在 1~6pt 线宽、单角短弧的实际观感下
+    //   这 0.17pt 差异不可见，而弧长长短是可见的 —— 观感优先于数学纯度，故按用户选择定稿。
+    //   同理 inset 回归「沿 45° 对角平移 inset/√2」：它相对同心圆角规则有最大 1.555pt 的
+    //   不等距(inset=12 档)，但形状恒定不变形，且与预览完全一致。
     //
-    // inset 也一并改正：.82 沿 45° 对角平移 inset/√2 → 各点离图标轮廓不等距
-    // (inset=12 档 min 10.08 / max 11.63，差 1.555pt，且系统性小于设定值)。
-    // 现改用【同心圆角规则】(Apple 官方嵌套圆角规则)：外框 = CGRectInset(icon, -D, -D)、
-    // 外圆角 = rc + D → 数学上保证外轮廓处处离图标轮廓恰好 D，且外轮廓仍是同族连续圆角。
-    // 实测不均匀度 D=12 仅 0.117pt（采样离散残留，非几何误差）。
+    // frame 已四周各扩 MKBadgeFrameExtra(15pt)：最大外移 12/√2 = 8.49pt + 半线宽 3pt
+    // = 11.49pt < 15pt，弧线圆头不会被裁。
     //
-    // frame 已四周各扩 MKBadgeFrameExtra(15pt)；外框原点在 icon 坐标 (-D,-D)
-    // → 在 view 坐标即 (extra-D, extra-D)。向外位移上限 12 + 半线宽 3 = 15 恰好不裁。
-    //
-    // v2.0.66.88: 【弧长收短】.87 画满整段连续圆角(跨度 p=1.528665R)，实机看是弧线两头
-    // 沿着图标上/左边各多拱出去约 7pt(60pt 图标)，视觉上像把 L 形两条边都描粗了，不像角标。
-    // 现只保留【中段真圆弧】那一段：起点 (d,mid)、终点 (mid,d)，沿边跨度 mid-d ≈ 0.512R
-    // (60pt 图标 6.87pt vs 原 20.52pt)。这一段与图标自身圆角的中段圆弧【严格同心】
-    // (半径 rc+D vs rc、圆心同点) → 等距性比 .87 更好，且天然居中于 45° 对角。
-    // 入弯/出弯两段 cubic 直接不画(它们本就是过渡到直边的部分，是"太长"的元凶)。
+    // ⚠️ 本段与 Preferences/MKRootListController.m 的 updateBadgePreview 必须【逐字同构】
+    //    (k / 跨度 rc / inset 对角平移三者)。改任一处务必同步另一处，否则预览又与桌面不一致
+    //    —— .87/.88 只改桌面没改预览，就是这次「预览比桌面好看」问题的由来。
     if (cfg.locationMode == MKLocationBadge) {
         CGFloat t = cfg.badgeThickness;
         CGFloat inset = cfg.badgeInset;
-        if (inset < 0) inset = 0;
+        if (inset < 0) inset = 0; else if (inset > 12.0f) inset = 12.0f;
         // v2.0.66.83: frame 四周各扩了 MKBadgeFrameExtra，W/H 必须扣掉扩边换算回图标实际尺寸
         CGFloat W = rect.size.width  - 2 * MKBadgeFrameExtra;
         CGFloat H = rect.size.height - 2 * MKBadgeFrameExtra;
@@ -75,62 +70,54 @@ const CGFloat MKBadgeFrameExtra = 15.0f;
         if (H < 1) H = rect.size.height;
         CGFloat rc = self.iconCornerRadius;
         if (rc <= 0) rc = MIN(W, H) * 0.2237f;   // 连续圆角等效半径 ≈ 边长 22.37%
+        // 钳位：弧线端点沿边跨度 rc 不得越过半边中点，否则两端自相交（极小图标兜底）
+        CGFloat halfMin = MIN(W, H) * 0.5f;
+        if (halfMin > 0 && rc > halfMin) rc = halfMin;
+        if (rc <= 0) return;
 
-        // ── 同心外扩：外框尺寸与外圆角半径 ──
-        CGFloat OW = W + 2 * inset;
-        CGFloat OH = H + 2 * inset;
-        CGFloat R  = rc + inset;
-
-        // corner smoothing。s=0.528665 = iOS 图标轮廓的等效平滑度(Figma/squircle-js cornerSmoothing)
-        const CGFloat kS = 0.528665;
-        // 跨度钳位：p 不得超过外框半边，否则两端越过中点自相交（极小图标保险；
-        // 迷你缩略图已由 MKBadgeBaseView 判废，此处纯兜底）。钳 R 而非钳 p，保证形状自洽。
-        CGFloat halfMin = MIN(OW, OH) * 0.5f;
-        if (halfMin > 0 && R * (1.0 + kS) > halfMin) R = halfMin / (1.0 + kS);
-        if (R <= 0) return;
-
-        // ── 连续圆角构造参数（figma-squircle 同款，全部与 R 成正比）──
-        // 注意用 double 版 sin/cos/tan/atan2：arm64 上 CGFloat = double，
-        // 用 sinf/tanf 会先窄化成 float 再算，白丢精度（且 -Wconversion 下可能报警）。
-        CGFloat p      = (1.0 + kS) * R;                        // 沿边总跨度 = 1.528665 R
-        CGFloat arcM   = (CGFloat)M_PI_2 * (1.0 - kS);          // 中段真圆弧圆心角 = 42.420°
-        CGFloat arcSec = sin(arcM * 0.5) * R * (CGFloat)M_SQRT2;
-        CGFloat alpha  = ((CGFloat)M_PI_2 - arcM) * 0.5;
-        CGFloat beta   = (CGFloat)M_PI_4 * kS;
-        CGFloat c      = R * tan(beta * 0.5) * cos(alpha);
-        CGFloat d      = c * tan(alpha);
-        CGFloat b      = (p - arcSec - c - d) / 3.0;
-        CGFloat a      = 2.0 * b;
-        CGFloat mid    = p - a - b - c;   // 入弯 cubic 终点(= 圆弧起点)的沿边坐标
-
-        // ── 左上角基准路径（外框局部坐标，原点 = 外框左上角）──
-        // v2.0.66.88: 只画中段真圆弧(圆心 (R,R)、半径 R、圆心角 42.420°)，
-        // 起点 (d,mid) / 终点 (mid,d) 即原 3 段构造中 cubic 与圆弧的两个接点。
-        // 其余三角由镜像变换得到，避免手写四份镜像坐标出错（.81 strncmp 死码同类教训）
-        UIBezierPath *path = [UIBezierPath bezierPath];
-        // UIKit 为 y-down 坐标系，clockwise:YES = 角度递增方向，与 atan2 计算出的 a0<a1 一致。
-        CGFloat a0 = atan2(mid - R, d - R);
-        CGFloat a1 = atan2(d - R, mid - R);
-        [path addArcWithCenter:CGPointMake(R, R) radius:R startAngle:a0 endAngle:a1 clockwise:YES];
-
+        // inset：沿 45° 对角单位向量平移整段弧线（形状恒为原样，不随距离变形）
+        CGFloat ss = inset * 0.70710678f;        // 1/√2
+        // 图标原点在 view 坐标 = (extra, extra)，再按所选角落方向外移
+        CGFloat ox = MKBadgeFrameExtra, oy = MKBadgeFrameExtra;
         switch (self.badgeCorner) {
-            case MKBadgeCornerTopLeft:
-                break;                                                   // 基准，无需变换
+            case MKBadgeCornerTopRight:    ox += ss; oy -= ss; break;
+            case MKBadgeCornerBottomLeft:  ox -= ss; oy += ss; break;
+            case MKBadgeCornerBottomRight: ox += ss; oy += ss; break;
+            default /*TopLeft*/:           ox -= ss; oy -= ss; break;
+        }
+
+        const CGFloat k = 0.528f;
+        UIBezierPath *path = [UIBezierPath bezierPath];
+        switch (self.badgeCorner) {
             case MKBadgeCornerTopRight:
-                [path applyTransform:CGAffineTransformMake(-1, 0, 0,  1, OW,  0)];  // 镜像 x
+                [path moveToPoint:CGPointMake(ox + W - rc, oy)];
+                [path addCurveToPoint:CGPointMake(ox + W, oy + rc)
+                        controlPoint1:CGPointMake(ox + W - rc * k, oy)
+                        controlPoint2:CGPointMake(ox + W, oy + rc * (1 - k))];
                 break;
             case MKBadgeCornerBottomLeft:
-                [path applyTransform:CGAffineTransformMake( 1, 0, 0, -1,  0, OH)];  // 镜像 y
+                [path moveToPoint:CGPointMake(ox + rc, oy + H)];
+                [path addCurveToPoint:CGPointMake(ox, oy + H - rc)
+                        controlPoint1:CGPointMake(ox + rc * k, oy + H)
+                        controlPoint2:CGPointMake(ox, oy + H - rc * (1 - k))];
                 break;
-            default /*BottomRight*/:
-                [path applyTransform:CGAffineTransformMake(-1, 0, 0, -1, OW, OH)];  // 镜像 x+y
+            case MKBadgeCornerBottomRight:
+                [path moveToPoint:CGPointMake(ox + W, oy + H - rc)];
+                [path addCurveToPoint:CGPointMake(ox + W - rc, oy + H)
+                        controlPoint1:CGPointMake(ox + W, oy + H - rc * (1 - k))
+                        controlPoint2:CGPointMake(ox + W - rc * k, oy + H)];
+                break;
+            default /*TopLeft*/:
+                [path moveToPoint:CGPointMake(ox, oy + rc)];
+                [path addCurveToPoint:CGPointMake(ox + rc, oy)
+                        controlPoint1:CGPointMake(ox, oy + rc * (1 - k))
+                        controlPoint2:CGPointMake(ox + rc * k, oy)];
                 break;
         }
 
         CGContextRef ctx = UIGraphicsGetCurrentContext();
         if (!ctx) return;
-        // 外框原点在 icon 坐标 (-inset,-inset)；icon 原点在 view 坐标 (extra,extra)
-        CGContextTranslateCTM(ctx, MKBadgeFrameExtra - inset, MKBadgeFrameExtra - inset);
+        // 路径已直接算在 view 坐标系（ox/oy 内含 MKBadgeFrameExtra），无需再平移 CTM
 
         [color setStroke];
         path.lineWidth = t;
