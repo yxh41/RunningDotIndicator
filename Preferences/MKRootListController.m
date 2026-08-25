@@ -8,6 +8,14 @@
 #import <UIKit/UIKit.h>
 #import <Preferences/PSSpecifier.h>
 
+// v2.0.66.86: PSTableCell / PSControlTableCell 的两个私有访问器。
+// ⚠️ 必须用【类别声明】而不是 -performSelector: —— ARC 下 performSelector 会触发
+//    -Warc-performSelector-leaks, 而 CI 开了 -Werror → 直接编译失败。
+@interface NSObject (MKPSCellPrivate)
+- (id)control;      // PSControlTableCell: UISwitch / UISegmentedControl / UISlider
+- (id)specifier;    // PSTableCell: 该行对应的 PSSpecifier
+@end
+
 // 偏好设置域名(与 Tweak 读取的文件一致)
 static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
 // 每次值变化时广播的 Darwin 通知名
@@ -436,6 +444,69 @@ static UIColor *MKColorFromHex(NSString *hex) {
     @try { if (self.heroView) [self layoutHero]; } @catch (NSException *e) {}
 }
 
+#pragma mark - 按 locationMode 置灰无关控件 (v2.0.66.86)
+
+// 当前显示位置模式下，哪些偏好项是【无作用】的 → 置灰 + 禁交互。
+//   locationMode: 0 = 替换名称(MKLocationReplace)  1 = 角标(MKLocationBadge)
+//
+// 角标模式无关项:
+//   shape/dotSize/barWidth/barHeight —— 角标只画弧线, 形状与点/横条尺寸全不读取。
+//   keepBetaDot                     —— 角标模式不藏名, 小黄点整套 machinery 已交还系统 (Tweak 侧门控)。
+//   folderIndicators                —— 角标模式下文件夹指示器【强制生效】, 开关已被 Tweak 侧忽略。
+// 替换名称模式无关项:
+//   badgeCorner/badgeThickness/badgeInset —— 角标专属几何参数。
+//
+// ⚠️ 不置灰 enabled/colorMode/color/customColor/opacity/locationMode: 两模式共用。
+static BOOL MKKeyDisabledForMode(NSString *key, NSInteger mode) {
+    if (!key.length) return NO;
+    if (mode == 1) { // 角标模式
+        static NSSet *badgeOff = nil;
+        if (!badgeOff) badgeOff = [NSSet setWithArray:@[ @"shape", @"dotSize", @"barWidth",
+                                                        @"barHeight", @"keepBetaDot",
+                                                        @"folderIndicators" ]];
+        return [badgeOff containsObject:key];
+    }
+    static NSSet *replaceOff = nil;
+    if (!replaceOff) replaceOff = [NSSet setWithArray:@[ @"badgeCorner", @"badgeThickness",
+                                                         @"badgeInset" ]];
+    return [replaceOff containsObject:key];
+}
+
+// 对一个 cell 施加/解除「灰化」。
+// ⚠️ 只设 cell.userInteractionEnabled = NO 【不够】: PSSwitchTableCell 的 UISwitch、
+//    PSSegmentTableCell 的 UISegmentedControl、PSSliderTableCell 的 UISlider 都挂在
+//    accessoryView / contentView 上, 各自独立接收 touch。必须同时把 -control 置 enabled=NO。
+static void MKApplyDimmed(UITableViewCell *cell, BOOL dimmed) {
+    if (!cell) return;
+    cell.userInteractionEnabled = !dimmed;
+    cell.selectionStyle = dimmed ? UITableViewCellSelectionStyleNone
+                                 : UITableViewCellSelectionStyleDefault;
+    if (@available(iOS 13.0, *)) {
+        cell.textLabel.textColor       = dimmed ? [UIColor tertiaryLabelColor]
+                                                : [UIColor labelColor];
+        cell.detailTextLabel.textColor = dimmed ? [UIColor quaternaryLabelColor]
+                                                : [UIColor secondaryLabelColor];
+    } else {
+        cell.textLabel.textColor       = dimmed ? [UIColor lightGrayColor] : [UIColor blackColor];
+        cell.detailTextLabel.textColor = dimmed ? [UIColor lightGrayColor] : [UIColor darkGrayColor];
+    }
+    // PSControlTableCell 家族: -control 返回真实控件
+    if ([cell respondsToSelector:@selector(control)]) {
+        id ctl = [(NSObject *)cell control];
+        if ([ctl isKindOfClass:[UIControl class]]) {
+            UIControl *c = (UIControl *)ctl;
+            c.enabled = !dimmed;
+            c.alpha   = dimmed ? 0.40f : 1.0f;
+        }
+    }
+    // 兜底: 某些 cell 把控件放 accessoryView 而未实现 -control
+    if ([cell.accessoryView isKindOfClass:[UIControl class]]) {
+        UIControl *a = (UIControl *)cell.accessoryView;
+        a.enabled = !dimmed;
+        a.alpha   = dimmed ? 0.40f : 1.0f;
+    }
+}
+
 #pragma mark - 玻璃卡片（同 section 多行共用一张卡片）
 
 - (void)tableView:(UITableView *)tableView
@@ -512,6 +583,20 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
         cell.textLabel.backgroundColor       = [UIColor clearColor];
         cell.detailTextLabel.backgroundColor = [UIColor clearColor];
 
+        // v2.0.66.86: 按当前「显示位置」模式置灰无关控件, 让用户一眼看出哪些项对本模式无作用。
+        // specifier 从 cell 自带的 -specifier (PSTableCell 属性) 取; 拿不到就不做灰化,
+        // 绝不影响原有视觉逻辑。
+        PSSpecifier *spec = nil;
+        if ([cell respondsToSelector:@selector(specifier)]) {
+            id s = [(NSObject *)cell specifier];
+            if ([s isKindOfClass:[PSSpecifier class]]) spec = (PSSpecifier *)s;
+        }
+        NSString *rowKey = spec ? [spec propertyForKey:@"key"] : nil;
+        NSInteger mode = [[self readValueForKey:@"locationMode"
+                                        default:@0
+                                  expectedClass:[NSNumber class]] integerValue];
+        MKApplyDimmed(cell, (rowKey != nil) && MKKeyDisabledForMode(rowKey, mode));
+
         // v2.0.24: folderIndicatorMode 选择已移除，代表 App 固定为位置靠前活跃（原 mode 0）。
     } @catch (NSException *e) {}
 }
@@ -537,6 +622,12 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     BOOL isSlider = (cellCls && [cellCls rangeOfString:@"Slider"].location != NSNotFound);
     if (!isSlider) {
         [self reloadSpecifier:specifier animated:YES];
+    }
+
+    // v2.0.66.86: 切换「显示位置」模式 → 整表重载, 让 willDisplayCell: 重新按新模式
+    //   计算灰化状态 (仅 reloadSpecifier 只刷本行, 其他行的灰/亮不会跟着变)。
+    if ([key isEqualToString:@"locationMode"]) {
+        @try { [self reloadSpecifiers]; } @catch (NSException *e) {}
     }
 
     // 广播 Darwin 通知
