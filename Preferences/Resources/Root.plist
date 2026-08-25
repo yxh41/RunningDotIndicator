@@ -10,7 +10,7 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>RunningDotIndicator 2.0.66.90</string>
+			<string>RunningDotIndicator 2.0.66.91</string>
 			<key>footerText</key>
 			<string>为运行中的 App 图标添加指示器。App 运行时自动替换图标下方的名称文字，退出后恢复原名称。支持系统：iOS 16.x（roothide / rootless）；iOS 15 及更低不挂钩。</string>
 		</dict>
@@ -406,7 +406,7 @@
 			<key>label</key>
 			<string>角标设置</string>
 			<key>footerText</key>
-			<string>以下选项仅在「角标模式」下生效。距离：0=内贴图标边角，数值越大越向外远离图标。粗细支持小数。</string>
+			<string>以下选项仅在「角标模式」下生效。距离：0=内贴图标边角，数值越大越向外远离图标。长度：弧线占图标圆角的比例，沿两端等量缩短，曲率不变仍贴合圆角。粗细支持小数。</string>
 		</dict>
 
 		<dict>
@@ -458,6 +458,29 @@
 			<key>showValue</key>
 			<true/>
 			<key>isContinuous</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>label</key>
+			<string>角标弧线长度 %</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>badgeArcLength</string>
+			<key>default</key>
+			<real>90</real>
+			<key>min</key>
+			<real>60</real>
+			<key>max</key>
+			<real>100</real>
+			<key>isContinuous</key>
+			<true/>
+			<key>showValue</key>
 			<true/>
 			<key>PostNotification</key>
 			<string>com.mk.runningdotindicator.reload</string>

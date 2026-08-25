@@ -4160,6 +4160,8 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     if (hadOld && oldMode != newMode) MKMigrateLocationMode();
     // v2.0.66.81: 角标参数(badgeCorner/thickness/inset)变更时刷新已存在的指示器。
     // thickness/inset 在 drawRect 直接读 cfg → setNeedsDisplay 即重画；badgeCorner 是属性需重设。
+    // v2.0.66.91: badgeArcLength(弧长比例)同属「drawRect 直接读 cfg」一类 → 无需新增属性,
+    //   下面的 setNeedsDisplay 已覆盖, 拖滑块即时生效。
     // v2.0.66.87: iconCornerRadius 也必须重设 —— 原注释「图标本身没变故不重设」漏了一种情形:
     //   setIconCornerRadius 只在【指示器创建时】调一次(MKUpdate L3365)。从替换模式切到角标模式
     //   时指示器往往已存在(MKFindIndicator 非 nil → 不走创建分支) → 用的是当初创建那一刻取到

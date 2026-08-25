@@ -145,6 +145,15 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
     CGFloat i = v ? [v floatValue] : 0.0f;
     return (i < 0.0f) ? 0.0f : (i > 12.0f ? 12.0f : i);
 }
+// v2.0.66.91: 角标弧线长度比例。plist 存 60~100 的百分数(滑块直观)，此处换算为 0.60~1.00 小数。
+// 默认 90 —— 用户实机对比 .90 的 100% 后要求「再短 10%」，故新默认即 90%。
+// 下限 60: 60pt 图标上 60% ≈ 8pt 弧，再短就接近 .88「太短」的观感，不给踩坑空间。
+- (CGFloat)badgeArcLength {
+    id v = _prefs[@"badgeArcLength"];
+    CGFloat p = v ? [v floatValue] : 90.0f;
+    if (p < 60.0f) p = 60.0f; else if (p > 100.0f) p = 100.0f;
+    return p / 100.0f;
+}
 
 + (UIColor *)colorFromHex:(NSString *)hex {
     if (![hex isKindOfClass:[NSString class]] || ![hex length]) {

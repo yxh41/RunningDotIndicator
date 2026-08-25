@@ -235,14 +235,44 @@ static UIColor *MKColorFromHex(NSString *hex) {
 
 // v2.0.66.84: 角标模式实时预览 —— 与 MKIndicatorDotView.m drawRect 同一套几何
 // (squircle 1/4 三次贝塞尔 k=0.528，inset 沿角落单位向量平移整段弧线)
+// v2.0.66.91: 同步新增弧长裁剪(badgeArcLength)。⚠️ 设置 bundle 与 tweak 是两个二进制,
+// 不能共享 MKIndicatorDotView.m 里的 static 函数 → 此处必须保留一份【逐字等价】的实现。
+// 改任一侧务必同步另一侧(同构铁律, .87/.88 血案由来)。
+static inline CGPoint MKPvLerp(CGPoint a, CGPoint b, CGFloat t) {
+    return CGPointMake(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+}
+static void MKPvSplit(const CGPoint p[4], CGFloat t, CGPoint L[4], CGPoint R[4]) {
+    CGPoint ab  = MKPvLerp(p[0], p[1], t);
+    CGPoint bc  = MKPvLerp(p[1], p[2], t);
+    CGPoint cd  = MKPvLerp(p[2], p[3], t);
+    CGPoint abc = MKPvLerp(ab, bc, t);
+    CGPoint bcd = MKPvLerp(bc, cd, t);
+    CGPoint m   = MKPvLerp(abc, bcd, t);
+    L[0] = p[0]; L[1] = ab;  L[2] = abc; L[3] = m;
+    R[0] = m;    R[1] = bcd; R[2] = cd;  R[3] = p[3];
+}
+static void MKPvSub(const CGPoint p[4], CGFloat t0, CGFloat t1, CGPoint out[4]) {
+    if (t1 <= t0) { for (int i = 0; i < 4; i++) out[i] = p[0]; return; }
+    CGPoint L[4], R[4];
+    MKPvSplit(p, t1, L, R);
+    if (t0 <= 0.0f) { for (int i = 0; i < 4; i++) out[i] = L[i]; return; }
+    CGPoint L2[4], R2[4];
+    MKPvSplit(L, t0 / t1, L2, R2);
+    for (int i = 0; i < 4; i++) out[i] = R2[i];
+}
+
 - (void)updateBadgePreview {
     if (!self.previewBadge || !self.previewIcon) return;
 
     NSInteger corner = [[self readValueForKey:@"badgeCorner" default:@0 expectedClass:[NSNumber class]] integerValue];
     CGFloat t = [[self readValueForKey:@"badgeThickness" default:@4.0f expectedClass:[NSNumber class]] floatValue];
     CGFloat inset = [[self readValueForKey:@"badgeInset" default:@0.0f expectedClass:[NSNumber class]] floatValue];
+    // v2.0.66.91: 弧长比例(plist 存 60~100 百分数, 与 MKConfig.badgeArcLength 同一换算)
+    CGFloat arcPct = [[self readValueForKey:@"badgeArcLength" default:@90.0f expectedClass:[NSNumber class]] floatValue];
     if (t < 1.0f) t = 1.0f; else if (t > 6.0f) t = 6.0f;
     if (inset < 0.0f) inset = 0.0f; else if (inset > 12.0f) inset = 12.0f;
+    if (arcPct < 60.0f) arcPct = 60.0f; else if (arcPct > 100.0f) arcPct = 100.0f;
+    CGFloat f = arcPct / 100.0f;
 
     // 预览图标 52pt / 圆角 12pt；按真实图标比例(60pt/13.5pt)等比缩放粗细与距离，视觉更接近实机
     CGFloat scale = kIconSize / 60.0f;
@@ -261,33 +291,43 @@ static UIColor *MKColorFromHex(NSString *hex) {
     }
 
     CGFloat k = 0.528f;
-    UIBezierPath *p = [UIBezierPath bezierPath];
+    // v2.0.66.91: 与 drawRect 同构 —— 先算 4 控制点, 再按 f 沿两端等量裁剪。
+    CGPoint cp[4];
     switch (corner) {
         case 1:  // 右上
-            [p moveToPoint:CGPointMake(ox + W - rc, oy)];
-            [p addCurveToPoint:CGPointMake(ox + W, oy + rc)
-                 controlPoint1:CGPointMake(ox + W - rc * k, oy)
-                 controlPoint2:CGPointMake(ox + W, oy + rc * (1 - k))];
+            cp[0] = CGPointMake(ox + W - rc,     oy);
+            cp[1] = CGPointMake(ox + W - rc * k, oy);
+            cp[2] = CGPointMake(ox + W,          oy + rc * (1 - k));
+            cp[3] = CGPointMake(ox + W,          oy + rc);
             break;
         case 2:  // 左下
-            [p moveToPoint:CGPointMake(ox + rc, oy + H)];
-            [p addCurveToPoint:CGPointMake(ox, oy + H - rc)
-                 controlPoint1:CGPointMake(ox + rc * k, oy + H)
-                 controlPoint2:CGPointMake(ox, oy + H - rc * (1 - k))];
+            cp[0] = CGPointMake(ox + rc,     oy + H);
+            cp[1] = CGPointMake(ox + rc * k, oy + H);
+            cp[2] = CGPointMake(ox,          oy + H - rc * (1 - k));
+            cp[3] = CGPointMake(ox,          oy + H - rc);
             break;
         case 3:  // 右下
-            [p moveToPoint:CGPointMake(ox + W, oy + H - rc)];
-            [p addCurveToPoint:CGPointMake(ox + W - rc, oy + H)
-                 controlPoint1:CGPointMake(ox + W, oy + H - rc * (1 - k))
-                 controlPoint2:CGPointMake(ox + W - rc * k, oy + H)];
+            cp[0] = CGPointMake(ox + W,          oy + H - rc);
+            cp[1] = CGPointMake(ox + W,          oy + H - rc * (1 - k));
+            cp[2] = CGPointMake(ox + W - rc * k, oy + H);
+            cp[3] = CGPointMake(ox + W - rc,     oy + H);
             break;
         default: // 左上
-            [p moveToPoint:CGPointMake(ox, oy + rc)];
-            [p addCurveToPoint:CGPointMake(ox + rc, oy)
-                 controlPoint1:CGPointMake(ox, oy + rc * (1 - k))
-                 controlPoint2:CGPointMake(ox + rc * k, oy)];
+            cp[0] = CGPointMake(ox,          oy + rc);
+            cp[1] = CGPointMake(ox,          oy + rc * (1 - k));
+            cp[2] = CGPointMake(ox + rc * k, oy);
+            cp[3] = CGPointMake(ox + rc,     oy);
             break;
     }
+    if (f < 0.9999f) {
+        CGFloat t0 = (1.0f - f) * 0.5f;
+        CGPoint sub[4];
+        MKPvSub(cp, t0, 1.0f - t0, sub);
+        for (int i = 0; i < 4; i++) cp[i] = sub[i];
+    }
+    UIBezierPath *p = [UIBezierPath bezierPath];
+    [p moveToPoint:cp[0]];
+    [p addCurveToPoint:cp[3] controlPoint1:cp[1] controlPoint2:cp[2]];
     self.previewBadge.frame     = self.previewIcon.superview.bounds;
     self.previewBadge.path      = p.CGPath;
     self.previewBadge.lineWidth = tt;
@@ -454,7 +494,7 @@ static UIColor *MKColorFromHex(NSString *hex) {
 //   keepBetaDot                     —— 角标模式不藏名, 小黄点整套 machinery 已交还系统 (Tweak 侧门控)。
 //   folderIndicators                —— 角标模式下文件夹指示器【强制生效】, 开关已被 Tweak 侧忽略。
 // 替换名称模式无关项:
-//   badgeCorner/badgeThickness/badgeInset —— 角标专属几何参数。
+//   badgeCorner/badgeThickness/badgeInset/badgeArcLength —— 角标专属几何参数。
 //
 // ⚠️ 不置灰 enabled/colorMode/color/customColor/opacity/locationMode: 两模式共用。
 static BOOL MKKeyDisabledForMode(NSString *key, NSInteger mode) {
@@ -468,7 +508,7 @@ static BOOL MKKeyDisabledForMode(NSString *key, NSInteger mode) {
     }
     static NSSet *replaceOff = nil;
     if (!replaceOff) replaceOff = [NSSet setWithArray:@[ @"badgeCorner", @"badgeThickness",
-                                                         @"badgeInset" ]];
+                                                         @"badgeInset", @"badgeArcLength" ]];
     return [replaceOff containsObject:key];
 }
 
