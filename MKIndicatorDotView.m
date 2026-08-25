@@ -57,6 +57,13 @@ const CGFloat MKBadgeFrameExtra = 15.0f;
     //
     // frame 已四周各扩 MKBadgeFrameExtra(15pt)；外框原点在 icon 坐标 (-D,-D)
     // → 在 view 坐标即 (extra-D, extra-D)。向外位移上限 12 + 半线宽 3 = 15 恰好不裁。
+    //
+    // v2.0.66.88: 【弧长收短】.87 画满整段连续圆角(跨度 p=1.528665R)，实机看是弧线两头
+    // 沿着图标上/左边各多拱出去约 7pt(60pt 图标)，视觉上像把 L 形两条边都描粗了，不像角标。
+    // 现只保留【中段真圆弧】那一段：起点 (d,mid)、终点 (mid,d)，沿边跨度 mid-d ≈ 0.512R
+    // (60pt 图标 6.87pt vs 原 20.52pt)。这一段与图标自身圆角的中段圆弧【严格同心】
+    // (半径 rc+D vs rc、圆心同点) → 等距性比 .87 更好，且天然居中于 45° 对角。
+    // 入弯/出弯两段 cubic 直接不画(它们本就是过渡到直边的部分，是"太长"的元凶)。
     if (cfg.locationMode == MKLocationBadge) {
         CGFloat t = cfg.badgeThickness;
         CGFloat inset = cfg.badgeInset;
@@ -97,20 +104,14 @@ const CGFloat MKBadgeFrameExtra = 15.0f;
         CGFloat mid    = p - a - b - c;   // 入弯 cubic 终点(= 圆弧起点)的沿边坐标
 
         // ── 左上角基准路径（外框局部坐标，原点 = 外框左上角）──
+        // v2.0.66.88: 只画中段真圆弧(圆心 (R,R)、半径 R、圆心角 42.420°)，
+        // 起点 (d,mid) / 终点 (mid,d) 即原 3 段构造中 cubic 与圆弧的两个接点。
         // 其余三角由镜像变换得到，避免手写四份镜像坐标出错（.81 strncmp 死码同类教训）
         UIBezierPath *path = [UIBezierPath bezierPath];
-        [path moveToPoint:CGPointMake(0, p)];
-        [path addCurveToPoint:CGPointMake(d, mid)
-                controlPoint1:CGPointMake(0, p - a)
-                controlPoint2:CGPointMake(0, p - a - b)];
-        // 圆心 (R,R)；起点 (d,mid)、终点 (mid,d) 均在半径 R 上。UIKit 为 y-down 坐标系，
-        // clockwise:YES = 角度递增方向，与 atan2 计算出的 a0<a1 一致。
+        // UIKit 为 y-down 坐标系，clockwise:YES = 角度递增方向，与 atan2 计算出的 a0<a1 一致。
         CGFloat a0 = atan2(mid - R, d - R);
         CGFloat a1 = atan2(d - R, mid - R);
         [path addArcWithCenter:CGPointMake(R, R) radius:R startAngle:a0 endAngle:a1 clockwise:YES];
-        [path addCurveToPoint:CGPointMake(p, 0)
-                controlPoint1:CGPointMake(p - a - b, 0)
-                controlPoint2:CGPointMake(p - a, 0)];
 
         switch (self.badgeCorner) {
             case MKBadgeCornerTopLeft:

@@ -353,6 +353,16 @@ static BOOL MKHideNames(void) {
 //
 // 恒真而非配置项: 纠正非法名字在任何模式下都无副作用, 没有关掉它的理由; 保留具名函数是为了
 // 让每个调用点自解释「这是纠正 iOS, 不是我们抢名字」, 防止将来又被误挂到 MKHideNames() 上。
+//
+// ⚠️ v2.0.66.88 重要修订 —— 上面「文件夹缩略图网格也算 stray, 两模式都要擦」这条【已推翻】:
+//   实机证实角标模式下文件夹名依旧闪, 真因不是「没人擦」, 而恰恰是「我们擦了」——
+//   iOS 开合文件夹走 compositor crossfade, 快照里那个名字还在; 我们只能改 live label,
+//   改不了已生成的快照 → live(无名) 与 snapshot(有名) 交叉淡入淡出 = 用户看到的闪。
+//   .77 在替换模式下判此路"hook 架构内无解"是对的(替换模式必须藏名, 不一致命里带的),
+//   但角标模式的契约本是「名字一律不动」→ 缩略图名也是名字, 不该碰。
+//   故 .88 起【角标模式下缩略图那一路全部交还系统】(共 5 个擦名点删除: MKSetHiddenHook /
+//   MKSetAlphaHook / setIconLabelAlpha / MKLabelDidMoveToWindowHook / layoutSubviews 每帧兜底)。
+//   dock / 负一屏 / widget 三类 foreign 容器【保留】—— 它们没有 crossfade 快照通道, 未观察到闪。
 static inline BOOL MKFixStrayNames(void) {
     return YES;
 }
@@ -2374,17 +2384,19 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
         if (!hidden && MKFixStrayNames()) {
             @try {
                 UIView *lbl = (UIView *)self;
-                // ① 文件夹缩略图网格(SBFolderIconImageView)内的迷你图标名 —— 原生从不显示,
-                //    出现即 iOS 回收复用/快照过渡带出的非法名(= 用户说的"文件夹那个问题")。
-                //    与替换模式分支的差别: 不再要求 bid∈sHiddenBids(角标模式该集合恒空 → 旧判据恒假),
-                //    改为容器 default-deny —— 缩略图里【任何】可见名字都非法。
-                if (MKViewInFolderThumb(lbl)) {
-                    hidden = YES;
-                    [lbl.layer removeAllAnimations];
-                }
-                // ② dock / 负一屏 / widget 容器内的图标名 —— 同为原生不显示的位置。
-                //    MKForeignContainerCtx 内含 MKLabelInHomeGrid 守卫, 主屏网格名绝不误杀。
-                else if (MKForeignContainerCtx(lbl)) {
+                // v2.0.66.88: 【原①「文件夹缩略图网格擦名」分支已整段删除】
+                // 用户实机证实角标模式下文件夹名仍在闪, 真因就是这一路: 我们擦掉 live label,
+                // 但 iOS 开合文件夹的 compositor crossfade 快照里那个名字还在
+                // → live/snapshot 不一致 = 闪。角标模式契约是「名字一律不动」, 文件夹名
+                // 也属于名字, 擦它既违约又是闪源。交还系统: iOS 16 缩略图原生不显示名字
+                // → 既不显也不闪; 若某状态原生要显示, 那也是原生行为, 不该我们插手。
+                // ⚠️ 注意本块整体在 `if (!MKHideNames())` 内 = 角标模式专属分支,
+                //    所以【不能】写成 `MKHideNames() && MKViewInFolderThumb(...)` —— 那是恒假死码。
+                //
+                // dock / 负一屏 / widget 容器内的图标名 —— 同为原生不显示的位置, 保留擦除
+                // (未观察到闪, 且原生确实无名, 常显更难看)。
+                // MKForeignContainerCtx 内含 MKLabelInHomeGrid 守卫, 主屏网格名绝不误杀。
+                if (MKForeignContainerCtx(lbl)) {
                     hidden = YES;
                     [lbl.layer removeAllAnimations];
                 }
@@ -2438,10 +2450,10 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
         if (a > 0.0f && MKFixStrayNames()) {   // 仅当有人试图显示才判定, alpha<=0 零成本跳过
             @try {
                 UIView *lbl = (UIView *)self;
-                if (MKViewInFolderThumb(lbl)) {          // 缩略图网格内任何可见名字皆非法
-                    a = 0.0f;
-                    [lbl.layer removeAllAnimations];
-                } else if (MKForeignContainerCtx(lbl)) {  // dock / 负一屏 / widget 同理
+                // v2.0.66.88: 原 MKViewInFolderThumb 分支已删除 —— 角标模式不擦文件夹缩略图名
+                // (擦 live 但快照里有 → 闪, 见 MKSetHiddenHook 同款说明)。本块在
+                // `if (!MKHideNames())` 内, 故【不可】改写成 `MKHideNames() && ...`(恒假死码)。
+                if (MKForeignContainerCtx(lbl)) {  // dock / 负一屏 / widget 原生无名, 保留擦除
                     a = 0.0f;
                     [lbl.layer removeAllAnimations];
                 }
@@ -2517,7 +2529,10 @@ static void MKLabelDidMoveToWindowHook(id self, SEL _cmd) {
             if (!MKFixStrayNames()) return;
             UIView *lbl0 = (UIView *)self;
             if (!lbl0.window || lbl0.alpha <= 0.0f || lbl0.hidden) return;  // 不可见 → 无需纠正
-            if (MKViewInFolderThumb(lbl0) || MKForeignContainerCtx(lbl0)) {
+            // v2.0.66.88: 原为 `MKViewInFolderThumb(lbl0) || MKForeignContainerCtx(lbl0)`。
+            // 角标模式下【不再】擦文件夹缩略图名(擦 live 但快照里有 → 闪, 见 MKSetHiddenHook
+            // 同款说明); 这里是第 4 个同类擦点, 不一并短路的话前三处的修复会被它抵消。
+            if (MKForeignContainerCtx(lbl0)) {
                 lbl0.hidden = YES;
                 lbl0.alpha = 0.0f;
                 lbl0.layer.opacity = 0.0f;
@@ -2656,8 +2671,13 @@ static void MKRestoreLabelIfOurs(UIView *label) {
     BOOL ours = (ourBid.length != 0);
     if (!ours && sHiddenLabelToBid && [sHiddenLabelToBid objectForKey:(id)label]) ours = YES;
     if (!ours) return;                                   // 系统藏的 → 不碰
-    if (MKViewInFolderThumb(label) || MKForeignContainerCtx(label)) {
-        MKAssocLabelBid(label, nil);                     // 原生无名字容器 → 只清键不复显
+    // v2.0.66.88: 跳过复显的条件收窄。
+    //   · foreign 容器(dock/负一屏/widget): 两模式都仍在擦(原生无名) → 复显会与自己互搏, 只清键。
+    //   · 文件夹缩略图: 角标模式已【交还系统】(不再擦) → 我们过去藏的必须复原, 否则是残留干预;
+    //     替换模式下该位置由既有藏名 machinery 持有 → 仍不复显(本函数虽只在角标模式被调,
+    //     判据写全以防将来复用)。
+    if (MKForeignContainerCtx(label) || (MKHideNames() && MKViewInFolderThumb(label))) {
+        MKAssocLabelBid(label, nil);                     // 只清键不复显
         return;
     }
     label.hidden = NO;
@@ -2750,7 +2770,11 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
             // 的显形通道之一。角标模式不藏名, 但这两个位置原生【本就没有名字】, 故仍需归零。
             // default-deny 按容器判定, 与运行状态无关(角标模式 sHiddenBids 恒空, 旧判据用不了)。
             if (a > 0.0f) {
-                if (MKViewInFolderThumb((UIView *)self) || MKLabelInDock((UIView *)self)) {
+                // v2.0.66.88: 原 `MKViewInFolderThumb(self) || MKLabelInDock(self)` 中的
+                // 缩略图判据已删除 —— 角标模式不擦文件夹缩略图名(擦 live 而快照里有 → 闪,
+                // 用户实机证实)。本 else 分支即角标模式专属, 故不可写 `MKHideNames() && ...`。
+                // MKLabelInDock 保留: dock 原生无名, 且未观察到闪。
+                if (MKLabelInDock((UIView *)self)) {
                     a = 0.0f;
                     UIView *sl = MKGetCachedLabel((SBIconView *)self);
                     if (sl) {
@@ -3944,7 +3968,12 @@ static void MKMigrateLocationMode(void) {
                     if (ours) {
                         // stray 容器内的 label 不复显 —— 这些位置原生无名字, 复显 = 制造 bug。
                         // MKFixStrayNames() 恒真, 下一帧也会再擦一遍, 但这里先别添乱。
-                        if (MKViewInFolderThumb(current) || MKForeignContainerCtx(current)) {
+                        // v2.0.66.88: 判据与 MKRestoreLabelIfOurs 对齐 —— 文件夹缩略图在
+                        // 角标模式下已交还系统(不再擦), 故此时【必须】复原我们过去藏的,
+                        // 否则切到角标模式后缩略图里那些名字永久 hidden=YES(残留干预)。
+                        // 本函数在 reload 之后调用 → MKHideNames() 已是新模式的值。
+                        if (MKForeignContainerCtx(current) ||
+                            (MKHideNames() && MKViewInFolderThumb(current))) {
                             objc_setAssociatedObject(current, &kMKLabelBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                         } else {
                             current.hidden = NO;
@@ -4095,20 +4124,23 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     }
 
     // v2.0.66.86: 【角标模式】每帧纠正「iOS 把名字渲染到原生无名字位置」——
-    // 覆盖用户实机复现的文件夹缩略图闪名, 并预防性覆盖负一屏(用户说"还没遇到, 估计也有")。
-    //   · 缩略图网格(SBFolderIconImageView): 原生【从不】显示迷你图标名字。替换模式下这活由
-    //     「运行 App 藏名(sHiddenBids 权威)」顺带压住; 角标模式 sHiddenBids 恒空 → 旧判据恒假
-    //     → 无人纠正, 于是 iOS 回收复用/快照过渡带出的名字照旧闪。
+    // v2.0.66.88 修订: 缩略图那一路【已删除】。用户实机证实角标模式文件夹名仍在闪, 真因
+    // 就是「我们擦 live label, 而 iOS 开合文件夹的 compositor crossfade 快照里名字还在」
+    // → live/snapshot 不一致。角标模式契约本是「名字一律不动」, 缩略图名也是名字。
+    // 现只保留 foreign 容器一路:
     //   · foreign 容器(负一屏 SBToday*/SBDashboard*/SBWidget*/SBFFocusIsolationView, 及 dock 的
-    //     层级形态): 同样原生无名字。dock 已由上方 MKDockStrayHide 每帧兜, 此处补齐其余。
+    //     层级形态): 原生无名字, 且未观察到闪(无 crossfade 快照通道)。dock 另由上方
+    //     MKDockStrayHide 每帧兜, 此处补齐其余。
     // 判定按容器 default-deny(与运行状态无关), 误伤空间为零: 这些位置本来就没名字。
-    // MKLabelInHomeGrid 守卫在 MKForeignContainerCtx 内, 主屏网格名绝不被误杀;
-    // MKViewInFolderThumb 只认 SBFolderIconImageView 子树, 文件夹自身名 label 不在其内。
+    // MKLabelInHomeGrid 守卫在 MKForeignContainerCtx 内, 主屏网格名绝不被误杀。
     // 仅角标模式走(替换模式已有既有链路), 且先做廉价的 hidden/alpha 预筛再爬祖先链。
     if (!MKHideNames() && MKFixStrayNames()) {
         UIView *tl = MKGetCachedLabel((SBIconView *)self);
         if (tl && tl.superview && !tl.hidden && tl.alpha > 0.01f) {
-            if (MKViewInFolderThumb(tl) || MKForeignContainerCtx(tl)) {
+            // ⚠️ 这里曾是第 5 个(也是最强的, 每帧执行)缩略图擦名点 —— 若将来有人把
+            //    MKViewInFolderThumb 加回来, 前四处(setHidden/setAlpha/setIconLabelAlpha/
+            //    didMoveToWindow)的 .88 修复会被它一并抵消, 文件夹闪名立刻复现。
+            if (MKForeignContainerCtx(tl)) {
                 tl.hidden = YES;
                 tl.alpha = 0.0f;
                 tl.layer.opacity = 0.0f;
