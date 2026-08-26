@@ -4157,7 +4157,33 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     MKLocationMode newMode = [MKConfig sharedConfig].locationMode;
     sLastLocationMode = newMode;
     sLastModeValid = YES;
-    if (hadOld && oldMode != newMode) MKMigrateLocationMode();
+    BOOL modeChanged = (hadOld && oldMode != newMode);
+    if (modeChanged) MKMigrateLocationMode();
+    // ★ v2.0.66.92 【跨模式切换必须全量重建指示器，不能只重画】★
+    //  病灶: 下面那段循环只 setBadgeCorner/setIconCornerRadius/setNeedsDisplay，【不重算 frame】。
+    //  但两模式的 frame 完全不是一个量级(见 MKIndicatorFrameInOverlay):
+    //    · 角标模式 frame = 图标图片方形 bounds 四周各扩 MKBadgeFrameExtra(15pt) ≈ 90x90, 原点 -15
+    //    · 替换模式 frame = 以 name label 矩形为心的 dotSize / barWidth x barHeight ≈ 6~40pt
+    //  于是切模式后至少一帧是「新模式的绘制代码 + 旧模式的 frame」:
+    //    · 角标→替换: 旧 frame 90x90, 替换分支 CGContextFillEllipseInRect(CGRectInset(rect,0.5,0.5))
+    //      把【整个 frame】当圆点本体画 → 一个约 89pt 的巨型圆点糊住图标。
+    //    · 替换→角标: 旧 frame 只有 6~40pt → drawRect 里 W = rect.w - 2*15 变负 → 触发兜底
+    //      W = rect.size.width → rc = MIN(W,H)*0.2237 ≈ 2pt → 弧线又小又在错位置。
+    //  二级病灶: MKUpdate 复用分支「图标离屏时保留最后位置不重算」(!CGRectIsEmpty 守卫) 会让
+    //  当前不在视图树内的图标(别页/dock/已关文件夹内)长期滞留【旧模式】frame, 而 MKRefreshAllIcons
+    //  只遍历 [UIApplication windows] 可达的 SBIconView, 覆盖不到 → 旧 frame 可以存活很久。
+    //
+    //  修法: 跨模式一律全量重建 —— 重建必然走 MKUpdate 的创建分支
+    //  (initWithFrame:新frame + setIconCornerRadius + setBadgeCorner + applyConfig 一次性按新模式初始化),
+    //  离屏残留问题一并消失(指示器直接不存在, 等该图标下次 layout 时按新模式新建)。
+    //  MKRemoveAllIndicators 会清 sHiddenBids/sHiddenLabelToBid, 但 MKMigrateLocationMode 上一行
+    //  刚跑完、本来就要清这两张表 → 语义不冲突。
+    if (modeChanged) {
+        MKRemoveAllIndicators();
+        MKRefreshAllIcons();
+        MKRefreshFolderIcons();
+        return;
+    }
     // v2.0.66.81: 角标参数(badgeCorner/thickness/inset)变更时刷新已存在的指示器。
     // thickness/inset 在 drawRect 直接读 cfg → setNeedsDisplay 即重画；badgeCorner 是属性需重设。
     // v2.0.66.91: badgeArcLength(弧长比例)同属「drawRect 直接读 cfg」一类 → 无需新增属性,
@@ -4167,6 +4193,14 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     //   时指示器往往已存在(MKFindIndicator 非 nil → 不走创建分支) → 用的是当初创建那一刻取到
     //   的值; 若那时图标图层尚未布好 continuousCornerRadius, 取到的是兜底 m*0.2237。
     //   .82 时代弧线本就不准看不出, .87 改同心圆角后 rc 直接决定外轮廓是否等距 → 必须校正。
+    // ★ v2.0.66.92: 同模式内参数变更也必须【重算 frame】——原来只 setNeedsDisplay 是错的:
+    //   替换模式的 frame 就是圆点本体尺寸(dotSize / barWidth x barHeight), 只重画不换 frame →
+    //   拖 dotSize/barWidth/barHeight 滑块【不即时生效】, 得等那个图标下次 layout 才变。
+    //   角标模式因为都在固定 90x90 画布内绘制, 所以 thickness/inset/arcLength 看不出这个缺口。
+    //   保守原则: 只在能【可信】算出新 frame 时才写, 算不出就一字不动(退化为改动前行为,
+    //   等该图标下次 layout 由 MKRepositionIndicator/MKUpdate 复位) —— 绝不 hidden=YES,
+    //   否则文件夹指示器(key 是 __folder__%p, 永不进 sBidToIconView)会被一律藏起来,
+    //   而 layoutSubviews 对文件夹指示器只管藏名不管几何 → 可能一直藏到下次 gen 变更, 是回归。
     if (sBidToIndicator) {
         MKConfig *cfg = [MKConfig sharedConfig];
         NSArray *bids = [[sBidToIndicator keyEnumerator] allObjects];
@@ -4178,6 +4212,17 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
             if (iv) {
                 CGFloat rc = MKIconCornerRadius((UIView *)iv);
                 if (rc > 0) [(MKIndicatorDotView *)ind setIconCornerRadius:rc];
+                // ⚠️ sBidToIconView 存的是「最后一次 MKUpdate 的图标实例」, 多页桌面下可能是
+                //   另一页的实例(见 MKIndicatorFrameInOverlay 头部警告) → 用它算出的 frame 属于
+                //   另一个 overlay 坐标系, 直接套上去 = 指示器飘到别页。判据: 该图标必须真的在
+                //   指示器当前所挂的 overlay 子树内。
+                //   直接用 ind.superview 而不调 MKOverlayForContainer —— 后者会懒建 overlay, 在这里
+                //   为一个当前没有 overlay 的容器凭空造一个是纯副作用。
+                UIView *ov = ind.superview;
+                if (ov && [iv isDescendantOfView:ov]) {
+                    CGRect f = MKIndicatorFrameInOverlay(iv, ov, cfg);
+                    if (!CGRectIsEmpty(f)) ind.frame = f;
+                }
             }
             [ind setNeedsDisplay];
         }
