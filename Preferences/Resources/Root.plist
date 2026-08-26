@@ -10,7 +10,7 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>RunningDotIndicator 2.0.66.46</string>
+			<string>RunningDotIndicator 2.0.66.91</string>
 			<key>footerText</key>
 			<string>为运行中的 App 图标添加指示器。App 运行时自动替换图标下方的名称文字，退出后恢复原名称。支持系统：iOS 16.x（roothide / rootless）；iOS 15 及更低不挂钩。</string>
 		</dict>
@@ -358,9 +358,156 @@
 		<string>PSGroupCell</string>
 		<key>label</key>
 		<string>说明</string>
-		<key>footerText</key>
-		<string>修改后即时生效，无需注销或重启。</string>
+	<key>footerText</key>
+	<string>修改后即时生效，无需注销或重启。</string>
 	</dict>
+
+		<!-- ===== 位置模式 ===== -->
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>位置模式</string>
+			<key>footerText</key>
+			<string>替换名称：保留原行为，指示器替换 App 图标下方的名称文字。角标模式：指示器贴在图标四角之一（一条带圆角的弧线），不占用名称位置，名称正常显示。</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSLinkListCell</string>
+			<key>detail</key>
+			<string>PSListItemsController</string>
+			<key>label</key>
+			<string>指示器位置</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>locationMode</string>
+			<key>default</key>
+			<integer>0</integer>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+			<key>validTitles</key>
+			<array>
+				<string>替换名称</string>
+				<string>角标模式</string>
+			</array>
+			<key>validValues</key>
+			<array>
+				<integer>0</integer>
+				<integer>1</integer>
+			</array>
+		</dict>
+
+		<!-- ===== 角标设置 ===== -->
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>角标设置</string>
+			<key>footerText</key>
+			<string>以下选项仅在「角标模式」下生效。距离：0=内贴图标边角，数值越大越向外远离图标。长度：弧线占图标圆角的比例，沿两端等量缩短，曲率不变仍贴合圆角。粗细支持小数。</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSLinkListCell</string>
+			<key>detail</key>
+			<string>PSListItemsController</string>
+			<key>label</key>
+			<string>角标角落</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>badgeCorner</string>
+			<key>default</key>
+			<integer>0</integer>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+			<key>validTitles</key>
+			<array>
+				<string>左上</string>
+				<string>右上</string>
+				<string>左下</string>
+				<string>右下</string>
+			</array>
+			<key>validValues</key>
+			<array>
+				<integer>0</integer>
+				<integer>1</integer>
+				<integer>2</integer>
+				<integer>3</integer>
+			</array>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>label</key>
+			<string>角标粗细</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>badgeThickness</string>
+			<key>default</key>
+			<real>4</real>
+			<key>min</key>
+			<real>1</real>
+			<key>max</key>
+			<real>6</real>
+			<key>showValue</key>
+			<true/>
+			<key>isContinuous</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>label</key>
+			<string>角标弧线长度 %</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>badgeArcLength</string>
+			<key>default</key>
+			<real>90</real>
+			<key>min</key>
+			<real>60</real>
+			<key>max</key>
+			<real>100</real>
+			<key>isContinuous</key>
+			<true/>
+			<key>showValue</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>label</key>
+			<string>角标与图标距离</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>badgeInset</string>
+			<key>default</key>
+			<real>0</real>
+			<key>min</key>
+			<real>0</real>
+			<key>max</key>
+			<real>12</real>
+			<key>isContinuous</key>
+			<true/>
+			<key>showValue</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+		</dict>
 
 	</array>
 

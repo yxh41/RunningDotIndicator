@@ -9,6 +9,10 @@
 #import <UIKit/UIKit.h>
 #import "MKConfig.h"
 
+// v2.0.66.82: 角标模式 indicator frame 四周扩展量 = max inset(12) + max half-thickness(3)
+// Tweak.x(MKIndicatorFrameInOverlay) 和 MKIndicatorDotView.m(drawRect 平移) 共享
+extern const CGFloat MKBadgeFrameExtra;
+
 @interface MKIndicatorDotView : UIView
 
 // 根据当前 MKConfig 刷新外观(颜色/形状/不透明度)
@@ -16,5 +20,9 @@
 
 // per-icon 颜色（AutoIcon 模式时覆盖 cfg.color）
 @property (nonatomic, strong) UIColor *indicatorColor;
+
+// v2.0.66.80: 角标模式参数
+@property (nonatomic, assign) CGFloat iconCornerRadius;  // 图标图片真实圆角
+@property (nonatomic, assign) MKBadgeCorner badgeCorner; // 角标所在角落
 
 @end

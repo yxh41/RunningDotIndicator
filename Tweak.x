@@ -281,6 +281,92 @@ static UIView *MKOverlayForContainer(UIView *container) {
     }
     return ov;
 }
+
+#pragma mark - 角标模式辅助（v2.0.66.80, .81 修 strncmp 死码, .82 改 squircle+扩 frame）
+// v2.0.66.82: frame 扩展常量 MKBadgeFrameExtra 定义在 MKIndicatorDotView.h（extern），
+// Tweak.x(MKIndicatorFrameInOverlay) 和 MKIndicatorDotView.m(drawRect) 共享
+// 取图标图片视图(SBIconImageView / SBIconImageCrossfadeView)，用于角标贴附图标圆角
+// v2.0.66.81: 原 strncmp(n,"SBIconImage",12) 比较长度写成12，"SBIconImage" 仅11字符+null=12，
+//   第12字节 '\0' 与任何 SBIconImage* 类名第12字节(字母)不等 → 恒不匹配 → 永远回退到 SBIconView
+//   (含名字标签区) → 左下/右下弧线圆心下移名字高度，"距离远"。修：长度改11 + 递归查找兜底嵌套。
+static UIView *MKIconImageView(UIView *iv) {
+    if (!iv) return nil;
+    for (UIView *sub in iv.subviews) {
+        const char *n = class_getName([sub class]);
+        // v2.0.66.84: 文件夹图标的图片视图类名是 SBFolderIconImageView（不以 SBIconImage 开头），
+        //   而它内部嵌着一格格迷你 App 图标、每个迷你图标各自带 SBIconImageView。
+        //   原实现深度优先递归 → 先命中【迷你图标】的 SBIconImageView 就返回 → 角标按迷你图标
+        //   (约 1/3 尺寸、位于文件夹内部) 的 bounds 定位 → 文件夹 4 个角全部"距离远"。
+        //   修：先比 SBFolderIconImage 前缀，保证在钻进缩略图之前就命中文件夹本体图片视图。
+        if (strncmp(n, "SBFolderIconImage", 17) == 0) return sub;
+        if (strncmp(n, "SBIconImage", 11) == 0) return sub;
+        UIView *found = MKIconImageView(sub);   // 递归兜底：crossfade 等容器嵌套
+        if (found) return found;
+    }
+    return nil;
+}
+// v2.0.66.84: 角标定位基准视图。若命中的图片视图宽度明显小于图标视图（说明仍误命中了
+// 文件夹缩略图内的迷你图标，或该系统版本类名不符预期），返回 nil 让调用方走正方形兜底。
+static UIView *MKBadgeBaseView(UIView *iv) {
+    UIView *base = MKIconImageView(iv);
+    if (!base) return nil;
+    CGFloat bw = base.bounds.size.width;
+    CGFloat ivw = iv ? iv.bounds.size.width : 0;
+    if (ivw > 1.0f && bw < ivw * 0.5f) return nil;   // 误命中迷你图标 → 判废
+    return base;
+}
+// 取图标图片真实圆角（continuousCornerRadius，iOS13+ 图标圆角真正来源；普通 cornerRadius 常为 0）
+static CGFloat MKIconCornerRadius(UIView *iv) {
+    UIView *imv = MKBadgeBaseView(iv);   // v2.0.66.84: 用带判废的基准视图，避免取到迷你图标的小圆角
+    UIView *target = imv ?: iv;
+    CALayer *layer = target.layer;
+    if ([layer respondsToSelector:@selector(continuousCornerRadius)]) {
+        NSNumber *cr = [layer valueForKey:@"continuousCornerRadius"];
+        if (cr && [cr floatValue] > 0) return [cr floatValue];
+    }
+    if (layer.cornerRadius > 0) return layer.cornerRadius;
+    // v2.0.66.84: 兜底按图标图片正方形边长算（不用含名字区的 SBIconView 高度）
+    CGFloat m = imv ? MIN(target.bounds.size.width, target.bounds.size.height)
+                    : target.bounds.size.width;
+    return m * 0.225f;
+}
+// 角标模式下不抢名字位置 → 所有藏名逻辑统一失效
+static BOOL MKHideNames(void) {
+    return [MKConfig sharedConfig].locationMode != MKLocationBadge;
+}
+
+// v2.0.66.86: 与 MKHideNames() 【正交】的第二类职责门控 —— 「纠正 iOS 原生非法名字」。
+//
+// 两者语义必须分清, .85 把它们混为一谈是本轮 bug 的根:
+//   MKHideNames()     = 「我们主动把运行 App 的名字藏掉, 让位给指示器」。角标模式不抢名字位 → 关。
+//   MKFixStrayNames() = 「iOS 自己把某个图标名 label 渲染到了【原生本来不显示名字】的位置
+//                        (dock / 负一屏 / widget / 文件夹缩略图网格), 把它纠正掉」。两模式都必须开。
+//
+// 用户实机反馈(角标模式下 dock 串名 + 文件夹缩略图闪名依旧)的真因就在这里:
+// 这两症的机制是 iOS 自身的 SBIconView/label 回收复用 —— 把旧槽位的名字带到新槽位,
+// 与我们藏不藏名【毫无关系】; 替换模式下靠 MKDockStrayHide / didMoveToSuperview 清过期键
+// 这套「纠正机制」压住, 而 .85 把它们随 MKHideNames() 一并关掉 = 禁用过头, 于是无人纠正。
+//
+// 判定安全性(default-deny 无误伤空间): dock / 负一屏 / widget / 缩略图网格 原生一律不显示
+// 图标名 → 这些容器内出现【任何可见 name label】= 100% 非法; 失败模式退化为「这些位置没名字」,
+// 而它们本来就没名字 → 用户零感知。主屏网格由 MKLabelInHomeGrid 守卫排除, 绝不误杀。
+//
+// 恒真而非配置项: 纠正非法名字在任何模式下都无副作用, 没有关掉它的理由; 保留具名函数是为了
+// 让每个调用点自解释「这是纠正 iOS, 不是我们抢名字」, 防止将来又被误挂到 MKHideNames() 上。
+//
+// ⚠️ v2.0.66.88 重要修订 —— 上面「文件夹缩略图网格也算 stray, 两模式都要擦」这条【已推翻】:
+//   实机证实角标模式下文件夹名依旧闪, 真因不是「没人擦」, 而恰恰是「我们擦了」——
+//   iOS 开合文件夹走 compositor crossfade, 快照里那个名字还在; 我们只能改 live label,
+//   改不了已生成的快照 → live(无名) 与 snapshot(有名) 交叉淡入淡出 = 用户看到的闪。
+//   .77 在替换模式下判此路"hook 架构内无解"是对的(替换模式必须藏名, 不一致命里带的),
+//   但角标模式的契约本是「名字一律不动」→ 缩略图名也是名字, 不该碰。
+//   故 .88 起【角标模式下缩略图那一路全部交还系统】(共 5 个擦名点删除: MKSetHiddenHook /
+//   MKSetAlphaHook / setIconLabelAlpha / MKLabelDidMoveToWindowHook / layoutSubviews 每帧兜底)。
+//   dock / 负一屏 / widget 三类 foreign 容器【保留】—— 它们没有 crossfade 快照通道, 未观察到闪。
+static inline BOOL MKFixStrayNames(void) {
+    return YES;
+}
+
 // v1.6.66: 递归查找某类的首个后代视图（关闭文件夹时定位主屏滚动容器 SBIconScrollView）
 static UIView *MKFindDescendantView(UIView *root, NSString *clsName) {
     if (!root || !clsName) return nil;
@@ -417,6 +503,25 @@ static void MKUnlockRestore(void) {
 // 无 live 视图（图标离屏/被回收）→ 返回 CGRectZero，调用方保留其最后位置不重算。
 static CGRect MKIndicatorFrameInOverlay(SBIconView *iv, UIView *overlay, MKConfig *cfg) {
     if (!iv || !overlay || !cfg) return CGRectZero;
+    if (cfg.locationMode == MKLocationBadge) {
+        // 角标模式：指示器贴在图标图片圆角内沿，按图标图片真实 bounds 计算（不依赖 label 位置）
+        // v2.0.66.84: 用 MKBadgeBaseView（带"误命中迷你图标判废"）。判废/取不到时兜底为
+        //   SBIconView 顶部的正方形图标区（宽=iv 宽，高=宽），而不是含名字区的整个 iv.bounds
+        //   —— 后者会让下方两角下移一个名字高度。
+        UIView *base = MKBadgeBaseView((UIView *)iv);
+        CGRect r;
+        if (base) {
+            r = [overlay convertRect:base.bounds fromView:base];
+        } else {
+            CGFloat side = MIN(iv.bounds.size.width, iv.bounds.size.height);
+            r = [overlay convertRect:CGRectMake(0, 0, side, side) fromView:(UIView *)iv];
+        }
+        // v2.0.66.82: 四周各扩 MKBadgeFrameExtra(15pt)，容纳 max inset(12) + max half-thickness(3)
+        // 供 inset>0 时弧线整体外移到角落外 + stroke 圆头不裁。
+        // drawRect 内对应按 (MKBadgeFrameExtra, MKBadgeFrameExtra) 平移到 icon 坐标系。
+        return CGRectMake(r.origin.x - MKBadgeFrameExtra, r.origin.y - MKBadgeFrameExtra,
+                          r.size.width + 2 * MKBadgeFrameExtra, r.size.height + 2 * MKBadgeFrameExtra);
+    }
     CGFloat indW = (cfg.shape == MKShapeDot) ? cfg.dotSize : cfg.barWidth;
     CGFloat indH = (cfg.shape == MKShapeDot) ? cfg.dotSize : cfg.barHeight;
     UIView *label = MKGetCachedLabel(iv);
@@ -813,6 +918,12 @@ static BOOL MKBetaHideClass(UIView *v) {
 // 仅在 MKRefreshAllIcons(prefs 变更) 走一次, 非每帧。BFS 整棵以确保嵌套的 beta 点也藏掉。
 static void MKBetaHideAll(UIView *iv) {
     if (!iv) return;
+    // v2.0.66.86: 角标模式 —— 小黄点整套 machinery 交还系统。
+    // 这套东西(脱离/复显/对齐/全藏)存在的【唯一】理由是「我们把 label 整张藏掉会把同区的
+    // 小黄点一起带走」。角标模式名字全程不动 → 小黄点从未被我们影响 → 任何主动干预都是
+    // 无理由地跟系统抢控制权(还会引入偏上/闪烁/孤儿点累积)。故一律不动手。
+    // 「保留小黄点」开关在角标模式下同样无意义, 设置页会置灰。
+    if (!MKHideNames()) return;
     NSMutableArray *st = [NSMutableArray arrayWithArray:(NSArray *)[iv subviews]];
     while (st.count) {
         UIView *v = [st lastObject]; [st removeLastObject];
@@ -842,6 +953,10 @@ static UIView *MKFindBetaInLabel(UIView *label) {
 // center.y 对齐到文本标签 center.y、水平保留 iOS 原生 x，灭偏上。
 static void MKEnsureBetaVertAlign(UIView *iconView, UIView *dot) {
     if (!iconView || !dot) return;
+    // v2.0.66.86: 角标模式不动小黄点坐标 —— 「偏上」这个 bug 本身就是我们藏 label 导致
+    // iOS 把 β点 y 钉到 label 顶沿的次生问题; 名字不藏则 iOS 自己摆得就是对的, 再去纠正
+    // 反而与系统布局互搏。见 MKBetaHideAll 同款说明。
+    if (!MKHideNames()) return;
     UIView *label = MKGetCachedLabel((SBIconView *)iconView);
     if (label) {
         CGFloat ly = label.center.y;
@@ -854,6 +969,9 @@ static void MKEnsureBetaVertAlign(UIView *iconView, UIView *dot) {
 // 父视图转换到 iconView；父视图不存在（极端）则沿用其 center。
 static void MKEnsureBetaOnIconView(UIView *iconView, UIView *dot) {
     if (!iconView || !dot) return;
+    // v2.0.66.86: 角标模式不脱离小黄点 —— 脱离是为了让它逃出「被我们藏掉的 label」;
+    // 角标模式 label 从不被藏, 脱离只会制造孤儿点与坐标偏移。见 MKBetaHideAll 同款说明。
+    if (!MKHideNames()) return;
     // v2.0.62: β点兄弟节点(本机 iOS16 实测 SBIconBetaLabelAccessoryView 直挂 SBIconView)→
     // 仅原位保可见、绝不改 center(灭偏上)。已在 iconView 上时直接保可见即返回。
     if (dot.superview == iconView) {
@@ -880,6 +998,9 @@ static void MKEnsureBetaOnIconView(UIView *iconView, UIView *dot) {
 
 static void MKDetachBetaOnce(UIView *iconView) {
     if (!iconView) return;
+    // v2.0.66.86: 角标模式不介入小黄点(交还系统)。见 MKBetaHideAll 同款说明。
+    // 放在最前 —— 早于 MKGetCachedLabel + MKFindBetaInLabel 的每帧子树 BFS, 顺带省开销。
+    if (!MKHideNames()) return;
     UIView *label = MKGetCachedLabel((SBIconView *)iconView);
      // v2.0.64: 仅调试开时枚举(生产零开销，省每帧 MKGetCachedBid 求值)
     // v2.0.30: 「保留小黄点」开关 —— 关则退回 v2.0.23 行为（不保护，由藏名逻辑连带藏掉 beta 点）
@@ -898,6 +1019,9 @@ static void MKDetachBetaOnce(UIView *iconView) {
     
 }
 // 退出/恢复：移除我们脱离到 iconView 的小黄点（系统会在原 label 重建自己的点，原生恢复）。
+// v2.0.66.86: 本函数【刻意不加 MKHideNames() 门控】—— 它的动作是「撤销我们的干预、还原系统
+// 原生状态」, 正是角标模式想要的。从替换模式切到角标模式时, 之前脱离出来的孤儿点必须靠它清掉,
+// 否则会与系统在 label 内重建的原生点重影(两个小黄点)。
 static void MKRestoreBetaOrphan(UIView *iconView) {
     // v2.0.33: 只移除「我们脱离时打过 kMKOurBetaKey 标记的」小黄点；
     // 绝不动系统原生的 TestFlight 黄点（它也是 MKBetaClass，但非我们脱离的）。
@@ -2002,6 +2126,37 @@ static NSString *MKForeignContainerCtx(UIView *label) {
     return nil;
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// v2.0.66.89 【角标模式擦名许可 —— 唯一谓词】
+// ─────────────────────────────────────────────────────────────────────
+// .88 只删了「角标专属分支里带 MKViewInFolderThumb 字样」的 5 处, 用户实机结果是
+// 「文件夹名闪的次数少很多, 但还是会」。复盘发现漏了一整类:
+//   两模式共用、只挂恒真 MKFixStrayNames()、按 dock/owner 判据擦名, 代码里【没有
+//   MKViewInFolderThumb 字样】, 却照样能命中文件夹缩略图 label 或动画中被重父的 label。
+// 按 .88 的 grep 口径永远搜不到它们 → 修一半。
+//
+// 【排查铁律】判断「谁还在擦名」不能按判据函数名搜, 必须枚举【所有对 label 写
+//   hidden=YES / alpha=0 / layer.opacity=0 的点】, 逐点问两句:
+//     ① 角标模式下这条路可达吗?  ② 可达时它擦的是不是一个【本该可见】的名字?
+//   判据函数的名字 ≠ 它实际能命中的视图集合(MKForeignContainerCtx 对 dock 内的文件夹
+//   缩略图返回 "DOCK", 名字里根本看不出这层)。
+//
+// 本谓词把散落判据收敛成一处, 语义 = 「角标模式下, 这个 label 所在位置是否允许我们擦掉」:
+//   · 允许: 该位置【原生就不显示名字】(dock / 负一屏 / widget) → 出现可见 label = 100% 非法;
+//   · 禁止: 该位置存在 compositor 快照 / crossfade 通道 → 我们改 live 改不了快照,
+//           「擦掉」本身就是闪源(.88 快照通道铁律)。文件夹缩略图属此类。
+//
+// ⚠️ 注意此处 MKViewInFolderThumb 是【擦名豁免条件】, 不是擦名触发器 ——
+//    与 layoutSubviews 里那条「别把 MKViewInFolderThumb 加回来」的警示注释【不冲突】:
+//    那条警告的是「把它当触发器加回去会让擦名复活」, 这里是拿它当 return NO 的守卫。
+//    改动此函数前请先读懂这两者方向相反, 勿再来回翻烧饼。
+static BOOL MKViewInFolderThumb(UIView *v);   // v2.0.66.89: 前向声明上移(定义见 ~L2670, 本谓词与 MKDockStrayHide 都在其之前)
+static BOOL MKBadgeMayEraseName(UIView *v) {
+    if (!v) return NO;
+    if (MKViewInFolderThumb(v)) return NO;        // 快照通道 → 交还系统(.88/.89)
+    return MKForeignContainerCtx(v) != nil;       // 内含 MKLabelInHomeGrid 守卫, 主屏网格名绝不误杀
+}
+
 
 
 
@@ -2117,24 +2272,45 @@ static BOOL MKDockStrayHide(SBIconView *iv, BOOL *outStray) {
             // 清键后 owner 回落为 nil, 下帧由 MKGetCachedLabelEx 正常绑定给真实属主并自动解钉(对称 restore)。
             objc_setAssociatedObject(foreign, &kMKLabelIconKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(foreign, &kMKLabelBidKey,  nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            foreign.hidden = YES;
-            foreign.alpha  = 0.0f;
-            foreign.layer.opacity = 0.0f;
-            foreign.opaque = NO;
-            [foreign.layer removeAllAnimations];
-            acted = YES;
-            if (outStray) *outStray = YES;
+            // v2.0.66.89 (S3b): 角标模式下若这个 label 属于【dock 里的文件夹缩略图】→ 只清键不藏。
+            //   dockCtx 对 dock 文件夹的 mini SBIconView 恒真(祖先链含 SBDockIconListView),
+            //   而缩略图有 compositor crossfade 快照通道 → 擦 live 就是闪源(.88 铁律)。
+            //   清键仍必须做(否则 owner 校验永远失败, dock 串名无人纠正)。
+            //   替换模式 MKHideNames() 恒真 → 短路走原路径, 行为一字不变。
+            if (MKHideNames() || !MKViewInFolderThumb(foreign)) {
+                foreign.hidden = YES;
+                foreign.alpha  = 0.0f;
+                foreign.layer.opacity = 0.0f;
+                foreign.opaque = NO;
+                [foreign.layer removeAllAnimations];
+                acted = YES;
+                if (outStray) *outStray = YES;
+            }
         }
+        (void)acted;   // v2.0.66.89: 埋点(.71)移除后仅剩赋值; 显式消耗以免 -Werror 未使用告警
         return dockCtx;
     }
     BOOL hit = dockCtx;
     if (!hit) {
+        // ★ v2.0.66.89 【S2】角标模式【不用物理纵带判定】★
+        //   MKLabelPhysicallyInDock 只比较 midY ∈ [dock.minY, dock.maxY], 【横向全屏通吃】。
+        //   本函数上方 L2266 的注释自己就写着「若按纵带放开, 会波及主屏底行/文件夹/Spotlight,
+        //   误伤代价是名字凭空消失, 比串名更刺眼 —— 故此处坚决不用」, 而这里还是用了。
+        //   替换模式下这笔账划得来: 名字本就要藏, 误伤退化成「本来也要藏」。
+        //   角标模式下方向完全相反: 名字本该显示, 误伤 = 名字凭空消失 / 动画期间闪。
+        //   典型命中: 文件夹在底行、或关闭动画收缩轨迹掠过 dock 纵带。
+        //   顺带一笔性能账: 角标模式所有 label 可见 → 下面 `hidden||alpha<=0.01` 早退失效
+        //   → 每图标每帧都做一次 convertRect + 纵带比较(layoutSubviews 每帧调本函数)。
+        //   另: sDockFrame 只在为空时刷新、转屏后不失效 → 横屏纵带整体错位, 角标模式一并免疫。
+        //   ⚠️ 这【不是死码】: MKDockStrayHide 是两模式共用函数, 不在 `if (!MKHideNames())` 分支内。
+        if (!MKHideNames()) return NO;                     // 角标模式: 只认真 dock 子树(dockCtx), 纵带一概不管
         if (lbl.hidden || lbl.alpha <= 0.01f) return NO;   // 已不可见 → 无需判定(最常见早退路径)
         if (!MKLabelPhysicallyInDock(lbl)) return NO;      // 物理不在 dock 纵带 → 正常主屏标签, 放行
         hit = YES;
         if (outStray) *outStray = YES;
     }
-    if (hit && (!lbl.hidden || lbl.alpha > 0.0f)) {
+    // v2.0.66.89 (S3b): 同上 —— 角标模式豁免 dock 内文件夹缩略图(快照通道)。
+    if (hit && (!lbl.hidden || lbl.alpha > 0.0f) && (MKHideNames() || !MKViewInFolderThumb(lbl))) {
         lbl.hidden = YES;
         lbl.alpha = 0.0f;
         lbl.layer.opacity = 0.0f;
@@ -2228,6 +2404,8 @@ static void *MKResolveOrigIMP(NSMutableDictionary *byClass, CFMutableDictionaryR
 // outMapOnly: 仅经指针弱键命中(直接 bid 未中) —— 对应原 OVERLAP-GAP 诊断条件 !hasBid && inMap。
 // 返回 useBid（非 nil = 该藏名）；具体「压制复显」由调用方据自身语义执行(setHidden 改 hidden / setAlpha 改 a 后调 orig)。
 static NSString *MKShouldHideLabel(UIView *label, NSString *bid, BOOL *outMapOnly) {
+    // v2.0.66.80: 角标模式不抢名字位置 → 源头切断所有藏名判定（名字永不藏）
+    if ([MKConfig sharedConfig].locationMode == MKLocationBadge) return nil;
     NSString *mapBid = (sHiddenLabelToBid ? [sHiddenLabelToBid objectForKey:(id)label] : nil);
     // β5: 清过期弱键关联 —— label 对象被跨 icon 复用(同指针不释放)而其当前实时 bid 已变为另一个
     // 有效 bid 时, 旧 mapBid 属回收残留; 此时不采信旧 mapBid 并清掉, 避免误藏/误判。
@@ -2250,6 +2428,42 @@ static NSString *MKShouldHideLabel(UIView *label, NSString *bid, BOOL *outMapOnl
 }
 
 static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
+    // v2.0.66.86: 角标模式不再整段透传 —— .85 的整段早退把「纠正 iOS 原生非法名字」
+    // (dock 串名 / 缩略图闪名) 一起关掉了, 那是用户实机两症在角标模式下依旧复现的真因。
+    // 现按职责拆两路: 替换模式走原全套(含我们主动藏名); 角标模式只走纠正路径。
+    if (!MKHideNames()) {
+        // 角标模式纠正路径: 仅当有人试图【显示】(hidden==NO) 时才判定, 已隐藏则零成本跳过。
+        if (!hidden && MKFixStrayNames()) {
+            @try {
+                UIView *lbl = (UIView *)self;
+                // v2.0.66.88: 【原①「文件夹缩略图网格擦名」分支已整段删除】
+                // 用户实机证实角标模式下文件夹名仍在闪, 真因就是这一路: 我们擦掉 live label,
+                // 但 iOS 开合文件夹的 compositor crossfade 快照里那个名字还在
+                // → live/snapshot 不一致 = 闪。角标模式契约是「名字一律不动」, 文件夹名
+                // 也属于名字, 擦它既违约又是闪源。交还系统: iOS 16 缩略图原生不显示名字
+                // → 既不显也不闪; 若某状态原生要显示, 那也是原生行为, 不该我们插手。
+                // ⚠️ 注意本块整体在 `if (!MKHideNames())` 内 = 角标模式专属分支,
+                //    所以【不能】写成 `MKHideNames() && MKViewInFolderThumb(...)` —— 那是恒假死码。
+                //
+                // dock / 负一屏 / widget 容器内的图标名 —— 同为原生不显示的位置, 保留擦除
+                // (未观察到闪, 且原生确实无名, 常显更难看)。
+                // MKForeignContainerCtx 内含 MKLabelInHomeGrid 守卫, 主屏网格名绝不误杀。
+                // v2.0.66.89 (S3): 改走 MKBadgeMayEraseName —— 它在 MKForeignContainerCtx 之上
+                // 再加一道「快照通道豁免」, 覆盖【dock 里放了文件夹】的情形(其缩略图 mini label
+                // 祖先含 SBDockIconListView → MKForeignContainerCtx 返 "DOCK" → 原判据照样擦 → 闪)。
+                if (MKBadgeMayEraseName(lbl)) {
+                    hidden = YES;
+                    [lbl.layer removeAllAnimations];
+                }
+            } @catch (NSException *e) {}
+        }
+        void(*o)(id,SEL,BOOL) = (void(*)(id,SEL,BOOL))MKResolveOrigIMP(sOrigSetHiddenByClass, sOrigSetHiddenByClassCF, self);
+        if (o && o != (void(*)(id,SEL,BOOL))MKSetHiddenHook) {
+            @try { o(self, _cmd, hidden); }
+            @catch (NSException *e) { RDLog(@"MKSetHiddenHook orig EXCEPTION: %@", e.reason); }
+        }
+        return;
+    }
     @try {
         NSString *bid = MKLabelToBid((UIView *)self);
         // v2.0.3: 关文件夹窗口内有界定向诊断（仅 debug 开 + sFolderClosing 时）
@@ -2260,7 +2474,7 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
             // v1.6.99: MKShouldHideLabel 已写回直接关联键 + 掐动画(标记自持，根除关文件夹缩回/主屏重叠闪现，详见 helper 注释)
             
             // v2.0.64: 删除原 REVEAL-ATTEMPT 分支 —— hidden 已在上行置 YES，!hidden 恒为 NO，该分支实际不可达(纯 debug 死代码)
-        } else if (MKViewInFolderThumb((UIView *)self)) {
+        } else if (MKHideNames() && MKViewInFolderThumb((UIView *)self)) {
             // v2.0.66.1: 缩略图内运行 App 名称 label 经 setHidden: 复显时兜底钉藏(仅运行 App + 仅缩略图上下文)
             NSString *fb = MKFolderThumbBid((UIView *)self);
             if (fb.length && sHiddenBids && [sHiddenBids containsObject:fb]) {
@@ -2268,7 +2482,7 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
                 MKAssocLabelBid((UIView *)self, fb);
                 [((UIView *)self).layer removeAllAnimations];
             }
-        } else if (MKForeignContainerCtx((UIView *)self)) {
+        } else if (MKHideNames() && MKForeignContainerCtx((UIView *)self)) {
             // v2.0.66.37: fctx 强制藏名补刀——foreign 容器(dock/负一屏/widget)名经 setHidden:NO 复显
             // (同窗口同 superview, didMoveToWindow/didMoveToSuperview 不触发)时在此压住; 零分配判定, 主屏/文件夹不受影响。
             // β2: 移除原 MKLabelPhysicallyInDock 物理纵带补刀(形态 B 改由 MKDockStrayHide 每帧兜底), 收敛 swizzle 面。
@@ -2285,6 +2499,30 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
     }
 }
 static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
+    // v2.0.66.86: 同 MKSetHiddenHook —— 角标模式保留「纠正 iOS 原生非法名字」这一路,
+    // 只有我们主动藏名那一路才随 MKHideNames() 关。见 MKFixStrayNames 注释。
+    if (!MKHideNames()) {
+        if (a > 0.0f && MKFixStrayNames()) {   // 仅当有人试图显示才判定, alpha<=0 零成本跳过
+            @try {
+                UIView *lbl = (UIView *)self;
+                // v2.0.66.88: 原 MKViewInFolderThumb 分支已删除 —— 角标模式不擦文件夹缩略图名
+                // (擦 live 但快照里有 → 闪, 见 MKSetHiddenHook 同款说明)。本块在
+                // `if (!MKHideNames())` 内, 故【不可】改写成 `MKHideNames() && ...`(恒假死码)。
+                // v2.0.66.89 (S3): 收敛到 MKBadgeMayEraseName —— 在 foreign 判据之上再加
+                // 「快照通道豁免」, 覆盖【dock 里放了文件夹】时缩略图 label 仍被判 "DOCK" 而被擦的漏洞。
+                if (MKBadgeMayEraseName(lbl)) {  // dock / 负一屏 / widget 原生无名, 保留擦除
+                    a = 0.0f;
+                    [lbl.layer removeAllAnimations];
+                }
+            } @catch (NSException *e) {}
+        }
+        void(*o)(id,SEL,CGFloat) = (void(*)(id,SEL,CGFloat))MKResolveOrigIMP(sOrigSetAlphaByClass, sOrigSetAlphaByClassCF, self);
+        if (o && o != (void(*)(id,SEL,CGFloat))MKSetAlphaHook) {
+            @try { o(self, _cmd, a); }
+            @catch (NSException *e) { RDLog(@"MKSetAlphaHook orig EXCEPTION: %@", e.reason); }
+        }
+        return;
+    }
     @try {
         NSString *bid = MKLabelToBid((UIView *)self);
         // v2.0.3: 关文件夹窗口内有界定向诊断（setAlpha: 复显路径）
@@ -2298,7 +2536,7 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
             
             // v2.0.66-diag: 关窗内 iOS 经 setAlpha:>0 复显【任意图标(含非运行 app)】label 也记(REVEAL-ATTEMPT); useBid=nil 即非运行,可区分
             
-        } else if (MKViewInFolderThumb((UIView *)self)) {
+        } else if (MKHideNames() && MKViewInFolderThumb((UIView *)self)) {
             // v2.0.66.1: 缩略图内运行 App 名称 label 经 setAlpha: 复显时兜底钉藏(仅运行 App + 仅缩略图上下文)
             NSString *fb = MKFolderThumbBid((UIView *)self);
             if (fb.length && sHiddenBids && [sHiddenBids containsObject:fb]) {
@@ -2306,7 +2544,7 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
                 MKAssocLabelBid((UIView *)self, fb);
                 [((UIView *)self).layer removeAllAnimations];
             }
-        } else if (MKForeignContainerCtx((UIView *)self)) {
+        } else if (MKHideNames() && MKForeignContainerCtx((UIView *)self)) {
             // v2.0.66.37: fctx 强制藏名补刀——foreign 容器(dock/负一屏/widget)名经 setAlpha:>0 复显
             // (同窗口同 superview, didMoveToWindow/didMoveToSuperview 不触发)时在此压住; 零分配判定, 主屏/文件夹不受影响。
             // β2: 移除原 MKLabelPhysicallyInDock 物理纵带补刀(形态 B 改由 MKDockStrayHide 每帧兜底), 收敛 swizzle 面。
@@ -2342,13 +2580,31 @@ static void MKLabelDidMoveToWindowHook(id self, SEL _cmd) {
         @catch (NSException *e) { RDLog(@"MKLabelDidMoveToWindowHook orig EXCEPTION: %@", e.reason); }
     }
     @try {
+        // v2.0.66.86: .85 在此整段早退 → 角标模式下 foreign 容器(dock/负一屏/widget)的
+        // 「进 window 创建点纠正」也一起没了。现拆两路: 角标模式只走纠正, 不走主动藏名。
+        if (!MKHideNames()) {
+            if (!MKFixStrayNames()) return;
+            UIView *lbl0 = (UIView *)self;
+            if (!lbl0.window || lbl0.alpha <= 0.0f || lbl0.hidden) return;  // 不可见 → 无需纠正
+            // v2.0.66.88: 原为 `MKViewInFolderThumb(lbl0) || MKForeignContainerCtx(lbl0)`。
+            // 角标模式下【不再】擦文件夹缩略图名(擦 live 但快照里有 → 闪, 见 MKSetHiddenHook
+            // 同款说明); 这里是第 4 个同类擦点, 不一并短路的话前三处的修复会被它抵消。
+            // v2.0.66.89 (S3): 同样收敛到 MKBadgeMayEraseName(见 MKSetAlphaHook 同款说明)。
+            if (MKBadgeMayEraseName(lbl0)) {
+                lbl0.hidden = YES;
+                lbl0.alpha = 0.0f;
+                lbl0.layer.opacity = 0.0f;
+                [lbl0.layer removeAllAnimations];
+            }
+            return;
+        }
         UIView *lbl = (UIView *)self;
         // 只在「已进 window 且当前可见」时检查；移除(window=nil)不处理
         if (lbl.window && (lbl.alpha > 0.0f)) {   // v2.0.40: 放宽——覆盖半残态(hidden=YES 但 alpha>0), 旧 !lbl.hidden 把 rd_log(168) CLOSE-TAIL lbl(h=1 a=1.00) 漏过   // v2.0.12: 撤销 v2.0.9 关合窗口内文件夹内 label 让步原生(label 一进 window 即刻强藏, 根除 sub-16ms settle 单帧闪现); 详见 MKSetHiddenHook 同款注释。
             // v2.0.41: 关窗内 label 进 window 即带名可见(属运行 App)时记一笔(REVEAL-ATTEMPT)
             
             NSString *bid = MKLabelToBid(lbl); // v2.0.7: 含几何兜底，瞬态也能解出
-            if (bid && sHiddenBids && [sHiddenBids containsObject:bid]) {
+            if (bid && sHiddenBids && [sHiddenBids containsObject:bid] && MKHideNames()) {
                 lbl.hidden = YES;
                 lbl.alpha = 0.0f;
                 lbl.layer.opacity = 0.0f;
@@ -2360,7 +2616,7 @@ static void MKLabelDidMoveToWindowHook(id self, SEL _cmd) {
             // 在「进 window 创建点」即强制藏名, 先于系统任何显示路径, 灭亚秒级闪现; 此前仅 MKStrayNameProbe 的 if(ctx)
             // 于 setHidden/setAlpha/1s 轮询时藏, 漏掉「直接 addSubview 进已可见父视图」(不调 setHidden/setAlpha)的显形路径。
             NSString *fctx = MKForeignContainerCtx(lbl);
-            if (fctx) {
+            if (fctx && MKHideNames()) {
                 lbl.hidden = YES;
                 lbl.alpha = 0.0f;
                 lbl.layer.opacity = 0.0f;
@@ -2385,6 +2641,11 @@ static void MKLabelDidMoveToSuperviewHook(id self, SEL _cmd) {
         @catch (NSException *e) { RDLog(@"MKLabelDidMoveToSuperviewHook orig EXCEPTION: %@", e.reason); }
     }
     @try {
+        // v2.0.66.86: 本 hook 的两件事都属「纠正 iOS 原生行为」, 与我们是否抢名字位无关:
+        //   ① 跨图标复用清过期键(dock 串名的源头级防线) ② foreign 容器内藏非法名。
+        // .85 在此整段早退 = 角标模式下 dock 串名源头防线全失。现改为两模式共用同一段,
+        // 门控从 MKHideNames() 换成 MKFixStrayNames()。
+        if (!MKFixStrayNames()) return;
         UIView *lbl = (UIView *)self;
         UIView *storedOwner = objc_getAssociatedObject(lbl, &kMKLabelIconKey);
         if (!storedOwner) return; // 全新 label（kMKLabelIconKey 尚未/已被清）→ 非复用串台，不处理
@@ -2399,20 +2660,46 @@ static void MKLabelDidMoveToSuperviewHook(id self, SEL _cmd) {
         UIView *curIV = nil;
         UIView *a = lbl.superview;
         while (a) { if (ivCls && [a isKindOfClass:ivCls]) { curIV = a; break; } a = a.superview; }
-        if (curIV && curIV != storedOwner) {
+        if (curIV && curIV != storedOwner && MKFixStrayNames()) {
             // 真·跨图标复用：旧属主(如文件夹/其它 app)文字串到新槽位 → 清过期键 + 隐藏
+            // v2.0.66.86: 门控由 MKHideNames() 改 MKFixStrayNames() —— 这是纠正 iOS 的回收复用,
+            // 与我们抢不抢名字位无关; 角标模式也必须清键, 否则 MKGetCachedLabelEx 的 owner 校验
+            // 会一直失败 → dock 串名无人纠正(用户实机 .85 dock 问题依旧的直接原因之一)。
+            //
+            // ★ v2.0.66.89 【S1 —— 本轮头号修复】把「清过期键」与「藏名」两件事拆开 ★
+            //   原实现两件事写在同一个 if 里, 而它【既不判容器、也不判模式】:
+            //   任何 label 换到「与 storedOwner 不同的 SBIconView」下就直接藏掉。
+            //   本函数注释自陈的触发场景恰恰是文件夹开合 ——
+            //     · MKGetCachedLabelEx(L875) 无条件写 kMKLabelIconKey → 角标模式 storedOwner 同样有值;
+            //     · iOS 关文件夹缩回时把内层 App 的 label 临时重父到动画层(见 MKLabelToBid/2.0.3 注释);
+            //     · 文件夹缩略图的 mini SBIconView 高频回收复用;
+            //   → curIV != storedOwner 在动画窗口内几乎必然成立 → 我们在 crossfade 期间擦掉一个
+            //     【本该可见】的名字 → live(无名) vs snapshot(有名) = 用户看到的闪。
+            //   这是 .88 修完后残留闪名的主因, 且【与文件夹放在哪一行无关】。
+            //
+            //   两件事的语义完全不同, 必须分开门控:
+            //     · 清过期键 = 真·纠正 iOS 回收复用(dock 串名源头防线, MKGetCachedLabelEx 的
+            //       owner 校验依赖它) → 【无条件保留, 两模式都做】;
+            //     · 藏名     = 干预 → 替换模式照旧(MKHideNames() 恒真短路, 行为一字不变);
+            //                  角标模式仅在 MKBadgeMayEraseName 许可的位置(dock/负一屏/widget)才藏。
             objc_setAssociatedObject(lbl, &kMKLabelIconKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             MKAssocLabelBid(lbl, nil);
-            lbl.hidden = YES;
-            lbl.alpha = 0.0f;
-            lbl.layer.opacity = 0.0f;
-            
+            if (MKHideNames() || MKBadgeMayEraseName(lbl)) {
+                lbl.hidden = YES;
+                lbl.alpha = 0.0f;
+                lbl.layer.opacity = 0.0f;
+            }
         }
         // v2.0.66.25: foreign 容器(dock/负一屏/widget)内图标名 label 在 superview 变更点也强制藏名,
         // 覆盖「仅换父、window 不变」的显形路径(与 didMoveToWindow 双保险, 灭亚秒级闪现);
         // 守卫在 MKForeignContainerCtx 内(MKLabelInHomeGrid)确保主屏网格名不被误杀。
-        NSString *fctx = MKForeignContainerCtx(lbl);
-        if (fctx) {   // β2: 移除原 MKLabelPhysicallyInDock 物理纵带补刀(形态 B 改由 MKDockStrayHide 每帧兜底)
+        // v2.0.66.89 (S3): 判据由裸 MKForeignContainerCtx 换成 MKBadgeMayEraseName ——
+        //   dock 里【放了文件夹】时, 其缩略图 mini label 的祖先链是
+        //   SBIconView(mini) → SBFolderIconImageView → SBIconView(folder) → SBDockIconListView,
+        //   而 strstr("SBDockIconListView","SBIconListView") 不匹配("SB" 后面是 "Dock")
+        //   → MKLabelInHomeGrid 返 NO → MKForeignContainerCtx 返 "DOCK" → 缩略图照样被擦 → 闪。
+        //   替换模式经 MKHideNames() 短路走原判据, 行为一字不变。
+        if (MKHideNames() ? (MKForeignContainerCtx(lbl) != nil) : MKBadgeMayEraseName(lbl)) {
             lbl.hidden = YES;
             lbl.alpha = 0.0f;
             lbl.layer.opacity = 0.0f;
@@ -2443,6 +2730,45 @@ static BOOL MKViewInFolderThumb(UIView *v) {
         }
     } @catch (NSException *e) {}
     return NO;
+}
+
+// v2.0.66.87 (B2): 角标模式下 label 的【条件恢复】—— 替代原先三处无条件写回。
+//
+// 原实现（.80~.86）在角标模式下把 label 显式写成 hidden=NO / alpha=1 / opacity=1 /
+// opaque=YES + MKAssocLabelBid(nil)，每帧每图标都写。问题:
+//   · 系统本来就维持 label 可见 → 绝大多数帧是与系统抢控制权的无意义写;
+//   · 会抹掉系统自己设的中间态(编辑抖动、文件夹开合过渡期的 alpha 插值);
+//   · opaque=YES 尤其危险 —— 系统从不这么设(原生 name label 是透明背景), 影响合成路径。
+// 现改为: 只在 label 确实处于【被我们藏住】的状态时才恢复一次, 稳态零写入。
+//
+// 判据与 MKMigrateLocationMode 一致 —— 只认「我们藏的」:
+//   带 kMKLabelBidKey 关联键(MKAssocLabelBid 写入) 或 命中 sHiddenLabelToBid 指针表。
+// 系统自己藏的(stray 名字被 MKFixStrayNames 擦掉 / 编辑态)一律不碰, 否则会把刚擦掉的
+// stray 名字重新翻出来(.85 血案同源)。stray 容器内亦只清键不复显。
+static void MKRestoreLabelIfOurs(UIView *label) {
+    if (!label) return;
+    if (!label.hidden && label.alpha > 0.99f) return;   // 已可见 → 零写入(最常见路径)
+    NSString *ourBid = objc_getAssociatedObject(label, &kMKLabelBidKey);
+    BOOL ours = (ourBid.length != 0);
+    if (!ours && sHiddenLabelToBid && [sHiddenLabelToBid objectForKey:(id)label]) ours = YES;
+    if (!ours) return;                                   // 系统藏的 → 不碰
+    // v2.0.66.88: 跳过复显的条件收窄。
+    //   · foreign 容器(dock/负一屏/widget): 两模式都仍在擦(原生无名) → 复显会与自己互搏, 只清键。
+    //   · 文件夹缩略图: 角标模式已【交还系统】(不再擦) → 我们过去藏的必须复原, 否则是残留干预;
+    //     替换模式下该位置由既有藏名 machinery 持有 → 仍不复显(本函数虽只在角标模式被调,
+    //     判据写全以防将来复用)。
+    // v2.0.66.89: 角标模式收敛到 MKBadgeMayEraseName(把 dock 内文件夹缩略图移出「不复显」
+    //   名单 —— 既然不再擦它, 过去藏的就必须还回去)。替换模式判据一字不变。
+    if (MKHideNames()
+          ? (MKForeignContainerCtx(label) != nil || MKViewInFolderThumb(label))
+          : MKBadgeMayEraseName(label)) {
+        MKAssocLabelBid(label, nil);                     // 只清键不复显
+        return;
+    }
+    label.hidden = NO;
+    label.alpha = 1.0f;
+    label.layer.opacity = 1.0f;
+    MKAssocLabelBid(label, nil);
 }
 
 // v2.0.66.1: 缩略图内迷你图标(或其名称 label)解析所属 App bid。
@@ -2481,6 +2807,11 @@ static NSMutableDictionary *sOrigSetIconLabelAlphaByClass = nil;
 static BOOL MKClassIsSubclass(Class sub, Class c); // 前向声明（定义于文件后部 ~2106；新增 MKHookSBIconViewAlpha 在 2030 行即用，须先声明以免 -Werror 隐式函数声明）
 static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
     @try {
+        // v2.0.66.85: 角标模式下两分支(hasBid / dock 上下文)注定不成立 → 跳过整段判定,
+        // 省 MKGetCachedBid + MKViewInFolderThumb 祖先链 + MKLabelInDock。
+        // v2.0.66.86: 改为 if/else —— 角标模式不是"什么都不做", 而是走下方 else 的
+        // 「按容器 default-deny 纠正非法名字」路径(缩略图/dock 原生无名字)。
+        if (MKHideNames()) {
         NSString *bid = MKGetCachedBid((SBIconView *)self);
         BOOL hasBid = (bid.length && sHiddenBids && [sHiddenBids containsObject:bid]);
         // v2.0.66.1: 关窗缩略图稳态钉藏——迷你图标在 SBFolderIconImageView 内、且属运行中 App(bid∈sHiddenBids)，
@@ -2496,7 +2827,7 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
         // v2.0.66-diag: 关窗内 iOS 经 setIconLabelAlpha:>0 复显【文件夹内任意图标(含非运行 app)】label 都记(REVEAL-ATTEMPT)，
         // 区分「a 层运行 app(cached-bid 翻转,可修)」vs「非运行/b 层(本 hook 看不到→日志零命中,近似无解)」。via 串含 hasBid。
         
-        if (hasBid) {   // 仅藏名 bid 成员：钉死 alpha=0 压制 iOS 经此 setter 补回的回弹
+        if (hasBid) {   // 仅藏名 bid 成员：钉死 alpha=0 压制 iOS 经此 setter 补回的回弹（外层已门控 MKHideNames）
             a = 0.0f;
             UIView *lbl = MKGetCachedLabel((SBIconView *)self);
             if (lbl) {
@@ -2517,6 +2848,34 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
                 }
             }
         }
+        }   // v2.0.66.85: MKHideNames() 门控块结束
+        else if (MKFixStrayNames()) {
+            // v2.0.66.86: 角标模式的纠正路径 —— 本 setter 是 iOS 在关文件夹 settle / dock
+            // 复用回弹时把 label 区 alpha 补回 1.0 的专用入口, 也是「缩略图闪名 / dock 串名」
+            // 的显形通道之一。角标模式不藏名, 但这两个位置原生【本就没有名字】, 故仍需归零。
+            // default-deny 按容器判定, 与运行状态无关(角标模式 sHiddenBids 恒空, 旧判据用不了)。
+            if (a > 0.0f) {
+                // v2.0.66.88: 原 `MKViewInFolderThumb(self) || MKLabelInDock(self)` 中的
+                // 缩略图判据已删除 —— 角标模式不擦文件夹缩略图名(擦 live 而快照里有 → 闪,
+                // 用户实机证实)。本 else 分支即角标模式专属, 故不可写 `MKHideNames() && ...`。
+                // v2.0.66.89 (S3): MKLabelInDock → MKBadgeMayEraseName。三重收益:
+                //   ① 补上「快照通道豁免」—— dock 里放文件夹时, 缩略图内 mini SBIconView 的
+                //      祖先链既含 Dock 又含 SBFolderIconImageView, 旧判据恒命中 → 擦名 → 闪;
+                //   ② 消掉「MKLabelInDock 无主屏守卫 vs MKForeignContainerCtx 有守卫」两套口径并存;
+                //   ③ 顺带覆盖负一屏/widget 宿主内的图标(原生同样无名)。
+                // 注: 这里传的是 SBIconView 而非 label —— 谓词只爬 superview 链, 两者等效。
+                if (MKBadgeMayEraseName((UIView *)self)) {
+                    a = 0.0f;
+                    UIView *sl = MKGetCachedLabel((SBIconView *)self);
+                    if (sl) {
+                        [sl.layer removeAllAnimations];
+                        sl.hidden = YES;
+                        sl.alpha = 0.0f;
+                        sl.layer.opacity = 0.0f;
+                    }
+                }
+            }
+        }
     } @catch (NSException *e) {}
     void(*orig)(id,SEL,CGFloat) = (void(*)(id,SEL,CGFloat))MKResolveOrigIMP(sOrigSetIconLabelAlphaByClass, sOrigSetIconLabelAlphaByClassCF, self);
     if (orig && orig != (void(*)(id,SEL,CGFloat))MKSetIconLabelAlphaHook) {
@@ -2527,7 +2886,10 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
     // setIconLabelAlpha:0 经 iOS 原始实现把「整个 label 区(文字+β点)」一起藏掉 → β点随 藏名 消失、
     // 且要等 MKBetaReconcile/滚动 才复显(即"解锁消失/滑屏才出")。藏名生效后立即把 β点兄弟节点
     // 原位复显(不动坐标→绝不偏上)，灭上述两症。仅 keepBetaDot 开时生效(关则连同文字一起藏)。
-    if ([MKConfig sharedConfig].keepBetaDot) {
+    // v2.0.66.86: 角标模式整段跳过 —— 我们没藏名, β点不会被我们带走, 系统自己管即可。
+    // (.85 曾特意注释"不能在此 return, 尾部这段与藏名无关必须继续执行" —— 那个判断是错的:
+    //  这段的因果链源头正是"藏名把 β点一起藏了", 角标模式下它是纯粹的多余干预。)
+    if (MKHideNames() && [MKConfig sharedConfig].keepBetaDot) {
         NSMutableArray *mkSt = [NSMutableArray arrayWithArray:(NSArray *)[self subviews]];
         while (mkSt.count > 0) {
             UIView *mkV = [mkSt lastObject]; [mkSt removeLastObject];
@@ -2747,11 +3109,14 @@ static void MKUpdate(SBIconView *self) {
         if (MKIsDisabled()) {
             MKRemoveAllIndicators();
             UIView *label = MKGetCachedLabel(self);
+            // v2.0.66.90 (B2): opaque=YES → NO。系统从不给透明背景的图标名 label 设 opaque,
+            // 设 YES 会让 CA 跳过下层合成 → 渲染未定义内容一帧(闪)。此分支仅在插件被禁用时
+            // 走到, 不是闪名主路径, 但同属客观错误, 一并纠正。复显本身保留(禁用必须还名字)。
             if (label) {
                 label.hidden = NO;
                 label.alpha = 1.0f;
                 label.layer.opacity = 1.0f;
-                label.opaque = YES;
+                label.opaque = NO;
                 MKAssocLabelBid(label, nil);
             }
             return;
@@ -2761,11 +3126,12 @@ static void MKUpdate(SBIconView *self) {
         if (!cfg || !cfg.enabled) {
             MKRemoveAllIndicators();
             UIView *label = MKGetCachedLabel(self);
+            // v2.0.66.90 (B2): 同上, opaque=YES → NO。
             if (label) {
                 label.hidden = NO;
                 label.alpha = 1.0f;
                 label.layer.opacity = 1.0f;
-                label.opaque = YES;
+                label.opaque = NO;
                 MKAssocLabelBid(label, nil);
             }
             return;
@@ -2820,7 +3186,33 @@ static void MKUpdate(SBIconView *self) {
                     }
                     // 顺带加固 label 隐藏不变量（呼应 v1.6.82，防与圆点重叠）
                     UIView *lbl = MKGetCachedLabel((SBIconView *)self);
-                    if (lbl) { lbl.hidden = YES; lbl.alpha = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO; MKAssocLabelBid(lbl, fBid); }
+                    if (lbl) {
+                        // ★ v2.0.66.90 【B2 —— 本轮头号修复：角标模式不写回 label 可见性】★
+                        //  用户实机 .89: 角标模式下【完全合拢文件夹后名字闪一下, 不是每次】。
+                        //  .88/.89 一直在查「谁还在藏名」, 方向错了 —— 藏名路径此时已全部门控完毕
+                        //  (主屏 label 在 HomeGrid 内, MKForeignContainerCtx 白名单必返 nil)。
+                        //  真凶在【反方向】: 角标模式下我们从不藏名, 却仍在多处无条件写
+                        //  hidden=NO / alpha=1 / layer.opacity=1 / opaque=YES 去「恢复」它。
+                        //
+                        //  两层危害:
+                        //   ① opaque=YES 对 SpringBoard 的图标名 UILabel 是【客观错误】——
+                        //      它背景透明, 系统从不这么设。opaque=YES 等于告诉 CoreAnimation
+                        //      「本层完全不透明, 不必合成下层」→ 该区域按不透明处理, 而实际绘制
+                        //      内容大量透明像素 → 渲染出未定义内容(黑/白块或上帧残留)一帧,
+                        //      随后 UILabel 内部按 backgroundColor 自行纠回 → 肉眼即「闪一下」。
+                        //   ② 在 iOS 跑 crossfade 的窗口内直接改 model 值(alpha/opacity),
+                        //      与 presentation layer 冲突 → 同样一帧跳变。
+                        //  关文件夹时 SBFolderView.didMoveToWindow(nil) 会【同步 + 异步各一次】
+                        //  MKRefreshSubviews(主屏) → 遍历全部图标走到这里 → 落在 crossfade 窗口
+                        //  内就闪、落在窗口外就不闪 → 精确对应「合拢后闪一下、不是每次」。
+                        //
+                        //  修法: 角标模式下这些写回是【纯粹的抢控制权无意义写】(我们从未藏过它,
+                        //  没有任何东西需要恢复) → 整段删除, 只保留 MKAssocLabelBid 清键
+                        //  (纯关联对象, 不触发任何渲染)。替换模式行为保持 —— 仅把 opaque=YES
+                        //  一并纠正为 NO(修客观错误, 方向是「少干预」, 不会导致名字不显示)。
+                        if (MKHideNames()) { lbl.hidden = YES; lbl.alpha = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO; MKAssocLabelBid(lbl, fBid); }
+                        else MKAssocLabelBid(lbl, nil);
+                    }
                 }
                 
                 return;
@@ -2830,16 +3222,31 @@ static void MKUpdate(SBIconView *self) {
             if (contained.count == 0) {
                 
                 UIView *lbl = MKGetCachedLabel(self);
-                if (lbl) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; MKAssocLabelBid(lbl, nil); }
+                // v2.0.66.90 (B2): 角标模式不写回可见性(我们从未藏它, 无可恢复);
+                // 替换模式保留写回, opaque 由 YES 纠正为 NO。详见上方 B2 完整说明。
+                if (lbl) {
+                    if (MKHideNames()) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = NO; }
+                    MKAssocLabelBid(lbl, nil);
+                }
                 UIView *fi = MKFindIndicator(fBid);
                 if (fi) MKRemoveIndicatorForBid(fBid);
                 return;
             }
             MKConfig *fCfg = [MKConfig sharedConfig];
-            if (!fCfg || !fCfg.folderIndicators) {
+            // v2.0.66.86: 角标模式下文件夹指示器【强制生效】, 不受「文件夹图标显示指示器」开关控制。
+            // 理由: 该开关当初存在的意义是「替换名称模式下文件夹图标的名字会被指示器顶掉,
+            // 用户可能不愿为文件夹付这个代价」—— 是一个「名字 vs 指示器」的取舍开关。
+            // 角标模式根本不碰名字, 这个取舍不存在, 开关退化为纯粹的功能缺失, 故忽略。
+            // 设置页会在角标模式下把该开关置灰, 与此处行为一致(见 MKRootListController)。
+            if (!fCfg || (MKHideNames() && !fCfg.folderIndicators)) {
                 
                 UIView *lbl = MKGetCachedLabel(self);
-                if (lbl) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = YES; MKAssocLabelBid(lbl, nil); }
+                // v2.0.66.90 (B2): 角标模式不写回可见性(我们从未藏它, 无可恢复);
+                // 替换模式保留写回, opaque 由 YES 纠正为 NO。详见上方 B2 完整说明。
+                if (lbl) {
+                    if (MKHideNames()) { lbl.hidden = NO; lbl.alpha = 1.0f; lbl.layer.opacity = 1.0f; lbl.opaque = NO; }
+                    MKAssocLabelBid(lbl, nil);
+                }
                 UIView *fi = MKFindIndicator(fBid);
                 if (fi) MKRemoveIndicatorForBid(fBid);
                 return;
@@ -2849,7 +3256,12 @@ static void MKUpdate(SBIconView *self) {
             NSString *rep = MKFolderChosenBid(contained);
             UIView *label = MKGetCachedLabel(self);
             
-            if (label) { label.hidden = YES; label.alpha = 0.0f; label.layer.opacity = 0.0f; label.opaque = NO; MKAssocLabelBid(label, fBid); }
+            if (label) {
+                // v2.0.66.90 (B2): 角标模式不写回可见性 —— 这是【文件夹有运行 App】的主路径,
+                // 也就是关合文件夹后必然走到的那一支, 闪名的直接来源。详见上方 B2 完整说明。
+                if (MKHideNames()) { label.hidden = YES; label.alpha = 0.0f; label.layer.opacity = 0.0f; label.opaque = NO; MKAssocLabelBid(label, fBid); }
+                else MKAssocLabelBid(label, nil);
+            }
             UIView *container = MKContainerForIconView((UIView *)self);
             UIView *overlay = MKOverlayForContainer(container);
             if (!overlay) {
@@ -2862,6 +3274,8 @@ static void MKUpdate(SBIconView *self) {
                 indicator = [[MKIndicatorDotView alloc] initWithFrame:indicatorFrame];
                 indicator.tag = kDotTag;
                 objc_setAssociatedObject(indicator, &kMKIndicatorBidKey, fBid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                [(MKIndicatorDotView *)indicator setIconCornerRadius:MKIconCornerRadius((UIView *)self)];
+                [(MKIndicatorDotView *)indicator setBadgeCorner:fCfg.badgeCorner];
                 [(MKIndicatorDotView *)indicator applyConfig];
                 if (!fixedColor && rep.length) {
                     UIColor *c = MKCachedIconColorForBundleID(rep);
@@ -2870,7 +3284,7 @@ static void MKUpdate(SBIconView *self) {
                 [overlay addSubview:indicator];
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:fBid];
-                if (sHiddenBids) [sHiddenBids addObject:fBid]; // v1.6.85: 文件夹合成 key 也要藏名
+                if (sHiddenBids && MKHideNames()) [sHiddenBids addObject:fBid]; // v1.6.85: 文件夹合成 key 也要藏名
                 
                 MKFadeInFolderIndicatorIfClosing(indicator); // v2.0.43: 关窗期淡入, 消除缩略图点瞬现
             } else {
@@ -3041,12 +3455,22 @@ static void MKUpdate(SBIconView *self) {
             // ── App 不在运行 / 在前台 → 移除指示器，恢复名字 ──
             if (indicator) MKRemoveIndicatorForBid(bundleID);
             MKRestoreBetaOrphan((UIView *)self); // v2.0.30: 移除我们脱离的孤儿小黄点，系统自建原 label 点
+            // ★ v2.0.66.90 (B2): 这是【每个非运行/前台图标每次 MKUpdate 必经】的复显路径 ——
+            //   关文件夹触发 MKRefreshSubviews(主屏) 时全屏图标都会走到这里, 是闪名的主路径之一。
+            //   角标模式我们从不藏名 → 无条件写回是抢控制权的无意义写, 且 opaque=YES 对透明背景的
+            //   name label 是客观错误(CA 跳过下层合成 → 渲染未定义内容一帧)。改为与 L3486/L3504
+            //   同构的条件恢复: 稳态零写入, 只在确实被我们藏住时(切模式残留)恢复一次。
+            //   替换模式路径不变(仍需无条件复显), 仅把 opaque=YES 纠正为 NO。
             if (label) {
-                label.hidden = NO;
-                label.alpha = 1.0f;
-                label.layer.opacity = 1.0f;
-                label.opaque = YES;
-                MKAssocLabelBid(label, nil);
+                if (MKHideNames()) {
+                    label.hidden = NO;
+                    label.alpha = 1.0f;
+                    label.layer.opacity = 1.0f;
+                    label.opaque = NO;
+                    MKAssocLabelBid(label, nil);
+                } else {
+                    MKRestoreLabelIfOurs(label);
+                }
             }
             MKRemovePending(bundleID);  // v1.5.6+: 清除 pending 状态
             MKRemoveFadingLabel(bundleID); // v1.5.8: 清除渐隐状态
@@ -3064,12 +3488,16 @@ static void MKUpdate(SBIconView *self) {
         // 标签渐隐已完成（alpha=0），但仍需保持隐藏状态防止系统恢复
         if (isPending) {
             
-            if (label) {
+            if (label && MKHideNames()) {
                 label.hidden = YES;
                 label.alpha = 0.0f;
                 label.layer.opacity = 0.0f;
                 label.opaque = NO;
                 MKAssocLabelBid(label, bundleID);
+            } else if (label) {
+                // v2.0.66.87 (B2): 角标模式 —— 名字本就该可见, 交还系统。
+                // 只在确实被我们藏住时恢复一次(稳态零写入), 不再无条件写回。
+                MKRestoreLabelIfOurs(label);
             }
             return;  // 不创建指示器，等300ms后 MKRefreshIconForBundleID 回调
         }
@@ -3079,11 +3507,16 @@ static void MKUpdate(SBIconView *self) {
         // ── App 正在运行 → 隐藏名字，显示指示器 ──
             MKDetachBetaOnce((UIView *)self); // v2.0.30: beta App 先把小黄点脱离 label，避免被藏名牵连
             if (label) {
-                label.hidden = YES;
-                label.alpha = 0.0f;
-                label.layer.opacity = 0.0f;
-                label.opaque = NO;
-                MKAssocLabelBid(label, bundleID);
+                if (MKHideNames()) {
+                    label.hidden = YES;
+                    label.alpha = 0.0f;
+                    label.layer.opacity = 0.0f;
+                    label.opaque = NO;
+                    MKAssocLabelBid(label, bundleID);
+                } else {
+                    // v2.0.66.87 (B2): 角标模式 —— 交还系统, 仅条件恢复(见 MKRestoreLabelIfOurs)
+                    MKRestoreLabelIfOurs(label);
+                }
             } else {
             // v1.5.5 诊断：App 在运行但找不到标签
             
@@ -3115,6 +3548,8 @@ static void MKUpdate(SBIconView *self) {
             indicator = [[MKIndicatorDotView alloc] initWithFrame:indicatorFrame];
             indicator.tag = kDotTag;
             objc_setAssociatedObject(indicator, &kMKIndicatorBidKey, bundleID, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // v1.6.63: 记录归属，供防乱跑校验
+            [(MKIndicatorDotView *)indicator setIconCornerRadius:MKIconCornerRadius((UIView *)self)];
+            [(MKIndicatorDotView *)indicator setBadgeCorner:cfg.badgeCorner];
             [(MKIndicatorDotView *)indicator applyConfig];
 
             // v1.6.11: AutoIcon 模式 — 从图标取主色调作为指示器颜色
@@ -3139,7 +3574,7 @@ static void MKUpdate(SBIconView *self) {
                 [overlay addSubview:indicator];
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:bundleID];
-                if (sHiddenBids) [sHiddenBids addObject:bundleID]; // v1.6.85: 标记此 bid 名字必须隐藏
+                if (sHiddenBids && MKHideNames()) [sHiddenBids addObject:bundleID]; // v1.6.85: 标记此 bid 名字必须隐藏
                 CGFloat finalAlpha = cfg.opacity;
                 
                 [UIView animateWithDuration:0.2 animations:^{
@@ -3149,7 +3584,7 @@ static void MKUpdate(SBIconView *self) {
                 [overlay addSubview:indicator];
                 if (!sBidToIndicator) sBidToIndicator = [NSMapTable strongToStrongObjectsMapTable];
                 [sBidToIndicator setObject:indicator forKey:bundleID];
-                if (sHiddenBids) [sHiddenBids addObject:bundleID]; // v1.6.85: 标记此 bid 名字必须隐藏
+                if (sHiddenBids && MKHideNames()) [sHiddenBids addObject:bundleID]; // v1.6.85: 标记此 bid 名字必须隐藏
             }
             [overlay bringSubviewToFront:indicator];  // v1.6.71: 确保指示器在文件夹 overlay 顶层（z-order）
             
@@ -3307,7 +3742,12 @@ static void MKRefreshAllIcons() {
                 [stack removeLastObject];
                 if ([current isKindOfClass:MKSBIconViewClass()]) {
                     MKUpdate((SBIconView *)current);
-                    if ([MKConfig sharedConfig].keepBetaDot) {
+                    // v2.0.66.86: 角标模式下小黄点交还系统 —— 不做 reconcile / hideAll,
+                    // 只做一次 MKRestoreBetaOrphan 清掉「从替换模式切过来时残留的脱离孤儿点」,
+                    // 否则它会与系统在 label 内重建的原生点重影。见 MKBetaHideAll 说明。
+                    if (!MKHideNames()) {
+                        MKRestoreBetaOrphan((UIView *)current);
+                    } else if ([MKConfig sharedConfig].keepBetaDot) {
                         MKBetaReconcile((SBIconView *)current); // v2.0.34: ON → 复显被藏的 beta 点
                     } else {
                         MKBetaHideAll((UIView *)current);   // v2.0.66.3: OFF → 隐藏全部 beta 点(运行+未运行)
@@ -3315,7 +3755,11 @@ static void MKRefreshAllIcons() {
                     // v2.0.66.46: dock 串名事件兜底 —— 内联进本趟 BFS, 零额外遍历
                     // (取代 v2.0.66.45 在函数尾部再独立 BFS 一整棵树的 MKDockBandSweep)。
                     // 必须放在 MKUpdate 之后: MKUpdate 会为非运行 App 复显名称, 先藏会被它覆盖。
-                    MKDockStrayHide((SBIconView *)current, NULL);
+                    // v2.0.66.86: 门控由 MKHideNames() 改 MKFixStrayNames() —— MKDockStrayHide 是
+                    // dock 串名的【唯一防线】, 其动作虽是「藏 label」但语义是「纠正 iOS 把旧名字
+                    // 渲染到原生无名字的 dock」, 与我们抢不抢名字位无关。.85 随藏名一并关掉 →
+                    // 角标模式 dock 串名无人纠正(用户实机复现的直接根因)。
+                    if (MKFixStrayNames()) MKDockStrayHide((SBIconView *)current, NULL);
                 }
                 for (UIView *child in current.subviews) {
                     [stack addObject:child];
@@ -3380,6 +3824,7 @@ static void MKRefreshIconForBundleID(NSString *bid) {
 static void MKFadeOutLabelForBundleID(NSString *bid) {
     MKSafe(^{
         if (!sInitDone || !bid.length) return;
+        if (!MKHideNames()) return;  // 角标模式：名字永不渐隐，保持可见
         MKAddFadingLabel(bid);  // v1.5.8: 标记渐隐状态
 
         BOOL fadeStarted = NO;  // v1.6.0: 追踪是否实际启动了渐隐动画
@@ -3436,6 +3881,10 @@ static void MKRestoreLabelForBundleID(NSString *bid) {
         if (!sInitDone || !bid.length) return;
         MKRemoveFadingLabel(bid);  // v1.5.8: 清除渐隐标记
         MKRemovePending(bid);      // v1.5.8: 清除 pending 标记
+        // v2.0.66.85: 角标模式名字永不藏（MKFadeOutLabelForBundleID 已早退）→ 下面这趟
+        // 全窗口 BFS 找到的 label 本来就是可见的, 恢复动画等于给每个匹配图标白跑一次
+        // 0.15s 动画。标记清理保留（幂等、廉价）, BFS 整段跳过。
+        if (!MKHideNames()) return;
         NSArray *windows = [UIApplication sharedApplication].windows;
         for (UIWindow *window in windows) {
             NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
@@ -3454,7 +3903,7 @@ static void MKRestoreLabelForBundleID(NSString *bid) {
                                 label.hidden = NO;
                                 label.alpha = 1.0f;
                                 label.layer.opacity = 1.0f;
-                                label.opaque = YES;
+                                label.opaque = NO;   // v2.0.66.90 (B2): YES → NO(客观错误纠正)
                                 MKAssocLabelBid(label, nil);
                             }];
                         }
@@ -3523,6 +3972,23 @@ static void MKOnStateChange(NSString *bid, BOOL running, BOOL foreground) {
         // v1.6.31: 只在 App 确实在我们的 running set 中（用户打开/用过）才做标签/指示器逻辑。
         // 纯后台被 iOS 拉起、从未前台过的 App 不在集合里 → 直接跳过，名字保持原样、不亮指示器。
         if (!MKIsAppRunning(bid)) return;
+        // ── v2.0.66.87 (B1): 角标模式立即建指示器, 整套渐隐排期交还系统 ──
+        // 下面 250ms 渐隐 + 300ms 延迟建 + 800ms 备用刷新这一整套排期, 唯一设计动机写在
+        // 原注释里: 「等返回动画结束 + 标签渐隐接近完成」再建指示器, 免名字与圆点重叠一瞬。
+        // 角标模式【不藏名、不抢名字位】→ 动机整体消失, 而代价是实打实的:
+        //   · MKAddPending/MKAddAnimateIndicator 进两个状态集, 而 layoutSubviews 里
+        //     `MKIsPending || MKIsFadingLabel` 那处早退是【无条件】的(.85 改)
+        //     → 300ms 内该图标 layoutSubviews 全部被跳过, 指示器晚 300ms 才出现;
+        //   · 两个 dispatch_after 各带一次全量 MKRefreshIconForBundleID, 主线程忙时堆积;
+        //   · 300ms 内 App 又回前台 → 走 MKRestoreLabelForBundleID(自 .85 已早退成空操作) 纯空转。
+        // 渐显动画标记保留 —— 那是我们【自己的 overlay 指示器】的 alpha 动画, 与藏名无关。
+        if (!MKHideNames()) {
+            MKAddAnimateIndicator(bid);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                MKRefreshIconForBundleID(bid);
+            });
+            return;
+        }
         // ── App 返回后台 → v1.5.8: 标签渐隐 + 指示器渐显 ──
         // 标签不再瞬间消失：250ms 渐隐 alpha 1→0
         // 300ms 后创建指示器并 200ms 渐显 alpha 0→cfg.opacity
@@ -3610,10 +4076,112 @@ static void MKDelayedInit() {
     MKRefreshFolderIcons();
 }
 
+// v2.0.66.87: locationMode 切换一次性迁移 —— 恢复所有被我们藏过的 label + 清权威集合。
+//
+// 【为什么必须有这段】原先「替换 → 角标」切换时恢复名字的唯一执行路径是
+// MKUpdate running 分支的 else（把 label 无条件写回 hidden=NO/alpha=1）。
+// .87 要把那三处 else 改成「条件恢复」(B2, 只在确实被藏时才写) 就必须先有一条
+// 显式的迁移路径, 否则一旦某图标此刻不在窗口层级里(离屏/文件夹内/dock 回收槽),
+// 它的 label 永远等不到那次写回 → 名字保持 hidden=YES 永不复原。
+// MKRestoreLabelForBundleID 帮不上: 它自 .85 起 `if (!MKHideNames()) return;` 已早退。
+//
+// 判据: 只认「我们藏的」—— label 带 kMKLabelBidKey 关联键(MKAssocLabelBid 写入)
+// 或 bid ∈ sHiddenBids。系统自己藏的 label(dock/负一屏 stray、编辑抖动中间态)
+// 一律不碰 —— 否则会把 MKFixStrayNames() 刚擦掉的 stray 名字重新翻出来(.85 血案同源)。
+static void MKMigrateLocationMode(void) {
+    MKSafe(^{
+        if (!sInitDone) return;
+        NSArray *windows = [UIApplication sharedApplication].windows;
+        for (UIWindow *window in windows) {
+            NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
+            while (stack.count > 0) {
+                UIView *current = [stack lastObject];
+                [stack removeLastObject];
+                // 只认 label-like 视图（与 layoutSubviews 兜底同款零分配判定）
+                BOOL isL = [current isKindOfClass:[UILabel class]] ||
+                           (strstr(class_getName([current class]), "Label") != NULL);
+                if (isL && (current.hidden || current.alpha <= 0.01f)) {
+                    NSString *ourBid = objc_getAssociatedObject(current, &kMKLabelBidKey);
+                    BOOL ours = (ourBid.length != 0);
+                    if (!ours && sHiddenLabelToBid && [sHiddenLabelToBid objectForKey:(id)current]) ours = YES;
+                    if (ours) {
+                        // stray 容器内的 label 不复显 —— 这些位置原生无名字, 复显 = 制造 bug。
+                        // MKFixStrayNames() 恒真, 下一帧也会再擦一遍, 但这里先别添乱。
+                        // v2.0.66.88: 判据与 MKRestoreLabelIfOurs 对齐 —— 文件夹缩略图在
+                        // 角标模式下已交还系统(不再擦), 故此时【必须】复原我们过去藏的,
+                        // 否则切到角标模式后缩略图里那些名字永久 hidden=YES(残留干预)。
+                        // 本函数在 reload 之后调用 → MKHideNames() 已是新模式的值。
+                        // v2.0.66.89: 角标模式改用 MKBadgeMayEraseName —— 它把「dock 里的
+                        // 文件夹缩略图」从不复显名单里排除(我们已不再擦它 → 过去藏的必须还)。
+                        // 替换模式分支一字不变(foreign || thumb)。
+                        if (MKHideNames()
+                              ? (MKForeignContainerCtx(current) != nil || MKViewInFolderThumb(current))
+                              : MKBadgeMayEraseName(current)) {
+                            objc_setAssociatedObject(current, &kMKLabelBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                        } else {
+                            current.hidden = NO;
+                            current.alpha = 1.0f;
+                            current.layer.opacity = 1.0f;
+                            [current.layer removeAllAnimations];
+                            objc_setAssociatedObject(current, &kMKLabelBidKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                        }
+                    }
+                }
+                for (UIView *child in current.subviews) {
+                    [stack addObject:child];
+                }
+            }
+        }
+        // 权威集合清空: 两个方向都该清。
+        //  · → 角标: sHiddenBids 恒空是该模式的不变量, 残留会让源级 setHidden/setAlpha hook 继续强藏。
+        //  · → 替换: 残留的旧表项对应的 label 可能已被回收复用, 留着只会误藏。
+        //    正确的表项会在下面 MKRefreshAllIcons → MKUpdate 藏名时重新写入。
+        if (sHiddenBids) [sHiddenBids removeAllObjects];
+        if (sHiddenLabelToBid) [sHiddenLabelToBid removeAllObjects];
+        // 排期状态集合也清: 角标模式不再排 300ms/800ms(见 MKStateDidChange), 残留 bid 会让
+        // layoutSubviews 的 `MKIsPending || MKIsFadingLabel` 无条件早退一直命中 → 指示器建不出来。
+        if (sPendingBIDs)    [sPendingBIDs removeAllObjects];
+        if (sFadingLabelBIDs) [sFadingLabelBIDs removeAllObjects];
+    });
+}
+
 static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observer,
                                     CFStringRef name, const void *object,
                                     CFDictionaryRef userInfo) {
+    // v2.0.66.87: locationMode 变化检测必须在 reload 之前取旧值
+    static MKLocationMode sLastLocationMode = MKLocationReplace;
+    static BOOL sLastModeValid = NO;
+    MKLocationMode oldMode = sLastLocationMode;
+    BOOL hadOld = sLastModeValid;
     [[MKConfig sharedConfig] reload];
+    MKLocationMode newMode = [MKConfig sharedConfig].locationMode;
+    sLastLocationMode = newMode;
+    sLastModeValid = YES;
+    if (hadOld && oldMode != newMode) MKMigrateLocationMode();
+    // v2.0.66.81: 角标参数(badgeCorner/thickness/inset)变更时刷新已存在的指示器。
+    // thickness/inset 在 drawRect 直接读 cfg → setNeedsDisplay 即重画；badgeCorner 是属性需重设。
+    // v2.0.66.91: badgeArcLength(弧长比例)同属「drawRect 直接读 cfg」一类 → 无需新增属性,
+    //   下面的 setNeedsDisplay 已覆盖, 拖滑块即时生效。
+    // v2.0.66.87: iconCornerRadius 也必须重设 —— 原注释「图标本身没变故不重设」漏了一种情形:
+    //   setIconCornerRadius 只在【指示器创建时】调一次(MKUpdate L3365)。从替换模式切到角标模式
+    //   时指示器往往已存在(MKFindIndicator 非 nil → 不走创建分支) → 用的是当初创建那一刻取到
+    //   的值; 若那时图标图层尚未布好 continuousCornerRadius, 取到的是兜底 m*0.2237。
+    //   .82 时代弧线本就不准看不出, .87 改同心圆角后 rc 直接决定外轮廓是否等距 → 必须校正。
+    if (sBidToIndicator) {
+        MKConfig *cfg = [MKConfig sharedConfig];
+        NSArray *bids = [[sBidToIndicator keyEnumerator] allObjects];
+        for (NSString *bid in bids) {
+            UIView *ind = [sBidToIndicator objectForKey:bid];
+            if (![ind isKindOfClass:[MKIndicatorDotView class]]) continue;
+            [(MKIndicatorDotView *)ind setBadgeCorner:cfg.badgeCorner];
+            SBIconView *iv = sBidToIconView ? [sBidToIconView objectForKey:bid] : nil;
+            if (iv) {
+                CGFloat rc = MKIconCornerRadius((UIView *)iv);
+                if (rc > 0) [(MKIndicatorDotView *)ind setIconCornerRadius:rc];
+            }
+            [ind setNeedsDisplay];
+        }
+    }
     MKRefreshAllIcons();
     MKRefreshFolderIcons();
 }
@@ -3645,16 +4213,22 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
             // 改判据：只要该 App 仍在后台运行（名字本就该被圆点替代），无论指示器对象
             // 此刻在否都强制保留隐藏。与 v1.6.96 "sHiddenBids 权威"不变量一致；
             // 关闭后主屏图标 MKUpdate 会接管重显指示器，名字继续由藏名规则压制。
-            if (bid2 && (MKFindIndicator(bid2) || (MKIsAppRunning(bid2) && !MKIsForeground(bid2)))) {
+            if (bid2 && (MKFindIndicator(bid2) || (MKIsAppRunning(bid2) && !MKIsForeground(bid2))) && MKHideNames()) {
                 label.hidden = YES;
                 label.alpha = 0.0f;
                 label.layer.opacity = 0.0f;
                 label.opaque = NO;
+            } else if (!MKHideNames()) {
+                // v2.0.66.87 (B2): 角标模式 —— 交还系统, 仅条件恢复(见 MKRestoreLabelIfOurs)。
+                // 注意本 else 是两模式共用: 替换模式下走下面的无条件恢复分支【一字不改】——
+                // 那里覆盖的是「App 已退出/前台 → 名字必须复原」, 而替换模式下我们确实
+                // 是名字的主动持有者, 无条件写回是正确且必要的(判据失效时也能兜住)。
+                MKRestoreLabelIfOurs(label);
             } else {
                 label.hidden = NO;
                 label.alpha = 1.0f;
                 label.layer.opacity = 1.0f;
-                label.opaque = YES;
+                label.opaque = NO;   // v2.0.66.90 (B2): YES → NO(客观错误纠正; 本分支仅替换模式可达)
                 MKAssocLabelBid(label, nil);
             }
         }
@@ -3682,13 +4256,45 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     // 形态 B(label 仅物理漂到 dock 纵带、层级仍主屏)整段跳过 → 每帧藏名对当前复发的串名完全失效。
     {
         BOOL strayHidden = NO;
-        if (MKDockStrayHide((SBIconView *)self, &strayHidden)) {
+        // v2.0.66.86: 门控由 MKHideNames() 改 MKFixStrayNames()(见 L3521 同款说明)。
+        // 角标模式下这条每帧防线必须在位, 否则 dock 串名照旧。
+        if (MKFixStrayNames() && MKDockStrayHide((SBIconView *)self, &strayHidden)) {
             return;  // 真 dock 图标: 名字已钉藏, 不走下方主屏/文件夹逻辑; 指示器几何由 MKUpdate 全局管理
         }
         if (strayHidden) {
             // 主屏图标但 label 物理漂到 dock 纵带(异常瞬态): 已钉藏, 本帧不再往下走 ——
             // 否则下方「非运行 App 恢复名称」分支会立刻把它复显, 白藏。指示器几何仍由 MKUpdate/MKRepositionIndicator 全局兜。
             return;
+        }
+    }
+
+    // v2.0.66.86: 【角标模式】每帧纠正「iOS 把名字渲染到原生无名字位置」——
+    // v2.0.66.88 修订: 缩略图那一路【已删除】。用户实机证实角标模式文件夹名仍在闪, 真因
+    // 就是「我们擦 live label, 而 iOS 开合文件夹的 compositor crossfade 快照里名字还在」
+    // → live/snapshot 不一致。角标模式契约本是「名字一律不动」, 缩略图名也是名字。
+    // 现只保留 foreign 容器一路:
+    //   · foreign 容器(负一屏 SBToday*/SBDashboard*/SBWidget*/SBFFocusIsolationView, 及 dock 的
+    //     层级形态): 原生无名字, 且未观察到闪(无 crossfade 快照通道)。dock 另由上方
+    //     MKDockStrayHide 每帧兜, 此处补齐其余。
+    // 判定按容器 default-deny(与运行状态无关), 误伤空间为零: 这些位置本来就没名字。
+    // MKLabelInHomeGrid 守卫在 MKForeignContainerCtx 内, 主屏网格名绝不被误杀。
+    // 仅角标模式走(替换模式已有既有链路), 且先做廉价的 hidden/alpha 预筛再爬祖先链。
+    if (!MKHideNames() && MKFixStrayNames()) {
+        UIView *tl = MKGetCachedLabel((SBIconView *)self);
+        if (tl && tl.superview && !tl.hidden && tl.alpha > 0.01f) {
+            // ⚠️ 这里曾是第 5 个(也是最强的, 每帧执行)缩略图擦名点 —— 若将来有人把
+            //    MKViewInFolderThumb 加回来, 前四处(setHidden/setAlpha/setIconLabelAlpha/
+            //    didMoveToWindow)的 .88 修复会被它一并抵消, 文件夹闪名立刻复现。
+            // v2.0.66.89 (S3): 改走 MKBadgeMayEraseName —— 该谓词内部把 MKViewInFolderThumb
+            //    用作【豁免守卫(return NO)】而非触发器, 与上面这条警告方向相反, 不冲突。
+            if (MKBadgeMayEraseName(tl)) {
+                tl.hidden = YES;
+                tl.alpha = 0.0f;
+                tl.layer.opacity = 0.0f;
+                tl.opaque = NO;
+                [tl.layer removeAllAnimations];
+                return;   // 非法位置的图标不参与主屏/文件夹指示器决策
+            }
         }
     }
 
@@ -3717,13 +4323,17 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     // 此刻是否存在无关 → 彻底钉死文件夹名不闪不叠。几何仍交 MKUpdate / MKRepositionIndicator。
     BOOL isFolder = MKIsFolderIcon((SBIconView *)self);
     if (isFolder) {
+        // v2.0.66.85: 角标模式下本分支唯一工作(藏文件夹名)注定不执行, 但原实现每帧仍要
+        // [self icon] + stringWithFormat 造一个 __folder__%p 字符串(每帧一次堆分配) +
+        // MKFindIndicator 查表。前置门控直接 return, 文件夹图标每帧零开销。
+        if (!MKHideNames()) return;
         id fIcon = [self icon];
         NSString *fBid = fIcon ? [NSString stringWithFormat:@"__folder__%p", fIcon] : nil;
         if (fBid.length) {
             // v2.0.4: sHiddenBids 权威（见上方注释）。只要 fBid 仍在集合即强制藏名，
             // 不再依赖指示器对象当场在场——对齐 App 分支 2782 的不变量。
             BOOL mustHide = (MKFindIndicator(fBid) != nil) || (sHiddenBids && [sHiddenBids containsObject:fBid]);
-            if (mustHide) {
+            if (mustHide && MKHideNames()) {
                 UIView *label = MKGetCachedLabel((SBIconView *)self);
                 if (label && label.superview) {
                     label.hidden = YES;
@@ -3765,7 +4375,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     // 与层级无关；只要本 bid 仍在 sHiddenBids（App 后台运行、名字须隐藏）即强制藏名。
     // 同时把 bid 种回 label 直接关联键，使源头级 setHidden: hook 稳定命中。
     BOOL mustHide = (indicator != nil) || (bid.length && sHiddenBids && [sHiddenBids containsObject:bid]);
-    if (mustHide) {   // v2.0.12: 撤销 v2.0.9 关合窗口内文件夹内 icon 让步原生(无条件强制藏名), 根治 sub-16ms settle 单帧闪现(第④点残留)。详见 MKSetHiddenHook 同款注释。
+    if (mustHide && MKHideNames()) {   // v2.0.12: 撤销 v2.0.9 关合窗口内文件夹内 icon 让步原生(无条件强制藏名), 根治 sub-16ms settle 单帧闪现(第④点残留)。详见 MKSetHiddenHook 同款注释。
         MKDetachBetaOnce((UIView *)self); // v2.0.30: beta App 每帧兜底脱离（仅当小黄点仍在 label 内才动，脱离后跳过）
         // v2.0.8: 主路径仍藏缓存 label；额外 BFS 当前子树，藏任何 label-like 子视图——
         // 缩回动画中 SpringBoard 给内层 App 新建/重父的 label 是【新对象】，MKGetCachedLabel
@@ -3840,8 +4450,12 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     // v1.6.82: 通用不变量——只要本 bid 当前有指示器（圆点），名字必须隐藏，
     // 否则滚动/转场布局把 label 复显会与圆点重叠。注意 folder 容器图标的 bid 是
     // __folder__%p（非 App），MKIsAppRunning 恒为 NO，旧条件 running&&!fg 会漏藏它 → 改判 indicator。
+    // v2.0.66.85: 门控位置修正 —— 原写作 `if (sScrolling && MKHideNames())`, 角标模式下整个
+    //   条件为假 → 滚动期间不再早退, 反而每帧走到下方重定位/重父路径, 引入 v1.6.67 明确
+    //   要避免的滚动 churn。指示器挂在滚动容器自己的 overlay 上、随滚动天然同步, 滚动中
+    //   本就无需重定位。故把「滚动早退」与「藏名」拆开: 早退无条件, 藏名仍受门控。
     if (sScrolling) {
-        if (indicator) {
+        if (indicator && MKHideNames()) {
             UIView *label = MKGetCachedLabel(self);
             if (label && label.superview) {
                 label.hidden = YES;
@@ -3869,7 +4483,16 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
             // 立即把名称强制隐藏——否则回桌面转场动画会把 label 复显(系统图标入场
             // 把 alpha 拉回 1)，与 300ms 后建出的指示器同显一瞬 = 名称与指示器重叠。
             // 原先在 isFading 时直接 return 不藏名，正是重叠窗口的成因。
-            if (MKIsPending(bid) || MKIsFadingLabel(bid)) {
+            // v2.0.66.85: 同 sScrolling —— 原写作 `&& MKHideNames()`, 角标模式下条件整体
+            //   为假 → 不再早退, 每帧都往下走 MKUpdate(self)。而 pending 表示"指示器创建
+            //   已排期(300ms 后)", fading 表示"名字正在渐隐中", 两者都应等排期自然落地,
+            //   此处提前 MKUpdate 会与排期竞争重复创建。故早退无条件, 藏名仍受门控。
+            // v2.0.66.87 (B1): 角标模式已不再排 300ms/800ms → 两个集合是该模式的
+            //   【恒空不变量】, 早退永不该命中。但切模式那一刻可能有 ≤800ms 的残留 bid
+            //   (MKMigrateLocationMode 已清一次, 这里再兜一道防竞态: 迁移与排期回调
+            //    的执行顺序无保证)。若残留而这里仍无条件早退 → 该图标 layoutSubviews
+            //   被永久跳过、指示器建不出来。故角标模式跳过早退。
+            if ((MKIsPending(bid) || MKIsFadingLabel(bid)) && MKHideNames()) {
                 UIView *label = MKGetCachedLabel(self);
                 if (label && label.superview) {
                     label.hidden = YES;
@@ -3901,7 +4524,7 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     if (!cfg || !cfg.enabled) { MKUpdate(self); return; }
 
     label = MKGetCachedLabel(self);   // v1.6.97: 复用 2683 已声明函数级 label，避免同作用域重定义（-Werror 编译失败）
-    if (label && label.superview) {
+    if (label && label.superview && MKHideNames()) {
         label.hidden = YES;
         label.alpha = 0.0f;
         label.layer.opacity = 0.0f;
@@ -3984,6 +4607,16 @@ static void MKFadeInFolderIndicatorIfClosing(UIView *ind) {
 
 static void MKArmFolderCloseGuard(void) {
     sFolderClosing = YES;
+        // v2.0.66.85: 角标模式 —— 本守卫的唯一工作(每 8ms 全窗口 BFS 强制藏名)整段被
+        // MKHideNames() 门控, 在角标模式下 150 拍全是空转(1.2s 内 150 次全窗口视图树遍历)。
+        // 但 sFolderClosing 标志本身仍被 overlay 逐帧不变量(关窗期隐藏文件夹内指示器)使用,
+        // 故仅把「密集 BFS 定时器」换成一次性延时复位, 保留标志语义、去掉全部空转。
+        if (!MKHideNames()) {
+            if (sFolderCloseGuard) { dispatch_source_cancel(sFolderCloseGuard); sFolderCloseGuard = NULL; }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ sFolderClosing = NO; });
+            return;
+        }
         if (sFolderCloseGuard) { dispatch_source_cancel(sFolderCloseGuard); sFolderCloseGuard = NULL; }
         sFolderCloseGuard = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
         if (sFolderCloseGuard) {
@@ -4020,7 +4653,7 @@ static void MKArmFolderCloseGuard(void) {
                                 // 证据(rd_log(63)): 关合窗口内 FOLDER-CLOSE-VISIBLE=0 / SNAP-PRE-NAME=0 / 无 Indicator 重建 → 根本不 strobe 互搏。
                                 // 故关合窗口内对文件夹内 label 干脆【全程强藏】, 不留任何让步窗口。FloatyFolder 识别由 MKIsIconInFolder 单独负责, 不受影响。
                                 // (无 yieldNative 变量, 避免 -Werror 未使用告警)
-                                if (b.length && sHiddenBids && [sHiddenBids containsObject:b]) {
+                                if (b.length && sHiddenBids && [sHiddenBids containsObject:b] && MKHideNames()) {
                                     UIView *lbl = MKGetCachedLabel(iv);
                                     // v2.0.5 探针 B：关文件夹窗口内，本该隐藏的 label 仍可见 = 泄漏。
                                     // 分两类报：① 缓存 label 可见（guard 抓到，至多晚 1 帧）→ via=guard；
@@ -4098,6 +4731,9 @@ static void MKArmFolderCloseGuard(void) {
         // v1.6.86: 动画关闭瞬间先把所有「有指示器」的图标 label 强制隐藏（含文件夹内层运行 App），
         // 防止系统把 label 复显一帧。与源头级 swizzle 形成双保险，杜绝缩回动画里名称闪现。
         MKSafe(^{
+            // v2.0.66.85: 角标模式名字永不藏 → 下面两趟全窗口 BFS 的内层条件必然全部落空,
+            // 整树遍历纯空转。外层直接早退（原先只在内层有 && MKHideNames() 判据）。
+            if (!MKHideNames()) return;
             Class ivCls = MKSBIconViewClass();
             // v1.6.96: 关文件夹瞬间，文件夹内部 App 图标正随文件夹脱离窗口，
             // 已不在 UIApplication.windows 树里（下方扫描会漏）→ 内部 App 名称闪现。
@@ -4112,7 +4748,7 @@ static void MKArmFolderCloseGuard(void) {
                     // 层级查找（关文件夹动画中 label 被重父/新建 → 查找失效 → 漏藏 → 名称闪现）。
                     NSString *b = MKGetCachedBid(iv);
                     UIView *lbl = MKGetCachedLabel(iv);
-                    if (lbl && b.length && sHiddenBids && [sHiddenBids containsObject:b]) {
+                    if (lbl && b.length && sHiddenBids && [sHiddenBids containsObject:b] && MKHideNames()) {
                         lbl.hidden = YES; lbl.alpha = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO;
                         MKAssocLabelBid(lbl, b);  // 种回直接关联键，使源头级 hook 稳定命中
                     }
@@ -4130,7 +4766,7 @@ static void MKArmFolderCloseGuard(void) {
                         // v2.0.1: 同子树段 —— 改用图标自身 bid + 种回关联键
                         NSString *b = MKGetCachedBid(iv);
                         UIView *lbl = MKGetCachedLabel(iv);
-                        if (lbl && b.length && sHiddenBids && [sHiddenBids containsObject:b]) {
+                        if (lbl && b.length && sHiddenBids && [sHiddenBids containsObject:b] && MKHideNames()) {
                             lbl.hidden = YES; lbl.alpha = 0.0f; lbl.layer.opacity = 0.0f; lbl.opaque = NO;
                             MKAssocLabelBid(lbl, b);
                         }
