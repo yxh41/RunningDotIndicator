@@ -3755,6 +3755,43 @@ static void MKClearPendingInView(UIView *root) {
 // 刷新所有图标
 // ====================================================================
 
+// ────────────────────────────────────────────────────────────────────
+// v2.0.66.96 (B) 图标遍历根窗口【并集】—— 修「切模式后别页指示器不是每次都回来」
+// ────────────────────────────────────────────────────────────────────
+// 病根不在 .95 的补做时机, 而在【遍历根】: 本工程所有"找全部 SBIconView"的遍历都以
+// [UIApplication sharedApplication].windows 为根, 而这个数组在 iOS 16 SpringBoard 上
+// 返回不全 —— 工程自己在 MKRefreshIconForBundleID 头部(L3818)早有记载。
+// 于是 .95 把重建推迟到 becomeActive 也只是提高了成功率: 那一刻若 windows 仍不含图标窗口,
+// 整趟照样落空 → 用户实测「不是每次成功」。
+//
+// 修法: 根集取并集 —— 官方 windows ∪ 我们自己两张表里视图的 .window。
+//   · sContainerToOverlay 的 key 是图标滚动容器(我们亲手 addSubview 过 overlay), 其 .window 必是图标窗口;
+//   · sBidToIconView 的 value 是图标视图本身, 其 .window 同理。
+// 注意与 .95 已否决的方案的区别: 那个方案是【拿注册表里的实例直接 MKUpdate】(会对已脱离
+//   视图触发 L3570 无上限 dispatch_async 自排期重试, 且注册表非全量实例源); 这里只
+//   【拿它取 window】, 遍历仍是从 window 起的全树 BFS → 实例仍是全量、仍走已验证路径。
+// 只增不减(官方 windows 全部保留 + 去重), 向后完全兼容; 表为空时退化为原行为。
+// 视图已脱离窗口时 .window 返回 nil, 自然被过滤 —— 不会引入野指针根。
+static NSArray *MKIconRootWindows(void) {
+    NSMutableArray *roots = [NSMutableArray array];
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w && ![roots containsObject:w]) [roots addObject:w];
+    }
+    if (sContainerToOverlay) {
+        for (UIView *c in [[sContainerToOverlay keyEnumerator] allObjects]) {
+            UIWindow *w = c.window;
+            if (w && ![roots containsObject:w]) [roots addObject:w];
+        }
+    }
+    if (sBidToIconView) {
+        for (UIView *iv in [[sBidToIconView objectEnumerator] allObjects]) {
+            UIWindow *w = iv.window;
+            if (w && ![roots containsObject:w]) [roots addObject:w];
+        }
+    }
+    return roots;
+}
+
 static void MKRefreshAllIcons() {
     MKSafe(^{
         if (!sInitDone) return;
@@ -3763,7 +3800,7 @@ static void MKRefreshAllIcons() {
         // reset it so main-screen icons are no longer skipped.
         if (sFolderOpen) {
             BOOL hasFolder = NO;
-            NSArray *wins = [UIApplication sharedApplication].windows;
+            NSArray *wins = MKIconRootWindows();   // v2.0.66.96 (B): 与主 BFS 同根集, 判据一致
             for (UIWindow *w in wins) {
                 if (MKFindDescendantView(w, @"SBFolderView")) { hasFolder = YES; break; }
             }
@@ -3772,7 +3809,7 @@ static void MKRefreshAllIcons() {
                 
             }
         }
-        NSArray *windows = [UIApplication sharedApplication].windows;
+        NSArray *windows = MKIconRootWindows();   // v2.0.66.96 (B): 官方 windows 不全 → 并入我方两表的 window
         for (UIWindow *window in windows) {
             NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
             while (stack.count > 0) {
@@ -4129,7 +4166,7 @@ static void MKDelayedInit() {
 static void MKMigrateLocationMode(void) {
     MKSafe(^{
         if (!sInitDone) return;
-        NSArray *windows = [UIApplication sharedApplication].windows;
+        NSArray *windows = MKIconRootWindows();   // v2.0.66.96 (B): 同 MKRefreshAllIcons, 官方 windows 不全
         for (UIWindow *window in windows) {
             NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
             while (stack.count > 0) {
@@ -4245,12 +4282,83 @@ static void MKConsumeModeRebuildIfPending(void) {
     MKRebuildAllForModeSwitch();
 }
 
+// ────────────────────────────────────────────────────────────────────
+// v2.0.66.96 (C) 反查「与指示器同 overlay 坐标系的图标实例」
+// ────────────────────────────────────────────────────────────────────
+// 修「替换模式拖参数不是每个 App 都即时更新」。
+//
+// 🔴 先坐实一个死码事实: .92 写的护栏 `[iv isDescendantOfView:ov]`(ov = ind.superview = overlay)
+//   【恒为 false】—— MKOverlayForContainer 是 `[container addSubview:ov]`, 图标视图是 container
+//   的另一侧后代, 从来不在 overlay 子树内。所以那段 frame 重算自 .92 引入起【一次都没跑过】。
+//   替换模式参数之所以「有些 App 会更新」, 靠的是回调末尾 MKRefreshAllIcons → MKUpdate 复用分支
+//   (L3642 `indicator.frame = indicatorFrame`) —— 而它只覆盖 BFS 可达的图标 → 当前页更新、别页不更新,
+//   与用户实机描述逐字吻合。
+//
+// 正解: 从 overlay 的【容器】(ov.superview)子树 BFS 反查 bid 匹配的 SBIconView。
+//   这样拿到的实例天然与该指示器同处一个 overlay 坐标系 —— 「防指示器飘到别页」的目的由
+//   【构造方式】保证, 不再需要一个恒假的事后判据。
+//   · 不调 MKOverlayForContainer(不懒建 overlay), 沿用 .92 的这条约束;
+//   · 算不出仍一字不动(下方 !CGRectIsEmpty 守卫), 沿用 .92 的保守原则;
+//   · 顺带覆盖文件夹指示器(key 为 __folder__%p, 永不进 sBidToIconView) —— 键按
+//     MKIsFolderIcon 合成, 与 MKUpdate 文件夹分支(L3195)同款; 它调的正是同一个
+//     MKIndicatorFrameInOverlay + MKIconCornerRadius, 故语义一致、无新风险。
+// 跳过 overlay 自身子树: 那里只有我们的指示器, 不含图标, 顺带省一段遍历。
+// 只在 prefs 变更时调用(非热路径), 每个 overlay 只 BFS 一次(下方 ovCache)。
+static NSDictionary *MKBidToIconViewUnderOverlay(UIView *ov) {
+    if (!ov) return nil;
+    UIView *container = ov.superview;
+    if (!container) return nil;
+    Class ivCls = MKSBIconViewClass();
+    if (!ivCls) return nil;
+    NSMutableDictionary *map = [NSMutableDictionary dictionary];
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:container];
+    while (stack.count > 0) {
+        UIView *cur = [stack lastObject];
+        [stack removeLastObject];
+        if (cur == ov) continue;   // overlay 子树内只有指示器, 无图标
+        if ([cur isKindOfClass:ivCls]) {
+            SBIconView *iv = (SBIconView *)cur;
+            NSString *key = nil;
+            if (MKIsFolderIcon(iv)) {
+                id fIcon = [iv icon];
+                if (fIcon) key = [NSString stringWithFormat:@"__folder__%p", fIcon];
+            } else {
+                key = MKGetCachedBid(iv);
+            }
+            if (key.length && !map[key]) map[key] = iv;
+        }
+        for (UIView *sub in cur.subviews) [stack addObject:sub];
+    }
+    return map;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// v2.0.66.96 (A) 模式基线 —— 修「装包后第一次切模式必出巨型圆点/错位小弧」
+// ────────────────────────────────────────────────────────────────────
+// 原实现把这两个变量写成 MKPrefsChangedCallback 的【函数内 static】, 初值
+// (MKLocationReplace, NO)。于是 respring 后【第一次】收到 prefs 通知时 hadOld 恒为 NO
+// → modeChanged 恒为 NO, 无论用户这次是不是真切了模式。
+// 后果: 首次切模式不走下面 .92 的全量重建, 而是掉进「同模式参数变更」循环 ——
+// 那个循环只 setNeedsDisplay(frame 重算还恰好是死码, 见上方 C), 于是精确制造出 .92
+// 注释里写明的病灶「新模式的绘制代码 + 旧模式的 frame」:
+//   · 角标(90x90 frame) → 替换: CGContextFillEllipseInRect 把整个 frame 当圆点本体画
+//     = 约 89pt 的【巨型圆点】(用户实机「切换角标模式后出现过一次巨型圆点」);
+//   · 替换(6~40pt frame) → 角标: W = rect.w - 30 变负 → 兜底 rc≈2pt = 又小又错位的小弧。
+// 之后 sLastModeValid 已为 YES, 重复切换全走正路 → 用户「之后重复切换测试没碰到过」。
+// 症状「只出现一次、之后不复现」正是函数内 static 首次未初始化的指纹。
+//
+// 修法: 提为文件级 static, 在 %ctor 里按【当前真实 locationMode】置好基线。
+// 这样首次通知的判定即准确: 真切模式 → YES 走全量重建; 只拖滑块 → NO 走同模式循环。
+// 与 MKIsDisabled 早退的关系: ctor 若因 disabled 提前 return, 基线保持 (Replace, NO),
+// 但那种情况下插件整体不工作, 无指示器可画错, 无害。
+static MKLocationMode sLastLocationMode = MKLocationReplace;
+static BOOL sLastModeValid = NO;
+
 static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observer,
                                     CFStringRef name, const void *object,
                                     CFDictionaryRef userInfo) {
     // v2.0.66.87: locationMode 变化检测必须在 reload 之前取旧值
-    static MKLocationMode sLastLocationMode = MKLocationReplace;
-    static BOOL sLastModeValid = NO;
+    // v2.0.66.96 (A): 两个 static 已提到函数外并由 %ctor 初始化基线, 见上方说明。
     MKLocationMode oldMode = sLastLocationMode;
     BOOL hadOld = sLastModeValid;
     [[MKConfig sharedConfig] reload];
@@ -4310,27 +4418,37 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     //   等该图标下次 layout 由 MKRepositionIndicator/MKUpdate 复位) —— 绝不 hidden=YES,
     //   否则文件夹指示器(key 是 __folder__%p, 永不进 sBidToIconView)会被一律藏起来,
     //   而 layoutSubviews 对文件夹指示器只管藏名不管几何 → 可能一直藏到下次 gen 变更, 是回归。
+    // ★ v2.0.66.96 (C): 图标实例来源由 sBidToIconView【改为按 overlay 反查】。
+    //   原实现两个缺陷叠加导致 frame 重算【从未执行过】:
+    //     ① sBidToIconView 每 bid 只存「最后一次 MKUpdate 的实例」, 多页桌面常属别页;
+    //     ② 护栏 [iv isDescendantOfView:ov] 中 ov 是 overlay, 而 overlay 是 container 的子视图、
+    //        与图标视图是兄弟侧分支 —— 图标【永远不可能】是 overlay 的后代 → 条件恒假。
+    //   现改为从 ov.superview(容器)子树反查同 bid 的图标实例: 拿到的实例天然与该指示器
+    //   共处同一 overlay 坐标系, 「防飘页」由构造方式保证, 不再依赖那个恒假判据。
+    //   每个 overlay 只 BFS 一次(ovCache 按 overlay 指针缓存本次回调内的结果)。
     if (sBidToIndicator) {
         MKConfig *cfg = [MKConfig sharedConfig];
         NSArray *bids = [[sBidToIndicator keyEnumerator] allObjects];
+        // overlay(指针) → {bid: SBIconView}; 仅本次回调内有效, 用 NSValue 包指针作 key(不 retain 视图)
+        NSMutableDictionary *ovCache = [NSMutableDictionary dictionary];
         for (NSString *bid in bids) {
             UIView *ind = [sBidToIndicator objectForKey:bid];
             if (![ind isKindOfClass:[MKIndicatorDotView class]]) continue;
             [(MKIndicatorDotView *)ind setBadgeCorner:cfg.badgeCorner];
-            SBIconView *iv = sBidToIconView ? [sBidToIconView objectForKey:bid] : nil;
-            if (iv) {
-                CGFloat rc = MKIconCornerRadius((UIView *)iv);
-                if (rc > 0) [(MKIndicatorDotView *)ind setIconCornerRadius:rc];
-                // ⚠️ sBidToIconView 存的是「最后一次 MKUpdate 的图标实例」, 多页桌面下可能是
-                //   另一页的实例(见 MKIndicatorFrameInOverlay 头部警告) → 用它算出的 frame 属于
-                //   另一个 overlay 坐标系, 直接套上去 = 指示器飘到别页。判据: 该图标必须真的在
-                //   指示器当前所挂的 overlay 子树内。
-                //   直接用 ind.superview 而不调 MKOverlayForContainer —— 后者会懒建 overlay, 在这里
-                //   为一个当前没有 overlay 的容器凭空造一个是纯副作用。
-                UIView *ov = ind.superview;
-                if (ov && [iv isDescendantOfView:ov]) {
+            UIView *ov = ind.superview;
+            if (ov) {
+                NSValue *ovKey = [NSValue valueWithPointer:(__bridge const void *)ov];
+                NSDictionary *m = ovCache[ovKey];
+                if (!m) {
+                    m = MKBidToIconViewUnderOverlay(ov) ?: @{};
+                    ovCache[ovKey] = m;
+                }
+                SBIconView *iv = m[bid];
+                if (iv) {
+                    CGFloat rc = MKIconCornerRadius((UIView *)iv);
+                    if (rc > 0) [(MKIndicatorDotView *)ind setIconCornerRadius:rc];
                     CGRect f = MKIndicatorFrameInOverlay(iv, ov, cfg);
-                    if (!CGRectIsEmpty(f)) ind.frame = f;
+                    if (!CGRectIsEmpty(f)) ind.frame = f;   // 算不出 → 一字不动(绝不 hidden=YES)
                 }
             }
             [ind setNeedsDisplay];
@@ -5196,7 +5314,7 @@ static void MKRefreshFolderIcons(void) {
         sFolderContentGen++;
         Class ivCls = MKSBIconViewClass();
         NSInteger total = 0;
-        NSArray *wins = [UIApplication sharedApplication].windows;
+        NSArray *wins = MKIconRootWindows();   // v2.0.66.96 (B): 同 MKRefreshAllIcons, 官方 windows 不全
         for (UIWindow *w in wins) {
             UIView *home = MKFindDescendantView(w, @"SBIconScrollView");
             if (home) total += MKUpdateFolderIconsUnder(home, ivCls);
@@ -5225,6 +5343,14 @@ static void MKRefreshFolderIcons(void) {
         RDLog(@"DISABLED at load; exiting ctor.");
         return;
     }
+
+    // ★ v2.0.66.96 (A): locationMode 基线初始化 —— 必须在注册 prefs 观察者【之前】。
+    //   原实现两个变量是 MKPrefsChangedCallback 的函数内 static(初值 Replace/NO) →
+    //   respring 后第一次收到通知时 modeChanged 恒为 NO, 首次切模式因此走进「同模式参数
+    //   变更」分支 = 新模式绘制代码 + 旧模式 frame → 巨型圆点 / 错位小弧(用户实机第②点)。
+    //   此处按当前真实配置置基线, 首次判定即准确。sharedConfig 首次访问会自行 reload。
+    sLastLocationMode = [MKConfig sharedConfig].locationMode;
+    sLastModeValid = YES;
 
     // ─── Darwin 通知 ──────────
     CFNotificationCenterAddObserver(
