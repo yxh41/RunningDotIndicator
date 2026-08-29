@@ -1141,6 +1141,7 @@ static NSMutableSet<NSString*> *sFadingLabelBIDs    = nil; // v1.5.8: 标签正�
 static NSMutableDictionary<NSString*, UIColor*> *sIconColorCache = nil; // v1.5.7: bundleID → 图标主色调缓存
 static NSMutableSet<NSString*> *sIconColorMissLogged = nil; // v1.6.12: 取色失败诊断（每 bid 只记一次）
 static dispatch_queue_t sColorDiskQueue = nil; // v2.0.66.6: 颜色缓存写盘串行队列（后台异步，避免主线程 jank）
+static BOOL sColorCacheFlushPending = NO;      // v2.0.66.94: 落盘去抖 —— 已排期未执行的 flush 标记（见 MKSaveColorCacheToDisk）
 
 // v2.0.66.73: 最终优化 —— 删除全部 sDebugLog/sProbeLog 调试门控与 MKDebugDumpBetaLabel/MKLogRevealAttempt 调试函数(RDLog 为编译期 no-op 宏, 参数不求值, 删之零行为影响); 仅 RDLogRunning 守卫保留以维持 .47 行为。
 // 调试/探针门控已全部清除(RDLog 为编译期 no-op 宏, 参数不求值; 全部 sDebugLog/sProbeLog 门控已删除)。
@@ -1416,20 +1417,37 @@ static void MKLoadColorCacheFromDisk() {
 }
 
 // 把当前内存缓存镜像写盘（后台串行队列异步 + atomic，避免主线程 jank 与半写损坏）。写失败静默忽略。
+//
+// v2.0.66.94 落盘去抖:
+//   原实现每取到一个新颜色就立刻【在主线程】重建整份字典(遍历 sIconColorCache, 每个 bid 一次
+//   getRed: + 一个 4 元素 NSArray + 4 个 NSNumber), 再异步写盘。开机/解锁那一波每个后台 App
+//   都取一次色 → N 个 bid 触发 N 次全量重建 = O(N²) 次装箱分配 + N 次整文件写盘, 全落在
+//   桌面刚出现、最忙的那几秒。而这份缓存的作用只是【下次开机少扫一遍图标】, 丢一两秒的
+//   增量毫无影响 → 典型的可去抖场景。
+//   现改为: 标记 pending, 1.5s 后合并成一次快照 + 一次写盘。窗口内再多少次新颜色都只排期一次。
+//   注意快照必须仍在主线程做(sIconColorCache 只在主线程读写, 没有锁), 只是把次数从 N 降到 1。
 static void MKSaveColorCacheToDisk() {
 	@try {
-		if (!sColorDiskQueue) sColorDiskQueue = dispatch_queue_create("com.mk.rd.colorcache", DISPATCH_QUEUE_SERIAL);
-		NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:sIconColorCache.count];
-		for (NSString *bid in sIconColorCache) {
-			UIColor *c = sIconColorCache[bid];
-			CGFloat r, g, b, a;
-			if ([c getRed:&r green:&g blue:&b alpha:&a]) {
-				out[bid] = @[@(r), @(g), @(b), @(a)];
-			}
-		}
-		NSString *path = MKColorCachePath();
-		dispatch_async(sColorDiskQueue, ^{
-			@try { [out writeToFile:path atomically:YES]; } @catch (NSException *e) {}
+		if (sColorCacheFlushPending) return;   // 已有排期 → 本次新颜色由那一次一并写出
+		sColorCacheFlushPending = YES;
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+		               dispatch_get_main_queue(), ^{
+			sColorCacheFlushPending = NO;
+			@try {
+				if (!sColorDiskQueue) sColorDiskQueue = dispatch_queue_create("com.mk.rd.colorcache", DISPATCH_QUEUE_SERIAL);
+				NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:sIconColorCache.count];
+				for (NSString *bid in sIconColorCache) {
+					UIColor *c = sIconColorCache[bid];
+					CGFloat r, g, b, a;
+					if ([c getRed:&r green:&g blue:&b alpha:&a]) {
+						out[bid] = @[@(r), @(g), @(b), @(a)];
+					}
+				}
+				NSString *path = MKColorCachePath();
+				dispatch_async(sColorDiskQueue, ^{
+					@try { [out writeToFile:path atomically:YES]; } @catch (NSException *e) {}
+				});
+			} @catch (NSException *e) {}
 		});
 	} @catch (NSException *e) {}
 }
@@ -2151,8 +2169,24 @@ static NSString *MKForeignContainerCtx(UIView *label) {
 //    那条警告的是「把它当触发器加回去会让擦名复活」, 这里是拿它当 return NO 的守卫。
 //    改动此函数前请先读懂这两者方向相反, 勿再来回翻烧饼。
 static BOOL MKViewInFolderThumb(UIView *v);   // v2.0.66.89: 前向声明上移(定义见 ~L2670, 本谓词与 MKDockStrayHide 都在其之前)
+// v2.0.66.94 【热路径短路 —— 纯布尔恒等变换, 语义零变化】
+// 本谓词被 layoutSubviews 那条每帧 stray 块对【每个图标每帧】调用一次(角标模式下前置的
+// hidden/alpha 预筛恒不早退, 因为角标模式所有 label 都可见)。原求值顺序:
+//     MKViewInFolderThumb(v)            → 走【整条】祖先链到 root 才能返回 NO
+//     → MKForeignContainerCtx(v)        → 内部 MKLabelInHomeGrid 再走一趟
+// 主屏图标(绝大多数)两趟都白走。
+// 而 MKForeignContainerCtx 的第一行就是 `if (MKLabelInHomeGrid(label)) return nil;`,
+// 即 InHomeGrid ⟹ ctx == nil ⟹ 本谓词恒为 NO(与 thumb 取值无关) —— 于是把 InHomeGrid
+// 提到最前面做早退, 结果【逐位相同】(`!thumb && ctx` 里 ctx 为 nil 时 thumb 是无关项),
+// 但主屏图标从「整链 + 部分链」降为「一趟部分链」(命中 SBIconListView 即返回)。
+// dock / 负一屏 / dock 内文件夹缩略图仍走原顺序, thumb 豁免守卫(.88/.89 快照通道铁律)完整保留。
+//
+// ⚠️ 刻意【不做】「superview 指针 → 判定结果」缓存: 失效点太多(翻页/文件夹开合/回收复用/
+//    旋转/重父动画), 漏一个就等于按过期结论擦名或漏擦, 属于本工程反复踩过的那类坑;
+//    而恒等变换已拿掉主要开销, 不值得为剩下的部分引入失效风险。
 static BOOL MKBadgeMayEraseName(UIView *v) {
     if (!v) return NO;
+    if (MKLabelInHomeGrid(v)) return NO;          // 快路径: 主屏网格 → ctx 必为 nil → 恒 NO
     if (MKViewInFolderThumb(v)) return NO;        // 快照通道 → 交还系统(.88/.89)
     return MKForeignContainerCtx(v) != nil;       // 内含 MKLabelInHomeGrid 守卫, 主屏网格名绝不误杀
 }
