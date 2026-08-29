@@ -2299,9 +2299,13 @@ static BOOL MKDockStrayHide(SBIconView *iv, BOOL *outStray) {
         //   替换模式下这笔账划得来: 名字本就要藏, 误伤退化成「本来也要藏」。
         //   角标模式下方向完全相反: 名字本该显示, 误伤 = 名字凭空消失 / 动画期间闪。
         //   典型命中: 文件夹在底行、或关闭动画收缩轨迹掠过 dock 纵带。
-        //   顺带一笔性能账: 角标模式所有 label 可见 → 下面 `hidden||alpha<=0.01` 早退失效
-        //   → 每图标每帧都做一次 convertRect + 纵带比较(layoutSubviews 每帧调本函数)。
-        //   另: sDockFrame 只在为空时刷新、转屏后不失效 → 横屏纵带整体错位, 角标模式一并免疫。
+    //   顺带一笔性能账: 角标模式所有 label 可见 → 下面 `hidden||alpha<=0.01` 早退失效
+    //   → 每图标每帧都做一次 convertRect + 纵带比较(layoutSubviews 每帧调本函数)。
+    //   另: sDockFrame 会在旋转时被清空(见 ctor 里的 UIDeviceOrientationDidChange 观察者, .39 加),
+    //   但那是【设备朝向】通知而非界面几何通知 —— 平放/翻面也发, 而 iPad 分屏这类真几何变更不发,
+    //   故横屏纵带仍有短暂错位窗口(下次 MKUpdateDockFrame 惰性重算才纠正)。角标模式一并免疫。
+    //   (v2.0.66.93 修正: 此处原注释写「sDockFrame 只在为空时刷新、转屏后不失效」, 与 .39 起的
+    //    旋转清缓存实现直接矛盾, 会把后来人引向错误结论 —— 已按代码现状改写。)
         //   ⚠️ 这【不是死码】: MKDockStrayHide 是两模式共用函数, 不在 `if (!MKHideNames())` 分支内。
         if (!MKHideNames()) return NO;                     // 角标模式: 只认真 dock 子树(dockCtx), 纵带一概不管
         if (lbl.hidden || lbl.alpha <= 0.01f) return NO;   // 已不可见 → 无需判定(最常见早退路径)
@@ -4231,6 +4235,27 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     MKRefreshFolderIcons();
 }
 
+// ────────────────────────────────────────────────────────────────────
+// v2.0.66.93 注销 SpringBoard（设置页「注销 SpringBoard」按钮）
+// ────────────────────────────────────────────────────────────────────
+// 设置 App 那侧只负责发 Darwin 通知；真正的退出必须在 SpringBoard 进程内做 ——
+// 设置 App 没有杀 SpringBoard 的权限, 而我们的 dylib 就注入在 SpringBoard 里。
+// 用 exit(0): launchd 监管 SpringBoard, 退出后立即重启, 这就是标准 respring。
+//   · 不引入 SpringBoardServices / FBSSystemService(SBSRelaunchAction) 依赖 —— 少一个私有
+//     framework 链接 = 少一处跨版本崩点, 且 Makefile 不用改 PRIVATE_FRAMEWORKS。
+//   · 不用 -performSelector: 打私有 API —— 本工程 ARC + CI 开 -Werror,
+//     -Warc-performSelector-leaks 会直接编译失败(见 MKRootListController.m 同款说明)。
+// 延迟 0.35s 再退出: 让本 CFNotification 回调先返回、设置 App 那侧的确认弹窗收起动画走完,
+// 否则用户观感是「点一下整个界面卡死」而不是「正常注销」。
+static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
+                               CFStringRef name, const void *object,
+                               CFDictionaryRef userInfo) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        exit(0);
+    });
+}
+
 // ====================================================================
 // Hook — SBIconView
 // ====================================================================
@@ -5101,6 +5126,13 @@ static void MKRefreshFolderIcons(void) {
         CFNotificationCenterGetDarwinNotifyCenter(),
         NULL, MKPrefsChangedCallback,
         CFSTR("com.mk.runningdotindicator.reload"),
+        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+
+    // v2.0.66.93: 设置页「注销 SpringBoard」按钮 → 设置 App 发此通知, 由 SpringBoard 内自行退出。
+    CFNotificationCenterAddObserver(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        NULL, MKRespringCallback,
+        CFSTR("com.mk.runningdotindicator.respring"),
         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
     // ─── 锁屏/解锁通知（v1.6.69）──────────

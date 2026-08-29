@@ -47,12 +47,11 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
     } else {
         _prefs = @{};
     }
-
-    NSLog(@"[RunningDotIndicator] MKConfig reload, keys: %lu, enabled=%@, shape=%@, color=%@",
-          (unsigned long)[_prefs count],
-          _prefs[@"enabled"],
-          _prefs[@"shape"],
-          _prefs[@"color"] ?: @"(default)");
+    // v2.0.66.93: 此处原有一条【无条件 NSLog】(打 keys 数 / enabled / shape / color)。
+    //   工程其余诊断早在 .73/.78 就全部 RDLog 化(编译期 no-op)、sDebugLog/sProbeLog 一并删除,
+    //   唯独这条漏了 —— 而 reload 是热路径: 拖任一滑块都会经由 Darwin 通知触发一次,
+    //   等于拖动过程中持续往 syslog 刷字符串格式化。诊断价值为零(线上取不到日志), 直接删除。
+    //   若将来确需排查配置读取, 请用 Tweak.x 的 RDLog 宏, 不要在此恢复裸 NSLog。
 }
 
 #pragma mark - 读取字段(带默认值)
