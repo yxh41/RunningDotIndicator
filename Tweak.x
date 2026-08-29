@@ -4166,8 +4166,18 @@ static void MKDelayedInit() {
 static void MKMigrateLocationMode(void) {
     MKSafe(^{
         if (!sInitDone) return;
-        NSArray *windows = MKIconRootWindows();   // v2.0.66.96 (B): 同 MKRefreshAllIcons, 官方 windows 不全
-        for (UIWindow *window in windows) {
+        // v2.0.66.96 (B): 官方 windows 不全 → 已并入我方两表元素的 window。
+        // v2.0.66.97 (D): 再补一类根 —— sContainerToOverlay 里【window 为 nil】的容器。
+        //   window 非 nil 的容器其 window 已被 (B) 并进根集, 无需重复; window 为 nil 说明
+        //   该容器整棵子树不在任何可达窗口树内(切模式那一刻的典型状态), 这些图标的 label
+        //   若不单独作根就永远等不到迁移 → 名字保持 hidden=YES 永不复原(本函数存在的理由)。
+        NSMutableArray *roots = [NSMutableArray arrayWithArray:MKIconRootWindows()];
+        if (sContainerToOverlay) {
+            for (UIView *c in [[sContainerToOverlay keyEnumerator] allObjects]) {
+                if (c && !c.window && ![roots containsObject:c]) [roots addObject:c];
+            }
+        }
+        for (UIView *window in roots) {
             NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
             while (stack.count > 0) {
                 UIView *current = [stack lastObject];
@@ -4333,6 +4343,81 @@ static NSDictionary *MKBidToIconViewUnderOverlay(UIView *ov) {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// v2.0.66.97 (D) 跨模式「原地迁移」—— 取代 .92 的「全删 + 窗口 BFS 重建」
+// ────────────────────────────────────────────────────────────────────
+// 🔴 .95/.96 都打错了层。.92 那套「MKRemoveAllIndicators() 全删 + MKRefreshAllIcons()
+//   重建」是【天生不对称】的:
+//     · 删除 = 内存表操作(sBidToIndicator), 与视图树无关 → 无条件即时成功;
+//     · 重建 = 依赖视图树可遍历 → 条件成功。
+//   切模式的通知抵达时用户人在设置 App 里 → 重建那一半落空 → 「删了没建回来」。
+//   .95 试图把重建【推迟】到 becomeActive、.96(B) 试图把遍历根【拓宽】, 两者都是在
+//   「让重建变得和删除一样可靠」= 与架构对抗。实机结果: 仍然只有回桌面那一屏立即生效。
+//   (且 .96(C) 的 frame 重算位于 MKPrefsChangedCallback 里 `if (modeChanged) { ... return; }`
+//    的【下方】→ 对跨模式路径根本不可达, 只服务同模式改参数。)
+//
+// 正解: 跨模式【不删除】, 原地把已有指示器改成新模式。三条支撑事实(均已核对源码):
+//  ① 跨模式真正需要改的只有 {frame, iconCornerRadius, badgeCorner} + applyConfig ——
+//     比对 MKUpdate 创建分支(initWithFrame: / setIconCornerRadius: / setBadgeCorner: /
+//     applyConfig), 模式相关的初始化恰好只有这些; tag / 关联 bid / 颜色跨模式不变。
+//     故「不删而是改」是可证完备的, 不是碰运气。
+//  ② 锚点从「窗口」换成「overlay」→ 彻底不依赖前台状态。ind.superview 即 overlay,
+//     ov.superview 即容器, 容器子树含该容器全部图标。视图层级【不因 App 不在前台而拆除】,
+//     故本路径不碰 [UIApplication windows]、不依赖 becomeActive、不依赖 layoutSubviews。
+//  ③ MKContainerForIconView 取的是第一个 UIScrollView 祖先 = 主屏所有页共同的
+//     SBIconScrollView → 【全主屏只有一个 overlay, 所有页的指示器都挂在它上面】→
+//     从 ov.superview 一趟 BFS 即覆盖所有页。这正是 .96(C) 能修好「别页参数不更新」的
+//     机理, 同一机理即可修「别页切模式不生效」。
+//
+// 保守设计:
+//  · 反查不到实例 / 算不出 frame 的【个别】指示器才删(交回 layoutSubviews 重建),
+//    而不是一律全删 —— 最坏退化为 .96 的行为, 不会更差。
+//  · 名字归属按新模式重置: 替换模式重新藏名并重登 sHiddenBids(上一行 MKMigrateLocationMode
+//    刚把两张表清空), 角标模式顺带 MKRestoreBetaOrphan(与 MKRefreshAllIcons L3824 同款)。
+//  · 仍保留 becomeActive pending + 0.6s/1.5s 波次, 降级为【幂等再同步】, 专治离屏页
+//    convertRect 拿到过渡态几何。
+static void MKMigrateIndicatorsInPlace(MKConfig *cfg) {
+  MKSafe(^{
+    if (!sBidToIndicator || !cfg) return;
+    NSArray *bids = [[sBidToIndicator keyEnumerator] allObjects];
+    NSMutableDictionary *ovCache = [NSMutableDictionary dictionary];   // overlay 指针 → {bid: SBIconView}
+    NSMutableArray *orphans = [NSMutableArray array];                  // 反查失败 → 删, 留给 layoutSubviews
+    for (NSString *bid in bids) {
+        UIView *ind = [sBidToIndicator objectForKey:bid];
+        if (![ind isKindOfClass:[MKIndicatorDotView class]]) { [orphans addObject:bid]; continue; }
+        UIView *ov = ind.superview;
+        if (!ov) { [orphans addObject:bid]; continue; }
+        NSValue *ovKey = [NSValue valueWithPointer:(__bridge const void *)ov];
+        NSDictionary *m = ovCache[ovKey];
+        if (!m) { m = MKBidToIconViewUnderOverlay(ov) ?: @{}; ovCache[ovKey] = m; }
+        SBIconView *iv = m[bid];
+        if (!iv) { [orphans addObject:bid]; continue; }
+        CGRect f = MKIndicatorFrameInOverlay(iv, ov, cfg);
+        if (CGRectIsEmpty(f)) { [orphans addObject:bid]; continue; }
+        MKIndicatorDotView *dot = (MKIndicatorDotView *)ind;
+        CGFloat rc = MKIconCornerRadius((UIView *)iv);
+        if (rc > 0) [dot setIconCornerRadius:rc];
+        [dot setBadgeCorner:cfg.badgeCorner];
+        dot.frame = f;
+        dot.hidden = NO;
+        [dot applyConfig];          // alpha = cfg.opacity + setNeedsDisplay(按新模式重画)
+        UIView *label = MKGetCachedLabel(iv);
+        if (MKHideNames()) {
+            if (label && label.superview) {
+                label.hidden = YES; label.alpha = 0.0f;
+                label.layer.opacity = 0.0f; label.opaque = NO;
+                MKAssocLabelBid(label, bid);
+            }
+            if (!sHiddenBids) sHiddenBids = [NSMutableSet set];
+            [sHiddenBids addObject:bid];
+        } else {
+            MKRestoreBetaOrphan((UIView *)iv);   // 角标模式: 小黄点交还系统(同 MKRefreshAllIcons)
+        }
+    }
+    for (NSString *bid in orphans) MKRemoveIndicatorForBid(bid);
+  });
+}
+
+// ────────────────────────────────────────────────────────────────────
 // v2.0.66.96 (A) 模式基线 —— 修「装包后第一次切模式必出巨型圆点/错位小弧」
 // ────────────────────────────────────────────────────────────────────
 // 原实现把这两个变量写成 MKPrefsChangedCallback 的【函数内 static】, 初值
@@ -4394,8 +4479,16 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     //   UIApplicationDidBecomeActiveNotification 在主屏真正活过来时补做重建。
     //   立即那一趟仍保留: 若通知恰好在桌面态抵达(如从设置返回后再改, 或第三方工具改键),
     //   它一趟就完事, pending 那次只是幂等重刷。
+    // ★ v2.0.66.97 (D): 跨模式改为【原地迁移】, 不再 MKRemoveAllIndicators 全删。
+    //   上面 .92/.95 那套的病根是「删除无条件成功、重建条件成功」的不对称(详见
+    //   MKMigrateIndicatorsInPlace 上方论证)。现改为按 overlay 锚点原地改写已有指示器 ——
+    //   不碰 [UIApplication windows]、不依赖 becomeActive、不依赖 layoutSubviews,
+    //   且因主屏所有页共用同一个 overlay, 一趟即覆盖所有页。
+    //   反查失败的个别指示器才删(函数内 orphans), 最坏退化为 .96 行为。
+    //   后续 MKRefreshAllIcons/MKRefreshFolderIcons 与 pending 波次全部保留为幂等再同步:
+    //   迁移已保证「立即正确」, 它们只负责补齐迁移时不在任何 overlay 上的图标。
     if (modeChanged) {
-        MKRemoveAllIndicators();
+        MKMigrateIndicatorsInPlace([MKConfig sharedConfig]);
         sModeRebuildPending = YES;
         sModeRebuildArmedAt = [NSDate date].timeIntervalSince1970;
         MKRebuildAllForModeSwitch();
