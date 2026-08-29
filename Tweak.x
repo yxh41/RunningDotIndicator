@@ -4183,6 +4183,68 @@ static void MKMigrateLocationMode(void) {
     });
 }
 
+// ────────────────────────────────────────────────────────────────────
+// v2.0.66.95 跨模式重建「补做」机制
+// ────────────────────────────────────────────────────────────────────
+// 用户实机 .94: 「切换模式时只有返回桌面时的那屏会立马切换, 其他屏的有运行的 App
+// 需要重新点开一下界面才会重新出现指示器」。
+//
+// 根因: 切模式的 Darwin 通知抵达时, 用户人在【设置 App】里 —— SpringBoard 不在前台,
+//   主屏视图树此刻不可用/未布局。而 .92 修法是「MKRemoveAllIndicators() 全删 +
+//   MKRefreshAllIcons() 重建」:
+//     · 删除立刻生效(sBidToIndicator 是内存表, 与视图树无关) → 所有页全空;
+//     · 重建走 [UIApplication windows] BFS → 此刻【一个图标也遍历不到】, 整趟落空。
+//   本工程早在 MKRefreshIconForBundleID 头部就记载过这个坑(iOS 16 SpringBoard 活跃态下
+//   主屏图标视图常不在窗口遍历可达路径), 当时的对策是改用 sBidToIconView 注册表。
+//   删完又建不出来 → 唯一恢复通道退化成每个图标自己的 layoutSubviews(L4582 的
+//   `if (!indicator) { ... MKUpdate(self); }`), 而它只对【用户实际走到的那一页】触发
+//   → 精确对应用户描述。
+//   这正是 .92 注释里作为「可接受代价」记下的二级病灶换了症状: .92 之前是「别页指示器
+//   存在但 frame 是旧模式量级」(巨点/错位小弧), .92 之后变成「别页指示器干脆不存在」。
+//
+// 修法: 【删除仍留在不可见窗口内】(此时删无闪烁, 是 .92 选这个时机的正当理由),
+//   但把【重建】推迟到主屏真正活过来。SpringBoard 回前台必发
+//   UIApplicationDidBecomeActiveNotification(见 %ctor 内该观察者的既有断言 ——
+//   v1.6.72 正是靠它根治「解锁后指示器不回来」), 由它消费 pending 标记补做重建。
+//
+// ⚠️ 为什么不改用 sBidToIconView 注册表补刷(第一直觉方案, 已否决):
+//   ① 若图标视图仍在窗口树内, 窗口 BFS 本就能遍历到, 注册表纯冗余;
+//   ② 若图标视图已脱离(superview == nil), 对它调 MKUpdate 会命中 L3570 的
+//      `if (!overlay) { dispatch_async(^{ MKUpdate(self); }); return; }` ——
+//      该重试【无次数上限】, 对永久脱离的视图就是自我排期的无限循环烧 CPU。
+//   ③ 注册表每个 bid 只存「最后一次 MKUpdate 的实例」, 本就不是全量视图源。
+//   故正解是「等树活过来再走原本那条已验证的路径」, 而不是换遍历源。
+//
+// 三波(立即 + 0.6s + 1.5s)而非一次: becomeActive 抵达时主屏虽已入树, 离屏页的
+//   SBIconListView 可能尚未完成布局 → convertRect 得到的是过渡态几何。首波保证
+//   指示器【存在】(不存在才是用户能看见的 bug), 后两波经 MKUpdate 复用分支
+//   (L3642 `if (!CGRectIsEmpty(indicatorFrame))`) 把 frame 校正到位。
+//   这个「一次即时 + 一次延迟兜底」的形状与 MKUnlockRestore(L490/L495) 完全同构。
+static BOOL sModeRebuildPending = NO;            // 跨模式重建待补做
+static NSTimeInterval sModeRebuildArmedAt = 0;   // 武装时刻(超 120s 视为过期, 防落到无关的 becomeActive 上)
+static void MKRebuildAllForModeSwitch(void) {
+    MKRefreshAllIcons();
+    MKRefreshFolderIcons();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ MKRefreshAllIcons(); MKRefreshFolderIcons(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ MKRefreshAllIcons(); MKRefreshFolderIcons(); });
+}
+// %ctor 内 becomeActive 观察者调用(定义在此、使用在后, 满足 -Werror 先声明后使用)
+// 注: MKMigrateLocationMode 定义就在本块【上方】, 无需前向声明。
+static void MKConsumeModeRebuildIfPending(void) {
+    if (!sModeRebuildPending) return;
+    sModeRebuildPending = NO;
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    if (now - sModeRebuildArmedAt > 120.0) return;   // 过期: 不在无关时机做全量刷新
+    // 标签迁移也必须重放 —— MKMigrateLocationMode 同样是窗口 BFS, 切模式那一刻在设置 App 内
+    // 一个 label 都遍历不到。顺序与 MKPrefsChangedCallback 内完全一致(先迁移、后重建),
+    // 迁移把「我们藏过的」复显、重建再按新模式重新藏 —— 同一 runloop 内的 model 写入,
+    // 中间不提交渲染, 故无闪。
+    MKMigrateLocationMode();
+    MKRebuildAllForModeSwitch();
+}
+
 static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observer,
                                     CFStringRef name, const void *object,
                                     CFDictionaryRef userInfo) {
@@ -4216,10 +4278,19 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     //  离屏残留问题一并消失(指示器直接不存在, 等该图标下次 layout 时按新模式新建)。
     //  MKRemoveAllIndicators 会清 sHiddenBids/sHiddenLabelToBid, 但 MKMigrateLocationMode 上一行
     //  刚跑完、本来就要清这两张表 → 语义不冲突。
+    //
+    // ★ v2.0.66.95: 上面这套【只在 SpringBoard 主屏当前可遍历时才完整成立】。
+    //   切模式的通知几乎总是在用户【还在设置 App 里】时抵达 → 窗口 BFS 一个图标也遍历不到,
+    //   于是「删掉了、没建回来」, 只有用户回桌面后那一页靠 layoutSubviews 补建 →
+    //   别页需要手动翻/点开才出现(用户 .94 实机报告)。故追加 pending 标记, 由
+    //   UIApplicationDidBecomeActiveNotification 在主屏真正活过来时补做重建。
+    //   立即那一趟仍保留: 若通知恰好在桌面态抵达(如从设置返回后再改, 或第三方工具改键),
+    //   它一趟就完事, pending 那次只是幂等重刷。
     if (modeChanged) {
         MKRemoveAllIndicators();
-        MKRefreshAllIcons();
-        MKRefreshFolderIcons();
+        sModeRebuildPending = YES;
+        sModeRebuildArmedAt = [NSDate date].timeIntervalSince1970;
+        MKRebuildAllForModeSwitch();
         return;
     }
     // v2.0.66.81: 角标参数(badgeCorner/thickness/inset)变更时刷新已存在的指示器。
@@ -5207,6 +5278,11 @@ static void MKRefreshFolderIcons(void) {
                         
                     }
                 }
+                // ★ v2.0.66.95: 跨模式重建补做 —— 必须放在下面 `if (!sLocked) return;` 之【前】。
+                //   切模式那一刻用户人在设置 App 里, SpringBoard 主屏不可遍历 → 那趟重建全落空;
+                //   从设置返回桌面走的正是「普通切 App 回前台」这条路(sLocked 恒为 NO),
+                //   若放在锁屏早退之后就永远消费不到。幂等: 无 pending 时零开销直接返回。
+                MKConsumeModeRebuildIfPending();
                 if (!sLocked) return;   // 非锁屏态（如普通切 App 回前台），不动
                 sLocked = NO;
                 // v2.0.66.32: 解锁即时 un-hide(原生携带), 圆点随原生锁屏揭开与主屏一同揭示, 统一解锁动画。
