@@ -575,13 +575,25 @@ static void MKLogBadgeGeometryOnce(SBIconView *iv, UIView *base, CGRect r) {
     if ([sGeoLogged containsObject:bid]) return;
     [sGeoLogged addObject:bid];
     sGeoCount++;
-    NSLog(@"[RDI-GEO] bid=%@ base=%@ baseBounds=%.1fx%.1f ivBounds=%.1fx%.1f rectInOv=(%.1f,%.1f %.1fx%.1f) rc=%.2f",
-          bid,
-          base ? NSStringFromClass([base class]) : @"(nil->ivSquareFallback)",
-          base ? base.bounds.size.width : 0.0, base ? base.bounds.size.height : 0.0,
-          iv.bounds.size.width, iv.bounds.size.height,
-          r.origin.x, r.origin.y, r.size.width, r.size.height,
-          MKIconCornerRadius((UIView *)iv));
+    // v2.0.66.100: 写入文件（Filza 可直接打开），不再依赖系统 syslog（roothide 默认无 /var/log/syslog）
+    NSString *line = [NSString stringWithFormat:
+        @"bid=%@ base=%@ baseBounds=%.1fx%.1f ivBounds=%.1fx%.1f rectInOv=(%.1f,%.1f %.1fx%.1f) rc=%.2f\n",
+        bid,
+        base ? NSStringFromClass([base class]) : @"(nil->ivSquareFallback)",
+        base ? base.bounds.size.width : 0.0, base ? base.bounds.size.height : 0.0,
+        iv.bounds.size.width, iv.bounds.size.height,
+        r.origin.x, r.origin.y, r.size.width, r.size.height,
+        MKIconCornerRadius((UIView *)iv)];
+    NSString *geoPath = @"/var/mobile/Documents/rdi_geo.log";
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:geoPath];
+    if (fh) {
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } else {
+        [line writeToFile:geoPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    NSLog(@"[RDI-GEO] %@", line); // 备用：有 syslog 时也能看到
 }
 
 static CGRect MKIndicatorFrameInOverlay(SBIconView *iv, UIView *overlay, MKConfig *cfg) {
