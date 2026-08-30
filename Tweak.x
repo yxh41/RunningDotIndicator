@@ -581,16 +581,6 @@ static void MKLogBadgeGeometryOnce(SBIconView *iv, UIView *base, CGRect r) {
     if ([sGeoLogged containsObject:bid]) return;
     [sGeoLogged addObject:bid];
     sGeoCount++;
-    // v2.0.66.100: 写入文件（Filza 可直接打开），不再依赖系统 syslog（roothide 默认无 /var/log/syslog）
-    NSString *line = [NSString stringWithFormat:
-        @"bid=%@ base=%@ baseBounds=%.1fx%.1f ivBounds=%.1fx%.1f rectInOv=(%.1f,%.1f %.1fx%.1f) rc=%.2f\n",
-        bid,
-        base ? NSStringFromClass([base class]) : @"(nil->ivSquareFallback)",
-        base ? base.bounds.size.width : 0.0, base ? base.bounds.size.height : 0.0,
-        iv.bounds.size.width, iv.bounds.size.height,
-        r.origin.x, r.origin.y, r.size.width, r.size.height,
-        MKIconCornerRadius((UIView *)iv)];
-    line = [line stringByAppendingString:candDump];
     // v2.0.66.102: base 为 nil 时, 额外 dump 该 iv 的全部图片视图候选类名,
     //   供确认时钟/天气等动态图标的真实图片视图类名(若 strstr 仍漏则下一行直接暴露)。
     NSString *candDump = @"";
@@ -605,6 +595,16 @@ static void MKLogBadgeGeometryOnce(SBIconView *iv, UIView *base, CGRect r) {
             candDump = @" CAND=(none)";
         }
     }
+    // v2.0.66.100: 写入文件（Filza 可直接打开），不再依赖系统 syslog（roothide 默认无 /var/log/syslog）
+    NSString *line = [NSString stringWithFormat:
+        @"bid=%@ base=%@ baseBounds=%.1fx%.1f ivBounds=%.1fx%.1f rectInOv=(%.1f,%.1f %.1fx%.1f) rc=%.2f\n",
+        bid,
+        base ? NSStringFromClass([base class]) : @"(nil->ivSquareFallback)",
+        base ? base.bounds.size.width : 0.0, base ? base.bounds.size.height : 0.0,
+        iv.bounds.size.width, iv.bounds.size.height,
+        r.origin.x, r.origin.y, r.size.width, r.size.height,
+        MKIconCornerRadius((UIView *)iv)];
+    line = [line stringByAppendingString:candDump];
     NSString *geoPath = @"/var/mobile/Documents/rdi_geo.log";
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:geoPath];
     if (fh) {
