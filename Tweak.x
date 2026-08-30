@@ -334,29 +334,28 @@ static UIView *MKBadgeBaseView(UIView *iv) {
     return nil;   // 全部判废 → 调用方兜底(iv 顶部正方形)
 }
 // 取图标图片真实圆角（continuousCornerRadius，iOS13+ 图标圆角真正来源；普通 cornerRadius 常为 0）
+// v2.0.66.99: 角标圆角比例 —— 与 Preferences/MKRootListController.m 的 kIconRadius(12.0f) /
+//   kIconSize(52.0f) 【逐字同构】(12/52 ≈ 0.23077)。两个独立二进制不共享 static, 各留等价
+//   常量(沿用 MKLerpP/MKBezierSplit ↔ MKPvLerp/MKPvSplit 的既有做法)。
+//   🔴 桌面【不再读 layer】求圆角 —— 理由见 MKIconCornerRadius 函数内说明。
+static const CGFloat MKBadgeCornerRatio = 12.0f / 52.0f;
 static CGFloat MKIconCornerRadius(UIView *iv) {
-    UIView *imv = MKBadgeBaseView(iv);   // v2.0.66.84: 用带判废的基准视图，避免取到迷你图标的小圆角
+    UIView *imv = MKBadgeBaseView(iv);   // v2.0.66.84: 用带判废的基准视图, 避免取到迷你图标的小尺寸
     UIView *target = imv ?: iv;
     // v2.0.66.84: m 按图标图片正方形边长算（不用含名字区的 SBIconView 高度）
     CGFloat m = imv ? MIN(target.bounds.size.width, target.bounds.size.height)
                     : target.bounds.size.width;
     if (m <= 0) return 0;
-    CALayer *layer = target.layer;
-    CGFloat rc = 0;
-    if ([layer respondsToSelector:@selector(continuousCornerRadius)]) {
-        NSNumber *cr = [layer valueForKey:@"continuousCornerRadius"];
-        if (cr && [cr floatValue] > 0) rc = [cr floatValue];
-    }
-    if (rc <= 0 && layer.cornerRadius > 0) rc = layer.cornerRadius;
-    if (rc <= 0) rc = m * 0.225f;   // 连续圆角等效半径 ≈ 边长 22.37%
-    // v2.0.66.98: 【安全上限】—— iOS 全部 App 图标统一走 squircle mask, 圆角占边长比例恒定
-    //   (约 22.37%, 正是上面兜底值的来源)。若读到远超它的值(典型是 W/2, 即某个 image view
-    //   被设成了圆形), 弧线就会沿那个大圆角外扩, 视觉上浮在图标外面 —— 用户实机「时钟 App
-    //   距离调整为 0 了还离那么远」正是此症。上限取 0.30(高于 0.2237 留容错, 远低于 0.5),
-    //   对正常图标恒不触发, 只拦下取值异常的图标。
-    CGFloat hi = m * 0.30f;
-    if (rc > hi) rc = hi;
-    return rc;
+    // v2.0.66.99: 【不再读 layer】—— 原实现优先读 layer.continuousCornerRadius(其次 cornerRadius),
+    //   读不到才兜底固定比例。而【设置页实时预览从不读 layer】(`updateBadgePreview` 内直接
+    //   `CGFloat rc = kIconRadius;`, 一个固定常量) → 两边输入不同 → 预览严丝合缝、桌面个别图标
+    //   弧线飘在图标外面(用户实机: 时钟 App「距离调整成 0 了还离那么远」, 且同一张截图里日历
+    //   的弧线也看得出不够贴)。
+    //   .98 试过给读到的值加 0.30 上限钳位, 【无效】—— 说明偏的不是"rc 读大了", 而是"读 layer"
+    //   这个输入源本身与预览不同构。iOS 全部 App 图标统一走 squircle mask, 圆角占边长比例恒定,
+    //   读 layer 带来的只是不可控偏差。故回退为与预览完全相同的固定比例。
+    //   这是 .87/.88「只改桌面没改预览 → 预览比桌面好看」的镜像版本, 教训一致: 两边必须同构。
+    return m * MKBadgeCornerRatio;
 }
 // 角标模式下不抢名字位置 → 所有藏名逻辑统一失效
 static BOOL MKHideNames(void) {
@@ -4300,9 +4299,16 @@ static NSTimeInterval sModeRebuildArmedAt = 0;   // 武装时刻(超 120s 视为
 static void MKRebuildAllForModeSwitch(void) {
     MKRefreshAllIcons();
     MKRefreshFolderIcons();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+    // v2.0.66.99: 波次由「0.6s / 1.5s 两波」加密提前为「0.3s / 0.8s / 1.8s 三波」。
+    //   实机: 回桌面那一刻视图刚恢复、尚未布局完, 首波大概率落空 → 原来要等 0.6s 才补上,
+    //   用户感知「更新新模式比较慢」; 而这段空窗里名字已经显示、指示器还没换过来
+    //   = 用户看到的「指示器跟名称重叠」。加密后收敛更快, 空窗更短。
+    //   纯时序调整, 不动任何判定逻辑: 每一波都只是幂等重刷。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ MKRefreshAllIcons(); MKRefreshFolderIcons(); });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ MKRefreshAllIcons(); MKRefreshFolderIcons(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ MKRefreshAllIcons(); MKRefreshFolderIcons(); });
 }
 // %ctor 内 becomeActive 观察者调用(定义在此、使用在后, 满足 -Werror 先声明后使用)

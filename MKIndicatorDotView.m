@@ -11,6 +11,11 @@
 // v2.0.66.82: 见 MKIndicatorDotView.h 声明
 const CGFloat MKBadgeFrameExtra = 15.0f;
 
+// v2.0.66.99: 与 Preferences/MKRootListController.m 的 kIconRadius(12.0f) / kIconSize(52.0f)
+//   同构的圆角比例(12/52 ≈ 0.23077); 与 Tweak.x 的 MKBadgeCornerRatio 等价。
+//   两个独立二进制不共享 static, 各留等价常量(同 MKLerpP/MKBezierSplit ↔ MKPvLerp/MKPvSplit)。
+static const CGFloat MKDotCornerRatio = 12.0f / 52.0f;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // v2.0.66.91: 三次贝塞尔【子曲线提取】(de Casteljau) —— 角标弧线长度调节的数学基础。
 //
@@ -111,7 +116,9 @@ static void MKBezierSub(const CGPoint p[4], CGFloat t0, CGFloat t1, CGPoint out[
         if (W < 1) W = rect.size.width;
         if (H < 1) H = rect.size.height;
         CGFloat rc = self.iconCornerRadius;
-        if (rc <= 0) rc = MIN(W, H) * 0.2237f;   // 连续圆角等效半径 ≈ 边长 22.37%
+        // v2.0.66.99: 比例必须与设置页预览【同构】(12/52)。原 0.2237 与预览的 12/52(≈0.23077)
+        //   不同, 也是"预览贴得好、桌面飘"的来源之一; 桌面侧 MKIconCornerRadius 亦已不再读 layer。
+        if (rc <= 0) rc = MIN(W, H) * MKDotCornerRatio;
         // 钳位：弧线端点沿边跨度 rc 不得越过半边中点，否则两端自相交（极小图标兜底）
         CGFloat halfMin = MIN(W, H) * 0.5f;
         if (halfMin > 0 && rc > halfMin) rc = halfMin;
