@@ -289,46 +289,74 @@ static UIView *MKOverlayForContainer(UIView *container) {
 // v2.0.66.81: 原 strncmp(n,"SBIconImage",12) 比较长度写成12，"SBIconImage" 仅11字符+null=12，
 //   第12字节 '\0' 与任何 SBIconImage* 类名第12字节(字母)不等 → 恒不匹配 → 永远回退到 SBIconView
 //   (含名字标签区) → 左下/右下弧线圆心下移名字高度，"距离远"。修：长度改11 + 递归查找兜底嵌套。
-static UIView *MKIconImageView(UIView *iv) {
-    if (!iv) return nil;
+// v2.0.66.98: 收集【全部】图标图片视图候选（不再命中第一个就返回）。
+//   原 MKBadgeBaseView 一旦判废(bw < ivw*0.5)就没有第二次机会, 只能兜底到 iv 顶部正方形 ——
+//   用户实机「时钟 App 距离调成 0 了弧线还离那么远」即疑似走了兜底路径(而实时预览贴得很好,
+//   说明几何公式本身无误, 是桌面取到的 base/rc 不对)。改为收集全部候选后按宽度降序挑第一个
+//   不判废的: 对正常图标(第一个候选就不判废)行为【完全不变】, 只给「首个候选恰好是残缺/
+//   迷你视图」的图标一次正确的补救。
+static void MKIconImageViewCandidates(UIView *iv, NSMutableArray *out) {
+    if (!iv) return;
     for (UIView *sub in iv.subviews) {
         const char *n = class_getName([sub class]);
         // v2.0.66.84: 文件夹图标的图片视图类名是 SBFolderIconImageView（不以 SBIconImage 开头），
         //   而它内部嵌着一格格迷你 App 图标、每个迷你图标各自带 SBIconImageView。
         //   原实现深度优先递归 → 先命中【迷你图标】的 SBIconImageView 就返回 → 角标按迷你图标
-        //   (约 1/3 尺寸、位于文件夹内部) 的 bounds 定位 → 文件夹 4 个角全部"距离远"。
+        //   (约 1/3 尺寸、位于文件夹内部) 的 bounds 定位 → 文件夹 4 个角全部“距离远”。
         //   修：先比 SBFolderIconImage 前缀，保证在钻进缩略图之前就命中文件夹本体图片视图。
-        if (strncmp(n, "SBFolderIconImage", 17) == 0) return sub;
-        if (strncmp(n, "SBIconImage", 11) == 0) return sub;
-        UIView *found = MKIconImageView(sub);   // 递归兜底：crossfade 等容器嵌套
-        if (found) return found;
+        if (strncmp(n, "SBFolderIconImage", 17) == 0) { [out addObject:sub]; continue; }
+        if (strncmp(n, "SBIconImage", 11) == 0) { [out addObject:sub]; continue; }
+        MKIconImageViewCandidates(sub, out);   // 递归兜底：crossfade 等容器嵌套
     }
-    return nil;
 }
 // v2.0.66.84: 角标定位基准视图。若命中的图片视图宽度明显小于图标视图（说明仍误命中了
-// 文件夹缩略图内的迷你图标，或该系统版本类名不符预期），返回 nil 让调用方走正方形兜底。
+// 文件夹缩略图内的迷你图标，或该系统版本类名不符预期），判废并【换下一个候选】；
+// v2.0.66.98: 全部判废才返回 nil 让调用方走正方形兜底。
 static UIView *MKBadgeBaseView(UIView *iv) {
-    UIView *base = MKIconImageView(iv);
-    if (!base) return nil;
-    CGFloat bw = base.bounds.size.width;
-    CGFloat ivw = iv ? iv.bounds.size.width : 0;
-    if (ivw > 1.0f && bw < ivw * 0.5f) return nil;   // 误命中迷你图标 → 判废
-    return base;
+    if (!iv) return nil;
+    NSMutableArray *cands = [NSMutableArray array];
+    MKIconImageViewCandidates(iv, cands);
+    if (cands.count == 0) return nil;
+    CGFloat ivw = iv.bounds.size.width;
+    if (cands.count > 1) {
+        [cands sortUsingComparator:^NSComparisonResult(UIView *a, UIView *b) {
+            CGFloat aw = a.bounds.size.width, bwid = b.bounds.size.width;
+            if (aw > bwid) return NSOrderedAscending;    // 宽度降序：最大的最先试
+            if (aw < bwid) return NSOrderedDescending;
+            return NSOrderedSame;
+        }];
+    }
+    for (UIView *c in cands) {
+        CGFloat bw = c.bounds.size.width;
+        if (ivw > 1.0f && bw < ivw * 0.5f) continue;   // 误命中迷你图标 → 判废, 换下一个候选
+        return c;
+    }
+    return nil;   // 全部判废 → 调用方兜底(iv 顶部正方形)
 }
 // 取图标图片真实圆角（continuousCornerRadius，iOS13+ 图标圆角真正来源；普通 cornerRadius 常为 0）
 static CGFloat MKIconCornerRadius(UIView *iv) {
     UIView *imv = MKBadgeBaseView(iv);   // v2.0.66.84: 用带判废的基准视图，避免取到迷你图标的小圆角
     UIView *target = imv ?: iv;
-    CALayer *layer = target.layer;
-    if ([layer respondsToSelector:@selector(continuousCornerRadius)]) {
-        NSNumber *cr = [layer valueForKey:@"continuousCornerRadius"];
-        if (cr && [cr floatValue] > 0) return [cr floatValue];
-    }
-    if (layer.cornerRadius > 0) return layer.cornerRadius;
-    // v2.0.66.84: 兜底按图标图片正方形边长算（不用含名字区的 SBIconView 高度）
+    // v2.0.66.84: m 按图标图片正方形边长算（不用含名字区的 SBIconView 高度）
     CGFloat m = imv ? MIN(target.bounds.size.width, target.bounds.size.height)
                     : target.bounds.size.width;
-    return m * 0.225f;
+    if (m <= 0) return 0;
+    CALayer *layer = target.layer;
+    CGFloat rc = 0;
+    if ([layer respondsToSelector:@selector(continuousCornerRadius)]) {
+        NSNumber *cr = [layer valueForKey:@"continuousCornerRadius"];
+        if (cr && [cr floatValue] > 0) rc = [cr floatValue];
+    }
+    if (rc <= 0 && layer.cornerRadius > 0) rc = layer.cornerRadius;
+    if (rc <= 0) rc = m * 0.225f;   // 连续圆角等效半径 ≈ 边长 22.37%
+    // v2.0.66.98: 【安全上限】—— iOS 全部 App 图标统一走 squircle mask, 圆角占边长比例恒定
+    //   (约 22.37%, 正是上面兜底值的来源)。若读到远超它的值(典型是 W/2, 即某个 image view
+    //   被设成了圆形), 弧线就会沿那个大圆角外扩, 视觉上浮在图标外面 —— 用户实机「时钟 App
+    //   距离调整为 0 了还离那么远」正是此症。上限取 0.30(高于 0.2237 留容错, 远低于 0.5),
+    //   对正常图标恒不触发, 只拦下取值异常的图标。
+    CGFloat hi = m * 0.30f;
+    if (rc > hi) rc = hi;
+    return rc;
 }
 // 角标模式下不抢名字位置 → 所有藏名逻辑统一失效
 static BOOL MKHideNames(void) {
@@ -4279,6 +4307,9 @@ static void MKRebuildAllForModeSwitch(void) {
 }
 // %ctor 内 becomeActive 观察者调用(定义在此、使用在后, 满足 -Werror 先声明后使用)
 // 注: MKMigrateLocationMode 定义就在本块【上方】, 无需前向声明。
+// v2.0.66.98 (E-2): MKMigrateIndicatorsInPlace 的定义在本块【下方】(见 .97 (D) 一节),
+//   故此处必须前向声明, 否则 -Werror 报 "no previous prototype / used before definition"。
+static void MKMigrateIndicatorsInPlace(MKConfig *cfg);
 static void MKConsumeModeRebuildIfPending(void) {
     if (!sModeRebuildPending) return;
     sModeRebuildPending = NO;
@@ -4289,6 +4320,13 @@ static void MKConsumeModeRebuildIfPending(void) {
     // 迁移把「我们藏过的」复显、重建再按新模式重新藏 —— 同一 runloop 内的 model 写入,
     // 中间不提交渲染, 故无闪。
     MKMigrateLocationMode();
+    // ★ v2.0.66.98 (E-2): 指示器迁移【必须】在这一刻做, 而不是在 prefs 回调里做。
+    //   此刻用户已上滑回桌面, 其他页的 SBIconView 已回到容器子树 → 一趟 BFS 覆盖所有页,
+    //   反查不再落空(在设置 App 内做则其他页全进 orphans 被删, 即 .97 的实机症状)。
+    //   必须排在 MKMigrateLocationMode【之后】: 后者会清空 sHiddenBids / 标签关联表,
+    //   而 D 内部要按新模式重新登记 sHiddenBids —— 顺序颠倒会被随后的清空抹掉。
+    //   随后三波 refresh 负责补齐此刻仍不在任何 overlay 上的图标, 以及校正过渡态几何。
+    MKMigrateIndicatorsInPlace([MKConfig sharedConfig]);
     MKRebuildAllForModeSwitch();
 }
 
@@ -4481,17 +4519,25 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     //   它一趟就完事, pending 那次只是幂等重刷。
     // ★ v2.0.66.97 (D): 跨模式改为【原地迁移】, 不再 MKRemoveAllIndicators 全删。
     //   上面 .92/.95 那套的病根是「删除无条件成功、重建条件成功」的不对称(详见
-    //   MKMigrateIndicatorsInPlace 上方论证)。现改为按 overlay 锚点原地改写已有指示器 ——
-    //   不碰 [UIApplication windows]、不依赖 becomeActive、不依赖 layoutSubviews,
-    //   且因主屏所有页共用同一个 overlay, 一趟即覆盖所有页。
-    //   反查失败的个别指示器才删(函数内 orphans), 最坏退化为 .96 行为。
-    //   后续 MKRefreshAllIcons/MKRefreshFolderIcons 与 pending 波次全部保留为幂等再同步:
-    //   迁移已保证「立即正确」, 它们只负责补齐迁移时不在任何 overlay 上的图标。
+    //   MKMigrateIndicatorsInPlace 上方论证)。现改为按 overlay 锚点原地改写已有指示器。
+    //
+    // ★ v2.0.66.98 (E-2): D 的【执行时机】同样错了 —— 从本回调挪到 becomeActive 消费点。
+    //   .97 把 D 放在这里, 逻辑上不依赖前台状态(不碰 [UIApplication windows]、不等
+    //   layoutSubviews), 但实机证明前提不成立: 通知抵达时用户还在设置 App 内, 【其他页的
+    //   SBIconView 并不在容器子树里】 → MKBidToIconViewUnderOverlay 反查落空 → 那些指示器
+    //   进 orphans 被 MKRemoveIndicatorForBid 删掉 → 回桌面后只剩当前页, 其他页要等自然
+    //   refresh(打开文件夹即触发)才重建 —— 与 .92 同病, 只是换了个触发条件。
+    //   dock 不受影响, 因为 dock 图标在设置 App 期间也不卸载(用户实机: 「dock 不会这样」)。
+    //
+    //   而 becomeActive 那一刻(上滑回桌面)其他页【是可达的】—— 用户实测「打开文件夹就刷新
+    //   出来」证明 refresh 能命中它们; 当前屏能立马好则证明该通知确实派发。把 D 挪到消费点,
+    //   一趟容器子树 BFS 即覆盖所有页; 紧随的三波 refresh 作幂等再同步与补齐。
+    //
+    //   此处只标记 pending, 不迁移也不删除 —— 此刻用户看不见桌面, 晚一点执行零代价,
+    //   而在这里执行的唯一后果就是把反查不到的其他页删掉(.97 的实机症状)。
     if (modeChanged) {
-        MKMigrateIndicatorsInPlace([MKConfig sharedConfig]);
         sModeRebuildPending = YES;
         sModeRebuildArmedAt = [NSDate date].timeIntervalSince1970;
-        MKRebuildAllForModeSwitch();
         return;
     }
     // v2.0.66.81: 角标参数(badgeCorner/thickness/inset)变更时刷新已存在的指示器。
