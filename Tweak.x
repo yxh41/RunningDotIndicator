@@ -229,6 +229,9 @@ static void MKInstallLabelHook(void);
 static void MKCacheGeoForBid(NSString *bid, SBIconView *iv, UIView *overlay, MKConfig *cfg);
 static CGRect MKIndicatorFrameFromCache(NSString *bid, UIView *overlay, MKConfig *cfg);
 static CGFloat MKIconCornerRadiusFromCache(NSString *bid);
+static void MKScheduleGeoCacheSave(void);   // v2.0.66.107: 几何缓存去抖落盘(定义在 MKIconCornerRadiusFromCache 之后)
+static void MKLoadGeoCache(void);           // v2.0.66.107: 启动时读回几何缓存
+static void MKRehideNamesForModeSwitch(void); // v2.0.66.107: 切回替换模式补登藏名权威
 
 // v1.6.75: 锁屏后兜底「解锁复原」定时器句柄（不依赖 iOS 解锁通知/布局事件）
 static dispatch_source_t sUnlockTimer = NULL;
@@ -654,6 +657,7 @@ static void MKCacheGeoForBid(NSString *bid, SBIconView *iv, UIView *overlay, MKC
         if (!sBidToReplaceR) sBidToReplaceR = [NSMutableDictionary dictionary];
         sBidToReplaceR[bid] = [NSValue valueWithCGRect:rr];
     }
+    MKScheduleGeoCacheSave();   // v2.0.66.107: 去抖落盘(跨 respring 保留几何缓存)
 }
 // v2.0.66.103: 离屏图标(反查失败)用缓存几何原地重画, 不删。overlay 即指示器当前 superview(坐标一致)。
 static CGRect MKIndicatorFrameFromCache(NSString *bid, UIView *overlay, MKConfig *cfg) {
@@ -675,6 +679,82 @@ static CGRect MKIndicatorFrameFromCache(NSString *bid, UIView *overlay, MKConfig
 static CGFloat MKIconCornerRadiusFromCache(NSString *bid) {
     NSNumber *n = sBidToBadgeRC ? sBidToBadgeRC[bid] : nil;
     return n ? [n floatValue] : 0.0f;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// v2.0.66.107: 几何缓存落盘(跨 respring 保留)
+// ────────────────────────────────────────────────────────────────────
+// 原缓存只存内存, respring 即丢 → 重启后【第一次】切模式是冷缓存最差情况:
+// 没翻过的页既无缓存又无 live iv → MKMigrateIndicatorsInPlace 只能 continue 跳过,
+// 保持旧样式直到用户翻到那页(「部分 App/文件夹更新慢」最可能的真身)。落盘后重启即热。
+//
+// 安全性(两条保证, 故零错配风险):
+//  ① MKUpdate(L3713 附近) / MKRepositionIndicator 每次图标可见都用 live iv 覆写缓存,
+//     所以即使用户挪动/增删过图标, 过期条目也会在该图标下次可见时被自动纠正;
+//     缓存只在【没有 live iv】时才被 MKMigrateIndicatorsInPlace 采用。
+//  ② 落盘同时记屏幕尺寸, 读回时尺寸不符(转屏/换机 → 图标网格已变)整份丢弃 ——
+//     宁可退回冷启动, 也绝不让旧坐标把指示器放到错位置。
+static NSString * const kRDIGeoCachePath = @"/var/mobile/Documents/rdi_geocache.plist";
+static BOOL sGeoSaveScheduled = NO;
+
+// 🔴 NSValue(CGRect) 不是 plist 类型 —— 直接 writeToFile: 会【静默失败】返回 NO。
+//    故统一用 NSStringFromCGRect / CGRectFromString 转成 NSString 存取。
+static NSDictionary *MKRectDictToStrings(NSDictionary *src) {
+    NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:src.count];
+    for (id k in src) {
+        id v = [src objectForKey:k];
+        if ([k isKindOfClass:[NSString class]] && [v isKindOfClass:[NSValue class]]) {
+            [out setObject:NSStringFromCGRect([(NSValue *)v CGRectValue]) forKey:(NSString *)k];
+        }
+    }
+    return out;
+}
+static NSMutableDictionary *MKRectDictFromStrings(NSDictionary *src) {
+    NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:src.count];
+    for (id k in src) {
+        id v = [src objectForKey:k];
+        if ([k isKindOfClass:[NSString class]] && [v isKindOfClass:[NSString class]]) {
+            CGRect r = CGRectFromString((NSString *)v);
+            if (!CGRectIsNull(r)) [out setObject:[NSValue valueWithCGRect:r] forKey:(NSString *)k];
+        }
+    }
+    return out;
+}
+static void MKSaveGeoCache(void) {
+    if (!sBidToBadgeR && !sBidToReplaceR) return;
+    NSMutableDictionary *root = [NSMutableDictionary dictionary];
+    if (sBidToBadgeR.count)   [root setObject:MKRectDictToStrings(sBidToBadgeR)   forKey:@"badgeR"];
+    if (sBidToBadgeRC.count)  [root setObject:sBidToBadgeRC                       forKey:@"badgeRC"];
+    if (sBidToReplaceR.count) [root setObject:MKRectDictToStrings(sBidToReplaceR) forKey:@"replaceR"];
+    CGSize sz = [UIScreen mainScreen].bounds.size;
+    [root setObject:@(sz.width)  forKey:@"screenW"];
+    [root setObject:@(sz.height) forKey:@"screenH"];
+    [root writeToFile:kRDIGeoCachePath atomically:YES];
+}
+// 去抖: 连续滚动/布局期间只在安静 3s 后落一次盘, 避免频繁写文件拖慢 SpringBoard
+static void MKScheduleGeoCacheSave(void) {
+    if (sGeoSaveScheduled) return;
+    sGeoSaveScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        sGeoSaveScheduled = NO;
+        MKSaveGeoCache();
+    });
+}
+static void MKLoadGeoCache(void) {
+    NSDictionary *root = [NSDictionary dictionaryWithContentsOfFile:kRDIGeoCachePath];
+    if (![root isKindOfClass:[NSDictionary class]]) return;
+    CGSize sz = [UIScreen mainScreen].bounds.size;
+    CGFloat w = [[root objectForKey:@"screenW"] floatValue];
+    CGFloat h = [[root objectForKey:@"screenH"] floatValue];
+    // 屏幕尺寸不符 → 图标网格已变, 整份作废(见上方安全性 ②)
+    if (w <= 0 || h <= 0 || fabs(w - sz.width) > 0.5f || fabs(h - sz.height) > 0.5f) return;
+    NSDictionary *br = [root objectForKey:@"badgeR"];
+    NSDictionary *bc = [root objectForKey:@"badgeRC"];
+    NSDictionary *rr = [root objectForKey:@"replaceR"];
+    if ([br isKindOfClass:[NSDictionary class]] && br.count) sBidToBadgeR   = MKRectDictFromStrings(br);
+    if ([bc isKindOfClass:[NSDictionary class]] && bc.count) sBidToBadgeRC  = [bc mutableCopy];
+    if ([rr isKindOfClass:[NSDictionary class]] && rr.count) sBidToReplaceR = MKRectDictFromStrings(rr);
 }
 
 // v1.6.75: 前向声明（MKFolderChosenBid 依赖，定义在文件后部）
@@ -4274,6 +4354,9 @@ static void MKDelayedInit() {
     
     
 
+    // ─── v2.0.66.107: 读回落盘的几何缓存(必须在首次刷新之前, 让切模式迁移一上来就有热缓存) ──────
+    MKLoadGeoCache();
+
     // ─── 标记初始化完成 ──────
     sInitDone = YES;
     
@@ -4518,7 +4601,54 @@ static void MKMigrateIndicatorsInPlace(MKConfig *cfg) {
             dot.frame = f;
             dot.hidden = NO;
             [dot applyConfig];   // alpha = cfg.opacity + setNeedsDisplay(按新模式重画)
-            // 名字归属: 离屏无 iv, 由 MKUpdate 在页面可见时按新模式重藏; 此处只管几何/绘制, 不碰 label。
+            // 名字归属: 离屏无 iv, 补登记由下方 MKRehideNamesForModeSwitch 统一处理。
+        }
+    });
+    });
+}
+
+// ────────────────────────────────────────────────────────────────────
+// v2.0.66.107: 切【回】替换模式时立刻补登藏名权威 + 主动藏已可见的 label
+// ────────────────────────────────────────────────────────────────────
+// 症状(用户实机): 角标 → 替换 切换时「部分运行 App 的名称隐藏不及时」。
+//
+// 根因链(已逐条核对源码):
+//  ① 藏名的【权威】是 sHiddenBids —— 源级 setHidden/setAlpha/创建钩子的判据全是
+//     `bid ∈ sHiddenBids`(见 L2587 / L2777 / L2986 / L4845 等)。
+//  ② 切到角标时 MKMigrateLocationMode 会把 sHiddenBids 清空(角标模式「恒空」是其不变量)。
+//  ③ 而 sHiddenBids 的写入点【只在 MKUpdate 内部】。
+//  ④ MKMigrateIndicatorsInPlace 按设计不碰 label(名字归属原交给「页面可见时的 MKUpdate」)。
+//  ⇒ 在设置里切模式时, MKRefreshAllIcons 够不到的那些图标视图(离屏页/转场态)跑不到 MKUpdate,
+//    其 bid 就进不了 sHiddenBids → 所有源级钩子都不认它 → 名字一直亮到用户翻到那一页。
+//
+// 修法(两路互补, 都不依赖窗口树):
+//  (a) 权威补登: 把「有指示器 且 在运行」的 bid 直接写回 sHiddenBids —— 此后任何钩子/创建路径
+//      都会按权威藏名; 连从未访问过的页(其 label 将来被创建时)也会被创建钩子立刻藏住。
+//  (b) 主动藏: 经弱引用注册表 sBidToIconView 拿到 iv(不依赖窗口层级)→ 取其 label 直接藏,
+//      覆盖「label 已存在、但此刻没有任何系统事件去触发钩子」的情况。
+static void MKRehideNamesForModeSwitch(void) {
+    if (!MKHideNames()) return;   // 角标模式不抢名字位, 无需处理
+    MKWithoutImplicitActions(^{   // 🔴 批量写 label 必须禁隐式动画(.100), 否则 0.25s 飘移 + 名字重叠
+    MKSafe(^{
+        if (!sBidToIndicator) return;
+        if (!sHiddenBids) sHiddenBids = [NSMutableSet set];
+        NSArray *bids = [[sBidToIndicator keyEnumerator] allObjects];
+        for (NSString *bid in bids) {
+            if (![bid isKindOfClass:[NSString class]] || bid.length == 0) continue;
+            if (!MKIsAppRunning(bid)) continue;   // 只藏运行中的(文件夹合成 key __folder__%p 亦被此过滤)
+            [sHiddenBids addObject:bid];          // (a) 权威补登
+            // (b) 主动藏已可见 label —— 经弱引用注册表, 不依赖窗口树
+            SBIconView *iv = sBidToIconView ? [sBidToIconView objectForKey:bid] : nil;
+            if (iv && [iv isKindOfClass:MKSBIconViewClass()]) {
+                UIView *lbl = MKGetCachedLabel(iv);
+                if (lbl) {
+                    lbl.hidden = YES;
+                    lbl.alpha = 0.0f;
+                    lbl.layer.opacity = 0.0f;
+                    lbl.opaque = NO;                 // .90: 全工程清 opaque(防闪)
+                    MKAssocLabelBid(lbl, bid);       // 种回直接关联键, 使源级钩子稳定命中
+                }
+            }
         }
     });
     });
@@ -4616,6 +4746,9 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         //   代价: 视图树不可达的离屏页仍无能为力(硬下限, 需从图标模型直接算几何的 B 方案)——本版先上低成本 A。
         MKMigrateIndicatorsInPlace([MKConfig sharedConfig]);
         MKRefreshAllIcons();
+        // v2.0.66.107: MKRefreshAllIcons 够不到的图标视图不会被 MKUpdate 重新登记藏名权威,
+        //   需在此补登 sHiddenBids + 经弱引用注册表主动藏 label(修「切回替换模式名称隐藏不及时」)。
+        MKRehideNamesForModeSwitch();
         return;
     }
     // v2.0.66.81: 角标参数(badgeCorner/thickness/inset)变更时刷新已存在的指示器。
