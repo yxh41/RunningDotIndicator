@@ -330,7 +330,13 @@ static void MKIconImageViewCandidates(UIView *iv, NSMutableArray *out) {
         //   (约 1/3 尺寸、位于文件夹内部) 的 bounds 定位 → 文件夹 4 个角全部“距离远”。
         //   修：先比 SBFolderIconImage 前缀，保证在钻进缩略图之前就命中文件夹本体图片视图。
         if (strncmp(n, "SBFolderIconImage", 17) == 0) { [out addObject:sub]; continue; }
-        if (strncmp(n, "SBIconImage", 11) == 0) { [out addObject:sub]; continue; }
+        // v2.0.66.102: 前缀 "SBIconImage" 漏掉时钟/天气等动态图标的图片视图
+        //   (类名形如 SBClockIconImageView / SBWeatherIconImageView, 含 "IconImage" 但不在前缀) →
+        //   MKBadgeBaseView 返回 nil → 角标走全 60x60 正方形兜底 → 弧线离图标圆角远。
+        //   改 strstr 子串匹配, 同时命中 SBIconImageView / SBIconImageCrossfadeView /
+        //   SBClockIconImageView / SBWeatherIconImageView 等; SBIconView / SBIconLabelView 不含
+        //   "IconImage" 子串, 不会误中。
+        if (strstr(n, "IconImage") != NULL) { [out addObject:sub]; continue; }
         MKIconImageViewCandidates(sub, out);   // 递归兜底：crossfade 等容器嵌套
     }
 }
@@ -584,6 +590,21 @@ static void MKLogBadgeGeometryOnce(SBIconView *iv, UIView *base, CGRect r) {
         iv.bounds.size.width, iv.bounds.size.height,
         r.origin.x, r.origin.y, r.size.width, r.size.height,
         MKIconCornerRadius((UIView *)iv)];
+    line = [line stringByAppendingString:candDump];
+    // v2.0.66.102: base 为 nil 时, 额外 dump 该 iv 的全部图片视图候选类名,
+    //   供确认时钟/天气等动态图标的真实图片视图类名(若 strstr 仍漏则下一行直接暴露)。
+    NSString *candDump = @"";
+    if (!base) {
+        NSMutableArray *cands = [NSMutableArray array];
+        MKIconImageViewCandidates((UIView *)iv, cands);
+        if (cands.count) {
+            NSMutableArray *names = [NSMutableArray array];
+            for (UIView *c in cands) [names addObject:NSStringFromClass([c class])];
+            candDump = [NSString stringWithFormat:@" CAND=(%@)", [names componentsJoinedByString:@","]];
+        } else {
+            candDump = @" CAND=(none)";
+        }
+    }
     NSString *geoPath = @"/var/mobile/Documents/rdi_geo.log";
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:geoPath];
     if (fh) {
