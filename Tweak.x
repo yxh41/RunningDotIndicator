@@ -194,6 +194,11 @@ static NSMapTable *sBidToIndicator;
 static NSMapTable *sHiddenLabelToBid = nil;   // v2.0.7+GAP-FIX: label(weak key) -> bid(strong) map; records a label that must stay hidden
      // bid(NSString) -> 指示器(UIView) 强引用，跨回收存活
 static NSMapTable *sContainerToOverlay; // 滚动容器(UIScrollView) -> overlay(UIView) 弱->强
+// v2.0.66.103: 几何缓存 —— 图标视图离屏/被回收时, 仍能用「上次可见时」缓存的 overlay 坐标几何原地重画指示器,
+//   覆盖「切模式后所有页即时更新」(不再因反查失败删离屏指示器、需手动切屏)。图标位置不随滚动/卸载变化 → 缓存永久有效。
+static NSMutableDictionary<NSString*, NSValue*>  *sBidToBadgeR   = nil; // bid -> CGRect(角标 rectInOv, 预扩 MKBadgeFrameExtra 之前)
+static NSMutableDictionary<NSString*, NSNumber*> *sBidToBadgeRC  = nil; // bid -> rc(角标圆角)
+static NSMutableDictionary<NSString*, NSValue*>  *sBidToReplaceR = nil; // bid -> CGRect(替换 label/iv rectInOv)
 // v1.6.61: 文件夹是否处于打开态（由 SBFolderView -didMoveToWindow 维护）。
 // 仅当为 YES 时才允许把图标判定为"在文件夹内"，消除主屏图标被误判。
 // 声明提前到此处，确保 MKIsIconInFolder()(v1.6.67) 等辅助函数在其定义前即可引用，满足 -Werror 先声明后使用。
@@ -220,6 +225,10 @@ static void *kMKLabelBidKey = &kMKLabelBidKey;              // v1.6.93: label→
 // 前向声明（定义见文件后部）
 static NSString *MKLabelToBid(UIView *label);
 static void MKInstallLabelHook(void);
+// v2.0.66.103: 几何缓存(定义紧随 MKRepositionIndicator 之后)
+static void MKCacheGeoForBid(NSString *bid, SBIconView *iv, UIView *overlay, MKConfig *cfg);
+static CGRect MKIndicatorFrameFromCache(NSString *bid, UIView *overlay, MKConfig *cfg);
+static CGFloat MKIconCornerRadiusFromCache(NSString *bid);
 
 // v1.6.75: 锁屏后兜底「解锁复原」定时器句柄（不依赖 iOS 解锁通知/布局事件）
 static dispatch_source_t sUnlockTimer = NULL;
@@ -659,8 +668,57 @@ static void MKRepositionIndicator(NSString *bid, SBIconView *iv, MKConfig *cfg) 
     UIView *container = MKContainerForIconView((UIView *)iv);
     UIView *overlay = MKOverlayForContainer(container);
     if (!overlay) return;
+    MKCacheGeoForBid(bid, iv, overlay, cfg);   // v2.0.66.103: 每次重定位都刷新几何缓存(图标可见时)
     CGRect f = MKIndicatorFrameInOverlay(iv, overlay, cfg);
     if (!CGRectIsEmpty(f)) { ind.frame = f; ind.hidden = NO; }
+}
+
+// v2.0.66.103: 几何缓存写入 —— 在图标可见(必经 MKUpdate / MKRepositionIndicator)时, 把「overlay 坐标系下的图标几何」落库。
+//   图标位置在页内固定, 不随滚动/卸载变化 → 缓存值对离屏页永久有效, 切模式时可原地重画。
+static void MKCacheGeoForBid(NSString *bid, SBIconView *iv, UIView *overlay, MKConfig *cfg) {
+    if (!bid || !iv || !overlay || !cfg) return;
+    // 角标: base 视图在 overlay 坐标系下的矩形(预扩 MKBadgeFrameExtra 之前) + rc
+    UIView *base = MKBadgeBaseView((UIView *)iv);
+    CGRect r;
+    if (base) r = [overlay convertRect:base.bounds fromView:base];
+    else { CGFloat side = MIN(iv.bounds.size.width, iv.bounds.size.height); r = [overlay convertRect:CGRectMake(0,0,side,side) fromView:(UIView *)iv]; }
+    if (!CGRectIsEmpty(r)) {
+        if (!sBidToBadgeR) sBidToBadgeR = [NSMutableDictionary dictionary];
+        sBidToBadgeR[bid] = [NSValue valueWithCGRect:r];
+        CGFloat rc = MKIconCornerRadius((UIView *)iv);
+        if (!sBidToBadgeRC) sBidToBadgeRC = [NSMutableDictionary dictionary];
+        sBidToBadgeRC[bid] = @(rc);
+    }
+    // 替换: label 矩形(无 label 时用 iv.bounds 派生, 与 MKIndicatorFrameInOverlay 同逻辑)
+    UIView *label = MKGetCachedLabel(iv);
+    CGRect rr;
+    if (label && label.superview) rr = [label.superview convertRect:label.frame toView:overlay];
+    else { rr = [overlay convertRect:iv.bounds fromView:iv]; rr = CGRectMake(CGRectGetMidX(rr)-20.0f, CGRectGetMaxY(rr)+2.0f, 40.0f, 14.0f); }
+    if (!CGRectIsEmpty(rr)) {
+        if (!sBidToReplaceR) sBidToReplaceR = [NSMutableDictionary dictionary];
+        sBidToReplaceR[bid] = [NSValue valueWithCGRect:rr];
+    }
+}
+// v2.0.66.103: 离屏图标(反查失败)用缓存几何原地重画, 不删。overlay 即指示器当前 superview(坐标一致)。
+static CGRect MKIndicatorFrameFromCache(NSString *bid, UIView *overlay, MKConfig *cfg) {
+    if (!bid || !overlay || !cfg) return CGRectZero;
+    if (cfg.locationMode == MKLocationBadge) {
+        NSValue *v = sBidToBadgeR ? sBidToBadgeR[bid] : nil;
+        if (!v) return CGRectZero;
+        CGRect r = v.CGRectValue;
+        return CGRectMake(r.origin.x - MKBadgeFrameExtra, r.origin.y - MKBadgeFrameExtra,
+                          r.size.width + 2*MKBadgeFrameExtra, r.size.height + 2*MKBadgeFrameExtra);
+    }
+    NSValue *v = sBidToReplaceR ? sBidToReplaceR[bid] : nil;
+    if (!v) return CGRectZero;
+    CGRect r = v.CGRectValue;
+    CGFloat indW = (cfg.shape == MKShapeDot) ? cfg.dotSize : cfg.barWidth;
+    CGFloat indH = (cfg.shape == MKShapeDot) ? cfg.dotSize : cfg.barHeight;
+    return CGRectMake(CGRectGetMidX(r) - indW/2.0f, CGRectGetMidY(r) - indH/2.0f, indW, indH);
+}
+static CGFloat MKIconCornerRadiusFromCache(NSString *bid) {
+    NSNumber *n = sBidToBadgeRC ? sBidToBadgeRC[bid] : nil;
+    return n ? [n floatValue] : 0.0f;
 }
 
 // v1.6.75: 前向声明（MKFolderChosenBid 依赖，定义在文件后部）
@@ -3696,6 +3754,7 @@ static void MKUpdate(SBIconView *self) {
             return;
         }
         CGRect indicatorFrame = MKIndicatorFrameInOverlay(self, overlay, cfg);
+        MKCacheGeoForBid(bundleID, self, overlay, cfg);   // v2.0.66.103: 图标可见时刷新几何缓存(离屏页切模式即时重画用)
 
         // v1.6.64: 统一用「按 bid 索引的 overlay 指示器」作为唯一真相来源（替代旧的 self 子视图关联）。
         indicator = MKFindIndicator(bundleID);
@@ -4530,17 +4589,24 @@ static void MKMigrateIndicatorsInPlace(MKConfig *cfg) {
         NSDictionary *m = ovCache[ovKey];
         if (!m) { m = MKBidToIconViewUnderOverlay(ov) ?: @{}; ovCache[ovKey] = m; }
         SBIconView *iv = m[bid];
-        if (!iv) { [orphans addObject:bid]; continue; }
-        CGRect f = MKIndicatorFrameInOverlay(iv, ov, cfg);
+        CGRect f;
+        CGFloat rc;
+        if (iv) {
+            f = MKIndicatorFrameInOverlay(iv, ov, cfg);
+            rc = MKIconCornerRadius((UIView *)iv);
+        } else {
+            // v2.0.66.103: 离屏图标(反查失败)用几何缓存原地重画, 不删 → 切模式后所有页即时更新, 无需手动切屏
+            f = MKIndicatorFrameFromCache(bid, ov, cfg);
+            rc = MKIconCornerRadiusFromCache(bid);
+        }
         if (CGRectIsEmpty(f)) { [orphans addObject:bid]; continue; }
         MKIndicatorDotView *dot = (MKIndicatorDotView *)ind;
-        CGFloat rc = MKIconCornerRadius((UIView *)iv);
         if (rc > 0) [dot setIconCornerRadius:rc];
         [dot setBadgeCorner:cfg.badgeCorner];
         dot.frame = f;
         dot.hidden = NO;
         [dot applyConfig];          // alpha = cfg.opacity + setNeedsDisplay(按新模式重画)
-        UIView *label = MKGetCachedLabel(iv);
+        UIView *label = iv ? MKGetCachedLabel(iv) : nil;   // v2.0.66.103: 离屏无 iv 时 label 取 nil(替换模式不藏名, 反正不在树)
         if (MKHideNames()) {
             if (label && label.superview) {
                 label.hidden = YES; label.alpha = 0.0f;
@@ -4550,7 +4616,7 @@ static void MKMigrateIndicatorsInPlace(MKConfig *cfg) {
             if (!sHiddenBids) sHiddenBids = [NSMutableSet set];
             [sHiddenBids addObject:bid];
         } else {
-            MKRestoreBetaOrphan((UIView *)iv);   // 角标模式: 小黄点交还系统(同 MKRefreshAllIcons)
+            if (iv) MKRestoreBetaOrphan((UIView *)iv);   // 角标模式: 小黄点交还系统(同 MKRefreshAllIcons); 离屏无 iv 则跳过
         }
     }
     for (NSString *bid in orphans) MKRemoveIndicatorForBid(bid);
