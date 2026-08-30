@@ -94,6 +94,31 @@
 #include <spawn.h>
 #include <string.h>          // v2.0.22: strcmp 用于无分配类名比较（MKIsFolderIcon 每帧热路径）
 #include <objc/runtime.h>
+#import <QuartzCore/QuartzCore.h>   // v2.0.66.100: CATransaction（禁隐式动画，见 MKWithoutImplicitActions）
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v2.0.66.100: 禁用隐式动画执行一段代码
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 背景（一次横跨 30+ 个版本的回归，根因在此）:
+//   .68 的提交「…统一藏名出口 + 删除 CATransaction 禁动画块 + 清空 RDLog」把全文件的
+//   CATransaction 包裹【一处不剩全删了】（实测统计：.67 有 14 处，.68 起恒为 0）。
+//   .70 把藏名回退成 .47 的瞬时钉死（去掉了 .68 引入的 0.22s 渐隐），但【没有恢复
+//   CATransaction】→ 之后每个版本对 label 的 hidden / alpha / layer.opacity 改动、
+//   以及对指示器的 frame 改动，全部走 CALayer 隐式动画（默认 0.25s）：
+//     · 藏名 → 名字要 0.25s 才淡掉，这段时间它与指示器同屏 = 用户看到的「名字重叠」；
+//     · 指示器换 frame → 从旧位置「飘」0.25s 才到新位置 = 用户看到的「变更慢」。
+//   用户实机原话：「68 跟 69 版本替换模式切角标模式会有名字重叠，就是变更太慢了」。
+//   这也解释了为何 .95~.99 一直在「别页更新不到」上打转却始终没解决「慢」——
+//   慢是另一条完全独立的病因，与遍历根集、与 becomeActive 时机都无关。
+//
+// commit 用 @finally 保证异常也配对，否则会污染后续事务栈。
+static void MKWithoutImplicitActions(dispatch_block_t block) {
+    if (!block) return;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    @try { block(); }
+    @finally { [CATransaction commit]; }
+}
 
 // ─── RDLog 已改为编译期 no-op 宏（.71 起彻底去掉诊断/探针输出；参数不求值，故 (void*)owner 等 ARC 桥接错误一并消失；全部 sDebugLog/sProbeLog 调试门控与探针函数体已在 .73 最终优化中删除，仅 RDLogRunning 守卫保留）──
 #define RDLog(fmt, ...) ((void)0)
@@ -528,6 +553,37 @@ static void MKUnlockRestore(void) {
 // 调用 MKUpdate 的图标实例"，在多页桌面中如果当前 layout 的是另一页的图标，会拿错位置
 // 导致指示器飘到别的页面（"左右滑动后重叠/错位"的根因之一）。
 // 无 live 视图（图标离屏/被回收）→ 返回 CGRectZero，调用方保留其最后位置不重算。
+// ─────────────────────────────────────────────────────────────────────────────
+// v2.0.66.100 【临时几何诊断】—— 定位「时钟 App 角标弧线离图标远 / 弧线有误差」
+// ─────────────────────────────────────────────────────────────────────────────
+// .99 已把 rc 改成与设置页预览【完全同构】的固定比例 12/52，仍然不贴 → 排除 rc，
+//   剩下的嫌疑只有 MKBadgeBaseView 取到的 bounds 与图标实际显示区域不一致
+//   （例如图标图片内容自带透明内边距，或首个候选视图不是真正的图片视图）。
+//   这个只能靠真数据判定，故临时加日志。
+// 限流：每个 bid 只打一次（重启 SpringBoard 后重来），总数封顶 60 条 —— 不刷屏，
+//   也不会像 .93 之前那样在拖滑块时持续输出（拖滑块只重算已打过的 bid）。
+// 定位完成后【务必整体删除】本函数与其唯一调用点。
+static NSString *MKGetCachedBid(SBIconView *iv);   // 文件后部已有同名前向声明，重复合法
+static void MKLogBadgeGeometryOnce(SBIconView *iv, UIView *base, CGRect r) {
+    static NSMutableSet *sGeoLogged = nil;
+    static int sGeoCount = 0;
+    if (sGeoCount >= 60) return;
+    if (!iv) return;
+    if (!sGeoLogged) sGeoLogged = [NSMutableSet set];
+    NSString *bid = MKGetCachedBid(iv);
+    if (!bid.length) return;
+    if ([sGeoLogged containsObject:bid]) return;
+    [sGeoLogged addObject:bid];
+    sGeoCount++;
+    NSLog(@"[RDI-GEO] bid=%@ base=%@ baseBounds=%.1fx%.1f ivBounds=%.1fx%.1f rectInOv=(%.1f,%.1f %.1fx%.1f) rc=%.2f",
+          bid,
+          base ? NSStringFromClass([base class]) : @"(nil->ivSquareFallback)",
+          base ? base.bounds.size.width : 0.0, base ? base.bounds.size.height : 0.0,
+          iv.bounds.size.width, iv.bounds.size.height,
+          r.origin.x, r.origin.y, r.size.width, r.size.height,
+          MKIconCornerRadius((UIView *)iv));
+}
+
 static CGRect MKIndicatorFrameInOverlay(SBIconView *iv, UIView *overlay, MKConfig *cfg) {
     if (!iv || !overlay || !cfg) return CGRectZero;
     if (cfg.locationMode == MKLocationBadge) {
@@ -543,6 +599,8 @@ static CGRect MKIndicatorFrameInOverlay(SBIconView *iv, UIView *overlay, MKConfi
             CGFloat side = MIN(iv.bounds.size.width, iv.bounds.size.height);
             r = [overlay convertRect:CGRectMake(0, 0, side, side) fromView:(UIView *)iv];
         }
+        // v2.0.66.100: 临时几何诊断（每个 bid 只打一次，封顶 60 条；定位后删除）
+        MKLogBadgeGeometryOnce(iv, base, r);
         // v2.0.66.82: 四周各扩 MKBadgeFrameExtra(15pt)，容纳 max inset(12) + max half-thickness(3)
         // 供 inset>0 时弧线整体外移到角落外 + stroke 圆头不裁。
         // drawRect 内对应按 (MKBadgeFrameExtra, MKBadgeFrameExtra) 平移到 icon 坐标系。
@@ -4297,19 +4355,20 @@ static void MKMigrateLocationMode(void) {
 static BOOL sModeRebuildPending = NO;            // 跨模式重建待补做
 static NSTimeInterval sModeRebuildArmedAt = 0;   // 武装时刻(超 120s 视为过期, 防落到无关的 becomeActive 上)
 static void MKRebuildAllForModeSwitch(void) {
-    MKRefreshAllIcons();
-    MKRefreshFolderIcons();
+    // v2.0.66.100: 每一波都包禁隐式动画 —— 否则本波内 MKUpdate 对 label / frame 的写入
+    //   全部走 0.25s 隐式动画, 「刷新完了但视觉上还在慢慢飘」= 用户感知的慢。
+    MKWithoutImplicitActions(^{ MKRefreshAllIcons(); MKRefreshFolderIcons(); });
     // v2.0.66.99: 波次由「0.6s / 1.5s 两波」加密提前为「0.3s / 0.8s / 1.8s 三波」。
     //   实机: 回桌面那一刻视图刚恢复、尚未布局完, 首波大概率落空 → 原来要等 0.6s 才补上,
     //   用户感知「更新新模式比较慢」; 而这段空窗里名字已经显示、指示器还没换过来
     //   = 用户看到的「指示器跟名称重叠」。加密后收敛更快, 空窗更短。
     //   纯时序调整, 不动任何判定逻辑: 每一波都只是幂等重刷。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ MKRefreshAllIcons(); MKRefreshFolderIcons(); });
+                   dispatch_get_main_queue(), ^{ MKWithoutImplicitActions(^{ MKRefreshAllIcons(); MKRefreshFolderIcons(); }); });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ MKRefreshAllIcons(); MKRefreshFolderIcons(); });
+                   dispatch_get_main_queue(), ^{ MKWithoutImplicitActions(^{ MKRefreshAllIcons(); MKRefreshFolderIcons(); }); });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ MKRefreshAllIcons(); MKRefreshFolderIcons(); });
+                   dispatch_get_main_queue(), ^{ MKWithoutImplicitActions(^{ MKRefreshAllIcons(); MKRefreshFolderIcons(); }); });
 }
 // %ctor 内 becomeActive 观察者调用(定义在此、使用在后, 满足 -Werror 先声明后使用)
 // 注: MKMigrateLocationMode 定义就在本块【上方】, 无需前向声明。
@@ -4420,6 +4479,10 @@ static NSDictionary *MKBidToIconViewUnderOverlay(UIView *ov) {
 //  · 仍保留 becomeActive pending + 0.6s/1.5s 波次, 降级为【幂等再同步】, 专治离屏页
 //    convertRect 拿到过渡态几何。
 static void MKMigrateIndicatorsInPlace(MKConfig *cfg) {
+  // v2.0.66.100: 全程禁隐式动画 —— 本函数会【批量】改 dot.frame(跨模式量级完全不同)
+  //   与 label 的 hidden/alpha/layer.opacity。若走默认 0.25s 隐式动画:
+  //   frame 会从旧位置「飘」到新位置、名字会「淡」出 → 慢 + 与指示器重叠(见 helper 说明)。
+  MKWithoutImplicitActions(^{
   MKSafe(^{
     if (!sBidToIndicator || !cfg) return;
     NSArray *bids = [[sBidToIndicator keyEnumerator] allObjects];
@@ -4458,6 +4521,7 @@ static void MKMigrateIndicatorsInPlace(MKConfig *cfg) {
         }
     }
     for (NSString *bid in orphans) MKRemoveIndicatorForBid(bid);
+  });
   });
 }
 
