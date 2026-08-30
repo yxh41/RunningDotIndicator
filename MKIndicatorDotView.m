@@ -14,7 +14,7 @@ const CGFloat MKBadgeFrameExtra = 15.0f;
 // v2.0.66.99: 与 Preferences/MKRootListController.m 的 kIconRadius(12.0f) / kIconSize(52.0f)
 //   同构的圆角比例(12/52 ≈ 0.23077); 与 Tweak.x 的 MKBadgeCornerRatio 等价。
 //   两个独立二进制不共享 static, 各留等价常量(同 MKLerpP/MKBezierSplit ↔ MKPvLerp/MKPvSplit)。
-static const CGFloat MKDotCornerRatio = 12.0f / 52.0f;
+static const CGFloat MKDotCornerRatio = 12.0f / 60.0f;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // v2.0.66.91: 三次贝塞尔【子曲线提取】(de Casteljau) —— 角标弧线长度调节的数学基础。
@@ -107,7 +107,8 @@ static void MKBezierSub(const CGPoint p[4], CGFloat t0, CGFloat t1, CGPoint out[
     //   故一次性做成可调滑块并把默认设为 90, 终结「改死值 → 推送 → 装包 → 再改」的循环。
     //   实现是沿曲线两端等量裁剪(见 MKBezierSub), 曲率不变 → 依旧贴合图标圆角。
     if (cfg.locationMode == MKLocationBadge) {
-        CGFloat t = cfg.badgeThickness;
+        // v2.0.66.105: 线宽随预览同构缩放 52/60 —— 原不缩放会让桌面弧线比预览粗 15%, 显得"重、不贴"
+        CGFloat t = cfg.badgeThickness * (52.0f / 60.0f);
         CGFloat inset = cfg.badgeInset;
         if (inset < 0) inset = 0; else if (inset > 12.0f) inset = 12.0f;
         // v2.0.66.83: frame 四周各扩了 MKBadgeFrameExtra，W/H 必须扣掉扩边换算回图标实际尺寸
@@ -116,8 +117,8 @@ static void MKBezierSub(const CGPoint p[4], CGFloat t0, CGFloat t1, CGPoint out[
         if (W < 1) W = rect.size.width;
         if (H < 1) H = rect.size.height;
         CGFloat rc = self.iconCornerRadius;
-        // v2.0.66.99: 比例必须与设置页预览【同构】(12/52)。原 0.2237 与预览的 12/52(≈0.23077)
-        //   不同, 也是"预览贴得好、桌面飘"的来源之一; 桌面侧 MKIconCornerRadius 亦已不再读 layer。
+        // v2.0.66.105: 兜底比例改 12/60(=0.2), 与 Tweak.x 的 MKBadgeCornerRatio、预览 kIconRadius=12
+        //   绝对对齐。原 12/52 让 60pt 图标 rc≈13.85 比预览 rc=12 大 → 弧线更平; 0.2 使标准图标 rc=12 同曲率。
         if (rc <= 0) rc = MIN(W, H) * MKDotCornerRatio;
         // 钳位：弧线端点沿边跨度 rc 不得越过半边中点，否则两端自相交（极小图标兜底）
         CGFloat halfMin = MIN(W, H) * 0.5f;
@@ -125,7 +126,8 @@ static void MKBezierSub(const CGPoint p[4], CGFloat t0, CGFloat t1, CGPoint out[
         if (rc <= 0) return;
 
         // inset：沿 45° 对角单位向量平移整段弧线（形状恒为原样，不随距离变形）
-        CGFloat ss = inset * 0.70710678f;        // 1/√2
+        // v2.0.66.105: inset 随预览同构缩放 52/60 —— 否则桌面比预览外移多 15%, 弧线"离开"角不够贴
+        CGFloat ss = inset * (52.0f / 60.0f) * 0.70710678f;        // 1/√2
         // 图标原点在 view 坐标 = (extra, extra)，再按所选角落方向外移
         CGFloat ox = MKBadgeFrameExtra, oy = MKBadgeFrameExtra;
         switch (self.badgeCorner) {

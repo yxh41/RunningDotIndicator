@@ -374,11 +374,13 @@ static UIView *MKBadgeBaseView(UIView *iv) {
     return nil;   // 全部判废 → 调用方兜底(iv 顶部正方形)
 }
 // 取图标图片真实圆角（continuousCornerRadius，iOS13+ 图标圆角真正来源；普通 cornerRadius 常为 0）
-// v2.0.66.99: 角标圆角比例 —— 与 Preferences/MKRootListController.m 的 kIconRadius(12.0f) /
-//   kIconSize(52.0f) 【逐字同构】(12/52 ≈ 0.23077)。两个独立二进制不共享 static, 各留等价
-//   常量(沿用 MKLerpP/MKBezierSplit ↔ MKPvLerp/MKPvSplit 的既有做法)。
+// v2.0.66.105: 角标圆角比例 —— 改为 12.0f/60.0f(≈0.2)。桌面 rc 绝对曲率须与设置页预览的
+//   kIconRadius(12.0f, 画在 52pt 图标上)【绝对值一致】, 而非按 12/52 比例放大(那样 60pt 图标得
+//   rc≈13.85, 比预览 rc=12 大 → 弧线更平、显"不够弯")。标准 60pt 图标 × 0.2 = 12 = 预览 rc,
+//   绝对曲率对齐 → 桌面弧线与预览一样弯。两个独立二进制不共享 static, 各留等价常量
+//   (沿用 MKLerpP/MKBezierSplit ↔ MKPvLerp/MKPvSplit 的既有做法)。
 //   🔴 桌面【不再读 layer】求圆角 —— 理由见 MKIconCornerRadius 函数内说明。
-static const CGFloat MKBadgeCornerRatio = 12.0f / 52.0f;
+static const CGFloat MKBadgeCornerRatio = 12.0f / 60.0f;
 static CGFloat MKIconCornerRadius(UIView *iv) {
     UIView *imv = MKBadgeBaseView(iv);   // v2.0.66.84: 用带判废的基准视图, 避免取到迷你图标的小尺寸
     UIView *target = imv ?: iv;
