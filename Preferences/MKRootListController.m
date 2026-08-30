@@ -20,6 +20,24 @@
 static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
 // 每次值变化时广播的 Darwin 通知名
 static NSString * const kReloadNotification = @"com.mk.runningdotindicator.reload";
+// v2.0.66.93: 「注销 SpringBoard」通知 —— 设置 App 无权杀 SpringBoard,
+// 只能发通知, 由注入在 SpringBoard 内的 dylib(MKRespringCallback) 自行 exit(0)。
+static NSString * const kRespringNotification = @"com.mk.runningdotindicator.respring";
+
+// v2.0.66.93: 「恢复默认设置」要清空的全部偏好键。
+// 清空(而非写回默认值)的理由: 读取侧(MKConfig 各 getter / readPreferenceValue)在键缺失时
+// 一律回落到默认值, 且 plist 的 <default> 与 MKConfig 里的默认值逐项一致 —— 删键即真正的
+// 「出厂状态」, 也避免将来改默认值时这里成为一份必须同步维护的重复清单。
+// ⚠️ 新增偏好项时必须把 key 加进本数组, 否则「恢复默认」会漏掉它。
+static NSArray *MKAllPrefKeys(void) {
+    static NSArray *keys = nil;
+    if (!keys) keys = @[ @"enabled", @"shape", @"dotSize", @"barWidth", @"barHeight",
+                         @"colorMode", @"color", @"customColor",
+                         @"folderIndicators", @"keepBetaDot", @"opacity",
+                         @"locationMode", @"badgeCorner", @"badgeThickness",
+                         @"badgeArcLength", @"badgeInset" ];
+    return keys;
+}
 
 // ── 2026 玻璃风格常量 ──
 static const CGFloat kHeroHeight = 150.0f;
@@ -632,13 +650,82 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
             if ([s isKindOfClass:[PSSpecifier class]]) spec = (PSSpecifier *)s;
         }
         NSString *rowKey = spec ? [spec propertyForKey:@"key"] : nil;
-        NSInteger mode = [[self readValueForKey:@"locationMode"
-                                        default:@0
-                                  expectedClass:[NSNumber class]] integerValue];
-        MKApplyDimmed(cell, (rowKey != nil) && MKKeyDisabledForMode(rowKey, mode));
+        // v2.0.66.93: 无 key 的行 = 操作按钮(PSButtonCell「恢复默认 / 注销」)。
+        //   MKApplyDimmed(cell, NO) 会把 textLabel.textColor 强写成 labelColor,
+        //   把按钮文字画成普通黑字, 失去「这是可点操作」的视觉线索(PSButtonCell 本应用 tintColor)。
+        //   故这类行【整段跳过灰化逻辑】, 保留系统默认外观。
+        //   现有 16 个偏好行全部带 key, 此分支对它们无影响。
+        if (rowKey != nil) {
+            NSInteger mode = [[self readValueForKey:@"locationMode"
+                                            default:@0
+                                      expectedClass:[NSNumber class]] integerValue];
+            MKApplyDimmed(cell, MKKeyDisabledForMode(rowKey, mode));
+        }
 
         // v2.0.24: folderIndicatorMode 选择已移除，代表 App 固定为位置靠前活跃（原 mode 0）。
     } @catch (NSException *e) {}
+}
+
+#pragma mark - 操作按钮 (v2.0.66.93)
+
+// 广播「配置已变」通知 + 刷新头图预览。setPreferenceValue: 与恢复默认共用。
+- (void)mk_postReloadAndRefresh {
+    CFNotificationCenterPostNotification(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        (__bridge CFStringRef)kReloadNotification,
+        NULL, NULL, TRUE);
+    [self refreshHero];
+}
+
+// 「恢复默认设置」—— 二次确认后删除本域全部键, 让读取侧回落到默认值。
+// ⚠️ 必须 reloadSpecifiers 而不是只 reloadSpecifier: 所有行的显示值都变了,
+//    且 locationMode 归零会让置灰集合整体反转(见 MKKeyDisabledForMode)。
+- (void)mkResetDefaults:(PSSpecifier *)specifier {
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"恢复默认设置"
+                         message:@"将把本插件的全部选项恢复为出厂默认值（形状、颜色、尺寸、位置模式、角标参数等）。此操作不可撤销。"
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消"
+                                          style:UIAlertActionStyleCancel
+                                        handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"恢复默认"
+                                          style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *a) {
+        @try {
+            for (NSString *k in MKAllPrefKeys()) {
+                CFPreferencesSetValue((__bridge CFStringRef)k, NULL,
+                                      (__bridge CFStringRef)kPrefsDomain,
+                                      kCFPreferencesCurrentUser,
+                                      kCFPreferencesAnyHost);
+            }
+            CFPreferencesAppSynchronize((__bridge CFStringRef)kPrefsDomain);
+            [self reloadSpecifiers];
+            [self mk_postReloadAndRefresh];
+        } @catch (NSException *e) {}
+    }]];
+    @try { [self presentViewController:ac animated:YES completion:nil]; } @catch (NSException *e) {}
+}
+
+// 「注销 SpringBoard」—— 设置 App 自己没权限杀 SpringBoard, 只发 Darwin 通知,
+// 由注入在 SpringBoard 内的 dylib 收到后 exit(0)(launchd 负责重启)。
+// 若插件未加载/被紧急开关关掉, 通知无人接收 → 什么也不会发生, 不会崩、不会卡。
+- (void)mkRespring:(PSSpecifier *)specifier {
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"注销 SpringBoard"
+                         message:@"桌面将立即重启，未保存的界面状态会丢失。正常情况下修改设置无需注销。"
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消"
+                                          style:UIAlertActionStyleCancel
+                                        handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"注销"
+                                          style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *a) {
+        CFNotificationCenterPostNotification(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            (__bridge CFStringRef)kRespringNotification,
+            NULL, NULL, TRUE);
+    }]];
+    @try { [self presentViewController:ac animated:YES completion:nil]; } @catch (NSException *e) {}
 }
 
 #pragma mark - 拦截写值
@@ -670,14 +757,8 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
         @try { [self reloadSpecifiers]; } @catch (NSException *e) {}
     }
 
-    // 广播 Darwin 通知
-    CFNotificationCenterPostNotification(
-        CFNotificationCenterGetDarwinNotifyCenter(),
-        (__bridge CFStringRef)kReloadNotification,
-        NULL, NULL, TRUE);
-
-    // 设置变化 → 头图实时预览同步刷新
-    [self refreshHero];
+    // 广播 Darwin 通知 + 头图实时预览同步刷新
+    [self mk_postReloadAndRefresh];
 }
 
 // 颜色选择等需要返回当前值的 cell

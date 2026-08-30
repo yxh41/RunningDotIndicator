@@ -94,6 +94,31 @@
 #include <spawn.h>
 #include <string.h>          // v2.0.22: strcmp 用于无分配类名比较（MKIsFolderIcon 每帧热路径）
 #include <objc/runtime.h>
+#import <QuartzCore/QuartzCore.h>   // v2.0.66.100: CATransaction（禁隐式动画，见 MKWithoutImplicitActions）
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v2.0.66.100: 禁用隐式动画执行一段代码
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 背景（一次横跨 30+ 个版本的回归，根因在此）:
+//   .68 的提交「…统一藏名出口 + 删除 CATransaction 禁动画块 + 清空 RDLog」把全文件的
+//   CATransaction 包裹【一处不剩全删了】（实测统计：.67 有 14 处，.68 起恒为 0）。
+//   .70 把藏名回退成 .47 的瞬时钉死（去掉了 .68 引入的 0.22s 渐隐），但【没有恢复
+//   CATransaction】→ 之后每个版本对 label 的 hidden / alpha / layer.opacity 改动、
+//   以及对指示器的 frame 改动，全部走 CALayer 隐式动画（默认 0.25s）：
+//     · 藏名 → 名字要 0.25s 才淡掉，这段时间它与指示器同屏 = 用户看到的「名字重叠」；
+//     · 指示器换 frame → 从旧位置「飘」0.25s 才到新位置 = 用户看到的「变更慢」。
+//   用户实机原话：「68 跟 69 版本替换模式切角标模式会有名字重叠，就是变更太慢了」。
+//   这也解释了为何 .95~.99 一直在「别页更新不到」上打转却始终没解决「慢」——
+//   慢是另一条完全独立的病因，与遍历根集、与 becomeActive 时机都无关。
+//
+// commit 用 @finally 保证异常也配对，否则会污染后续事务栈。
+static void MKWithoutImplicitActions(dispatch_block_t block) {
+    if (!block) return;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    @try { block(); }
+    @finally { [CATransaction commit]; }
+}
 
 // ─── RDLog 已改为编译期 no-op 宏（.71 起彻底去掉诊断/探针输出；参数不求值，故 (void*)owner 等 ARC 桥接错误一并消失；全部 sDebugLog/sProbeLog 调试门控与探针函数体已在 .73 最终优化中删除，仅 RDLogRunning 守卫保留）──
 #define RDLog(fmt, ...) ((void)0)
@@ -169,6 +194,11 @@ static NSMapTable *sBidToIndicator;
 static NSMapTable *sHiddenLabelToBid = nil;   // v2.0.7+GAP-FIX: label(weak key) -> bid(strong) map; records a label that must stay hidden
      // bid(NSString) -> 指示器(UIView) 强引用，跨回收存活
 static NSMapTable *sContainerToOverlay; // 滚动容器(UIScrollView) -> overlay(UIView) 弱->强
+// v2.0.66.103: 几何缓存 —— 图标视图离屏/被回收时, 仍能用「上次可见时」缓存的 overlay 坐标几何原地重画指示器,
+//   覆盖「切模式后所有页即时更新」(不再因反查失败删离屏指示器、需手动切屏)。图标位置不随滚动/卸载变化 → 缓存永久有效。
+static NSMutableDictionary<NSString*, NSValue*>  *sBidToBadgeR   = nil; // bid -> CGRect(角标 rectInOv, 预扩 MKBadgeFrameExtra 之前)
+static NSMutableDictionary<NSString*, NSNumber*> *sBidToBadgeRC  = nil; // bid -> rc(角标圆角)
+static NSMutableDictionary<NSString*, NSValue*>  *sBidToReplaceR = nil; // bid -> CGRect(替换 label/iv rectInOv)
 // v1.6.61: 文件夹是否处于打开态（由 SBFolderView -didMoveToWindow 维护）。
 // 仅当为 YES 时才允许把图标判定为"在文件夹内"，消除主屏图标被误判。
 // 声明提前到此处，确保 MKIsIconInFolder()(v1.6.67) 等辅助函数在其定义前即可引用，满足 -Werror 先声明后使用。
@@ -195,6 +225,10 @@ static void *kMKLabelBidKey = &kMKLabelBidKey;              // v1.6.93: label→
 // 前向声明（定义见文件后部）
 static NSString *MKLabelToBid(UIView *label);
 static void MKInstallLabelHook(void);
+// v2.0.66.103: 几何缓存(定义紧随 MKRepositionIndicator 之后)
+static void MKCacheGeoForBid(NSString *bid, SBIconView *iv, UIView *overlay, MKConfig *cfg);
+static CGRect MKIndicatorFrameFromCache(NSString *bid, UIView *overlay, MKConfig *cfg);
+static CGFloat MKIconCornerRadiusFromCache(NSString *bid);
 
 // v1.6.75: 锁屏后兜底「解锁复原」定时器句柄（不依赖 iOS 解锁通知/布局事件）
 static dispatch_source_t sUnlockTimer = NULL;
@@ -289,46 +323,81 @@ static UIView *MKOverlayForContainer(UIView *container) {
 // v2.0.66.81: 原 strncmp(n,"SBIconImage",12) 比较长度写成12，"SBIconImage" 仅11字符+null=12，
 //   第12字节 '\0' 与任何 SBIconImage* 类名第12字节(字母)不等 → 恒不匹配 → 永远回退到 SBIconView
 //   (含名字标签区) → 左下/右下弧线圆心下移名字高度，"距离远"。修：长度改11 + 递归查找兜底嵌套。
-static UIView *MKIconImageView(UIView *iv) {
-    if (!iv) return nil;
+// v2.0.66.98: 收集【全部】图标图片视图候选（不再命中第一个就返回）。
+//   原 MKBadgeBaseView 一旦判废(bw < ivw*0.5)就没有第二次机会, 只能兜底到 iv 顶部正方形 ——
+//   用户实机「时钟 App 距离调成 0 了弧线还离那么远」即疑似走了兜底路径(而实时预览贴得很好,
+//   说明几何公式本身无误, 是桌面取到的 base/rc 不对)。改为收集全部候选后按宽度降序挑第一个
+//   不判废的: 对正常图标(第一个候选就不判废)行为【完全不变】, 只给「首个候选恰好是残缺/
+//   迷你视图」的图标一次正确的补救。
+static void MKIconImageViewCandidates(UIView *iv, NSMutableArray *out) {
+    if (!iv) return;
     for (UIView *sub in iv.subviews) {
         const char *n = class_getName([sub class]);
         // v2.0.66.84: 文件夹图标的图片视图类名是 SBFolderIconImageView（不以 SBIconImage 开头），
         //   而它内部嵌着一格格迷你 App 图标、每个迷你图标各自带 SBIconImageView。
         //   原实现深度优先递归 → 先命中【迷你图标】的 SBIconImageView 就返回 → 角标按迷你图标
-        //   (约 1/3 尺寸、位于文件夹内部) 的 bounds 定位 → 文件夹 4 个角全部"距离远"。
+        //   (约 1/3 尺寸、位于文件夹内部) 的 bounds 定位 → 文件夹 4 个角全部“距离远”。
         //   修：先比 SBFolderIconImage 前缀，保证在钻进缩略图之前就命中文件夹本体图片视图。
-        if (strncmp(n, "SBFolderIconImage", 17) == 0) return sub;
-        if (strncmp(n, "SBIconImage", 11) == 0) return sub;
-        UIView *found = MKIconImageView(sub);   // 递归兜底：crossfade 等容器嵌套
-        if (found) return found;
+        if (strncmp(n, "SBFolderIconImage", 17) == 0) { [out addObject:sub]; continue; }
+        // v2.0.66.102: 前缀 "SBIconImage" 漏掉时钟/天气等动态图标的图片视图
+        //   (类名形如 SBClockIconImageView / SBWeatherIconImageView, 含 "IconImage" 但不在前缀) →
+        //   MKBadgeBaseView 返回 nil → 角标走全 60x60 正方形兜底 → 弧线离图标圆角远。
+        //   改 strstr 子串匹配, 同时命中 SBIconImageView / SBIconImageCrossfadeView /
+        //   SBClockIconImageView / SBWeatherIconImageView 等; SBIconView / SBIconLabelView 不含
+        //   "IconImage" 子串, 不会误中。
+        if (strstr(n, "IconImage") != NULL) { [out addObject:sub]; continue; }
+        MKIconImageViewCandidates(sub, out);   // 递归兜底：crossfade 等容器嵌套
     }
-    return nil;
 }
 // v2.0.66.84: 角标定位基准视图。若命中的图片视图宽度明显小于图标视图（说明仍误命中了
-// 文件夹缩略图内的迷你图标，或该系统版本类名不符预期），返回 nil 让调用方走正方形兜底。
+// 文件夹缩略图内的迷你图标，或该系统版本类名不符预期），判废并【换下一个候选】；
+// v2.0.66.98: 全部判废才返回 nil 让调用方走正方形兜底。
 static UIView *MKBadgeBaseView(UIView *iv) {
-    UIView *base = MKIconImageView(iv);
-    if (!base) return nil;
-    CGFloat bw = base.bounds.size.width;
-    CGFloat ivw = iv ? iv.bounds.size.width : 0;
-    if (ivw > 1.0f && bw < ivw * 0.5f) return nil;   // 误命中迷你图标 → 判废
-    return base;
+    if (!iv) return nil;
+    NSMutableArray *cands = [NSMutableArray array];
+    MKIconImageViewCandidates(iv, cands);
+    if (cands.count == 0) return nil;
+    CGFloat ivw = iv.bounds.size.width;
+    if (cands.count > 1) {
+        [cands sortUsingComparator:^NSComparisonResult(UIView *a, UIView *b) {
+            CGFloat aw = a.bounds.size.width, bwid = b.bounds.size.width;
+            if (aw > bwid) return NSOrderedAscending;    // 宽度降序：最大的最先试
+            if (aw < bwid) return NSOrderedDescending;
+            return NSOrderedSame;
+        }];
+    }
+    for (UIView *c in cands) {
+        CGFloat bw = c.bounds.size.width;
+        if (ivw > 1.0f && bw < ivw * 0.5f) continue;   // 误命中迷你图标 → 判废, 换下一个候选
+        return c;
+    }
+    return nil;   // 全部判废 → 调用方兜底(iv 顶部正方形)
 }
 // 取图标图片真实圆角（continuousCornerRadius，iOS13+ 图标圆角真正来源；普通 cornerRadius 常为 0）
+// v2.0.66.105: 角标圆角比例 —— 改为 12.0f/60.0f(≈0.2)。桌面 rc 绝对曲率须与设置页预览的
+//   kIconRadius(12.0f, 画在 52pt 图标上)【绝对值一致】, 而非按 12/52 比例放大(那样 60pt 图标得
+//   rc≈13.85, 比预览 rc=12 大 → 弧线更平、显"不够弯")。标准 60pt 图标 × 0.2 = 12 = 预览 rc,
+//   绝对曲率对齐 → 桌面弧线与预览一样弯。两个独立二进制不共享 static, 各留等价常量
+//   (沿用 MKLerpP/MKBezierSplit ↔ MKPvLerp/MKPvSplit 的既有做法)。
+//   🔴 桌面【不再读 layer】求圆角 —— 理由见 MKIconCornerRadius 函数内说明。
+static const CGFloat MKBadgeCornerRatio = 12.0f / 60.0f;
 static CGFloat MKIconCornerRadius(UIView *iv) {
-    UIView *imv = MKBadgeBaseView(iv);   // v2.0.66.84: 用带判废的基准视图，避免取到迷你图标的小圆角
+    UIView *imv = MKBadgeBaseView(iv);   // v2.0.66.84: 用带判废的基准视图, 避免取到迷你图标的小尺寸
     UIView *target = imv ?: iv;
-    CALayer *layer = target.layer;
-    if ([layer respondsToSelector:@selector(continuousCornerRadius)]) {
-        NSNumber *cr = [layer valueForKey:@"continuousCornerRadius"];
-        if (cr && [cr floatValue] > 0) return [cr floatValue];
-    }
-    if (layer.cornerRadius > 0) return layer.cornerRadius;
-    // v2.0.66.84: 兜底按图标图片正方形边长算（不用含名字区的 SBIconView 高度）
+    // v2.0.66.84: m 按图标图片正方形边长算（不用含名字区的 SBIconView 高度）
     CGFloat m = imv ? MIN(target.bounds.size.width, target.bounds.size.height)
                     : target.bounds.size.width;
-    return m * 0.225f;
+    if (m <= 0) return 0;
+    // v2.0.66.99: 【不再读 layer】—— 原实现优先读 layer.continuousCornerRadius(其次 cornerRadius),
+    //   读不到才兜底固定比例。而【设置页实时预览从不读 layer】(`updateBadgePreview` 内直接
+    //   `CGFloat rc = kIconRadius;`, 一个固定常量) → 两边输入不同 → 预览严丝合缝、桌面个别图标
+    //   弧线飘在图标外面(用户实机: 时钟 App「距离调整成 0 了还离那么远」, 且同一张截图里日历
+    //   的弧线也看得出不够贴)。
+    //   .98 试过给读到的值加 0.30 上限钳位, 【无效】—— 说明偏的不是"rc 读大了", 而是"读 layer"
+    //   这个输入源本身与预览不同构。iOS 全部 App 图标统一走 squircle mask, 圆角占边长比例恒定,
+    //   读 layer 带来的只是不可控偏差。故回退为与预览完全相同的固定比例。
+    //   这是 .87/.88「只改桌面没改预览 → 预览比桌面好看」的镜像版本, 教训一致: 两边必须同构。
+    return m * MKBadgeCornerRatio;
 }
 // 角标模式下不抢名字位置 → 所有藏名逻辑统一失效
 static BOOL MKHideNames(void) {
@@ -501,6 +570,20 @@ static void MKUnlockRestore(void) {
 // 调用 MKUpdate 的图标实例"，在多页桌面中如果当前 layout 的是另一页的图标，会拿错位置
 // 导致指示器飘到别的页面（"左右滑动后重叠/错位"的根因之一）。
 // 无 live 视图（图标离屏/被回收）→ 返回 CGRectZero，调用方保留其最后位置不重算。
+// ─────────────────────────────────────────────────────────────────────────────
+// v2.0.66.100 【临时几何诊断】—— 定位「时钟 App 角标弧线离图标远 / 弧线有误差」
+// ─────────────────────────────────────────────────────────────────────────────
+// .99 已把 rc 改成与设置页预览【完全同构】的固定比例 12/52，仍然不贴 → 排除 rc，
+//   剩下的嫌疑只有 MKBadgeBaseView 取到的 bounds 与图标实际显示区域不一致
+//   （例如图标图片内容自带透明内边距，或首个候选视图不是真正的图片视图）。
+//   这个只能靠真数据判定，故临时加日志。
+// 限流：每个 bid 只打一次（重启 SpringBoard 后重来），总数封顶 60 条 —— 不刷屏，
+//   也不会像 .93 之前那样在拖滑块时持续输出（拖滑块只重算已打过的 bid）。
+// 定位完成后【务必整体删除】本函数与其唯一调用点。
+static NSString *MKGetCachedBid(SBIconView *iv);   // 文件后部已有同名前向声明，重复合法
+// v2.0.66.104: 诊断函数 MKLogBadgeGeometryOnce 已删除 —— 曾用于定位时钟/天气动态图标角标弧线,
+//   现由 .102 的 `strstr(n,"IconImage")` 候选收集修复, 诊断不再需要。
+
 static CGRect MKIndicatorFrameInOverlay(SBIconView *iv, UIView *overlay, MKConfig *cfg) {
     if (!iv || !overlay || !cfg) return CGRectZero;
     if (cfg.locationMode == MKLocationBadge) {
@@ -541,8 +624,57 @@ static void MKRepositionIndicator(NSString *bid, SBIconView *iv, MKConfig *cfg) 
     UIView *container = MKContainerForIconView((UIView *)iv);
     UIView *overlay = MKOverlayForContainer(container);
     if (!overlay) return;
+    MKCacheGeoForBid(bid, iv, overlay, cfg);   // v2.0.66.103: 每次重定位都刷新几何缓存(图标可见时)
     CGRect f = MKIndicatorFrameInOverlay(iv, overlay, cfg);
     if (!CGRectIsEmpty(f)) { ind.frame = f; ind.hidden = NO; }
+}
+
+// v2.0.66.103: 几何缓存写入 —— 在图标可见(必经 MKUpdate / MKRepositionIndicator)时, 把「overlay 坐标系下的图标几何」落库。
+//   图标位置在页内固定, 不随滚动/卸载变化 → 缓存值对离屏页永久有效, 切模式时可原地重画。
+static void MKCacheGeoForBid(NSString *bid, SBIconView *iv, UIView *overlay, MKConfig *cfg) {
+    if (!bid || !iv || !overlay || !cfg) return;
+    // 角标: base 视图在 overlay 坐标系下的矩形(预扩 MKBadgeFrameExtra 之前) + rc
+    UIView *base = MKBadgeBaseView((UIView *)iv);
+    CGRect r;
+    if (base) r = [overlay convertRect:base.bounds fromView:base];
+    else { CGFloat side = MIN(iv.bounds.size.width, iv.bounds.size.height); r = [overlay convertRect:CGRectMake(0,0,side,side) fromView:(UIView *)iv]; }
+    if (!CGRectIsEmpty(r)) {
+        if (!sBidToBadgeR) sBidToBadgeR = [NSMutableDictionary dictionary];
+        sBidToBadgeR[bid] = [NSValue valueWithCGRect:r];
+        CGFloat rc = MKIconCornerRadius((UIView *)iv);
+        if (!sBidToBadgeRC) sBidToBadgeRC = [NSMutableDictionary dictionary];
+        sBidToBadgeRC[bid] = @(rc);
+    }
+    // 替换: label 矩形(无 label 时用 iv.bounds 派生, 与 MKIndicatorFrameInOverlay 同逻辑)
+    UIView *label = MKGetCachedLabel(iv);
+    CGRect rr;
+    if (label && label.superview) rr = [label.superview convertRect:label.frame toView:overlay];
+    else { rr = [overlay convertRect:iv.bounds fromView:iv]; rr = CGRectMake(CGRectGetMidX(rr)-20.0f, CGRectGetMaxY(rr)+2.0f, 40.0f, 14.0f); }
+    if (!CGRectIsEmpty(rr)) {
+        if (!sBidToReplaceR) sBidToReplaceR = [NSMutableDictionary dictionary];
+        sBidToReplaceR[bid] = [NSValue valueWithCGRect:rr];
+    }
+}
+// v2.0.66.103: 离屏图标(反查失败)用缓存几何原地重画, 不删。overlay 即指示器当前 superview(坐标一致)。
+static CGRect MKIndicatorFrameFromCache(NSString *bid, UIView *overlay, MKConfig *cfg) {
+    if (!bid || !overlay || !cfg) return CGRectZero;
+    if (cfg.locationMode == MKLocationBadge) {
+        NSValue *v = sBidToBadgeR ? sBidToBadgeR[bid] : nil;
+        if (!v) return CGRectZero;
+        CGRect r = v.CGRectValue;
+        return CGRectMake(r.origin.x - MKBadgeFrameExtra, r.origin.y - MKBadgeFrameExtra,
+                          r.size.width + 2*MKBadgeFrameExtra, r.size.height + 2*MKBadgeFrameExtra);
+    }
+    NSValue *v = sBidToReplaceR ? sBidToReplaceR[bid] : nil;
+    if (!v) return CGRectZero;
+    CGRect r = v.CGRectValue;
+    CGFloat indW = (cfg.shape == MKShapeDot) ? cfg.dotSize : cfg.barWidth;
+    CGFloat indH = (cfg.shape == MKShapeDot) ? cfg.dotSize : cfg.barHeight;
+    return CGRectMake(CGRectGetMidX(r) - indW/2.0f, CGRectGetMidY(r) - indH/2.0f, indW, indH);
+}
+static CGFloat MKIconCornerRadiusFromCache(NSString *bid) {
+    NSNumber *n = sBidToBadgeRC ? sBidToBadgeRC[bid] : nil;
+    return n ? [n floatValue] : 0.0f;
 }
 
 // v1.6.75: 前向声明（MKFolderChosenBid 依赖，定义在文件后部）
@@ -1141,6 +1273,7 @@ static NSMutableSet<NSString*> *sFadingLabelBIDs    = nil; // v1.5.8: 标签正�
 static NSMutableDictionary<NSString*, UIColor*> *sIconColorCache = nil; // v1.5.7: bundleID → 图标主色调缓存
 static NSMutableSet<NSString*> *sIconColorMissLogged = nil; // v1.6.12: 取色失败诊断（每 bid 只记一次）
 static dispatch_queue_t sColorDiskQueue = nil; // v2.0.66.6: 颜色缓存写盘串行队列（后台异步，避免主线程 jank）
+static BOOL sColorCacheFlushPending = NO;      // v2.0.66.94: 落盘去抖 —— 已排期未执行的 flush 标记（见 MKSaveColorCacheToDisk）
 
 // v2.0.66.73: 最终优化 —— 删除全部 sDebugLog/sProbeLog 调试门控与 MKDebugDumpBetaLabel/MKLogRevealAttempt 调试函数(RDLog 为编译期 no-op 宏, 参数不求值, 删之零行为影响); 仅 RDLogRunning 守卫保留以维持 .47 行为。
 // 调试/探针门控已全部清除(RDLog 为编译期 no-op 宏, 参数不求值; 全部 sDebugLog/sProbeLog 门控已删除)。
@@ -1416,20 +1549,37 @@ static void MKLoadColorCacheFromDisk() {
 }
 
 // 把当前内存缓存镜像写盘（后台串行队列异步 + atomic，避免主线程 jank 与半写损坏）。写失败静默忽略。
+//
+// v2.0.66.94 落盘去抖:
+//   原实现每取到一个新颜色就立刻【在主线程】重建整份字典(遍历 sIconColorCache, 每个 bid 一次
+//   getRed: + 一个 4 元素 NSArray + 4 个 NSNumber), 再异步写盘。开机/解锁那一波每个后台 App
+//   都取一次色 → N 个 bid 触发 N 次全量重建 = O(N²) 次装箱分配 + N 次整文件写盘, 全落在
+//   桌面刚出现、最忙的那几秒。而这份缓存的作用只是【下次开机少扫一遍图标】, 丢一两秒的
+//   增量毫无影响 → 典型的可去抖场景。
+//   现改为: 标记 pending, 1.5s 后合并成一次快照 + 一次写盘。窗口内再多少次新颜色都只排期一次。
+//   注意快照必须仍在主线程做(sIconColorCache 只在主线程读写, 没有锁), 只是把次数从 N 降到 1。
 static void MKSaveColorCacheToDisk() {
 	@try {
-		if (!sColorDiskQueue) sColorDiskQueue = dispatch_queue_create("com.mk.rd.colorcache", DISPATCH_QUEUE_SERIAL);
-		NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:sIconColorCache.count];
-		for (NSString *bid in sIconColorCache) {
-			UIColor *c = sIconColorCache[bid];
-			CGFloat r, g, b, a;
-			if ([c getRed:&r green:&g blue:&b alpha:&a]) {
-				out[bid] = @[@(r), @(g), @(b), @(a)];
-			}
-		}
-		NSString *path = MKColorCachePath();
-		dispatch_async(sColorDiskQueue, ^{
-			@try { [out writeToFile:path atomically:YES]; } @catch (NSException *e) {}
+		if (sColorCacheFlushPending) return;   // 已有排期 → 本次新颜色由那一次一并写出
+		sColorCacheFlushPending = YES;
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+		               dispatch_get_main_queue(), ^{
+			sColorCacheFlushPending = NO;
+			@try {
+				if (!sColorDiskQueue) sColorDiskQueue = dispatch_queue_create("com.mk.rd.colorcache", DISPATCH_QUEUE_SERIAL);
+				NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:sIconColorCache.count];
+				for (NSString *bid in sIconColorCache) {
+					UIColor *c = sIconColorCache[bid];
+					CGFloat r, g, b, a;
+					if ([c getRed:&r green:&g blue:&b alpha:&a]) {
+						out[bid] = @[@(r), @(g), @(b), @(a)];
+					}
+				}
+				NSString *path = MKColorCachePath();
+				dispatch_async(sColorDiskQueue, ^{
+					@try { [out writeToFile:path atomically:YES]; } @catch (NSException *e) {}
+				});
+			} @catch (NSException *e) {}
 		});
 	} @catch (NSException *e) {}
 }
@@ -2151,8 +2301,24 @@ static NSString *MKForeignContainerCtx(UIView *label) {
 //    那条警告的是「把它当触发器加回去会让擦名复活」, 这里是拿它当 return NO 的守卫。
 //    改动此函数前请先读懂这两者方向相反, 勿再来回翻烧饼。
 static BOOL MKViewInFolderThumb(UIView *v);   // v2.0.66.89: 前向声明上移(定义见 ~L2670, 本谓词与 MKDockStrayHide 都在其之前)
+// v2.0.66.94 【热路径短路 —— 纯布尔恒等变换, 语义零变化】
+// 本谓词被 layoutSubviews 那条每帧 stray 块对【每个图标每帧】调用一次(角标模式下前置的
+// hidden/alpha 预筛恒不早退, 因为角标模式所有 label 都可见)。原求值顺序:
+//     MKViewInFolderThumb(v)            → 走【整条】祖先链到 root 才能返回 NO
+//     → MKForeignContainerCtx(v)        → 内部 MKLabelInHomeGrid 再走一趟
+// 主屏图标(绝大多数)两趟都白走。
+// 而 MKForeignContainerCtx 的第一行就是 `if (MKLabelInHomeGrid(label)) return nil;`,
+// 即 InHomeGrid ⟹ ctx == nil ⟹ 本谓词恒为 NO(与 thumb 取值无关) —— 于是把 InHomeGrid
+// 提到最前面做早退, 结果【逐位相同】(`!thumb && ctx` 里 ctx 为 nil 时 thumb 是无关项),
+// 但主屏图标从「整链 + 部分链」降为「一趟部分链」(命中 SBIconListView 即返回)。
+// dock / 负一屏 / dock 内文件夹缩略图仍走原顺序, thumb 豁免守卫(.88/.89 快照通道铁律)完整保留。
+//
+// ⚠️ 刻意【不做】「superview 指针 → 判定结果」缓存: 失效点太多(翻页/文件夹开合/回收复用/
+//    旋转/重父动画), 漏一个就等于按过期结论擦名或漏擦, 属于本工程反复踩过的那类坑;
+//    而恒等变换已拿掉主要开销, 不值得为剩下的部分引入失效风险。
 static BOOL MKBadgeMayEraseName(UIView *v) {
     if (!v) return NO;
+    if (MKLabelInHomeGrid(v)) return NO;          // 快路径: 主屏网格 → ctx 必为 nil → 恒 NO
     if (MKViewInFolderThumb(v)) return NO;        // 快照通道 → 交还系统(.88/.89)
     return MKForeignContainerCtx(v) != nil;       // 内含 MKLabelInHomeGrid 守卫, 主屏网格名绝不误杀
 }
@@ -2299,9 +2465,13 @@ static BOOL MKDockStrayHide(SBIconView *iv, BOOL *outStray) {
         //   替换模式下这笔账划得来: 名字本就要藏, 误伤退化成「本来也要藏」。
         //   角标模式下方向完全相反: 名字本该显示, 误伤 = 名字凭空消失 / 动画期间闪。
         //   典型命中: 文件夹在底行、或关闭动画收缩轨迹掠过 dock 纵带。
-        //   顺带一笔性能账: 角标模式所有 label 可见 → 下面 `hidden||alpha<=0.01` 早退失效
-        //   → 每图标每帧都做一次 convertRect + 纵带比较(layoutSubviews 每帧调本函数)。
-        //   另: sDockFrame 只在为空时刷新、转屏后不失效 → 横屏纵带整体错位, 角标模式一并免疫。
+    //   顺带一笔性能账: 角标模式所有 label 可见 → 下面 `hidden||alpha<=0.01` 早退失效
+    //   → 每图标每帧都做一次 convertRect + 纵带比较(layoutSubviews 每帧调本函数)。
+    //   另: sDockFrame 会在旋转时被清空(见 ctor 里的 UIDeviceOrientationDidChange 观察者, .39 加),
+    //   但那是【设备朝向】通知而非界面几何通知 —— 平放/翻面也发, 而 iPad 分屏这类真几何变更不发,
+    //   故横屏纵带仍有短暂错位窗口(下次 MKUpdateDockFrame 惰性重算才纠正)。角标模式一并免疫。
+    //   (v2.0.66.93 修正: 此处原注释写「sDockFrame 只在为空时刷新、转屏后不失效」, 与 .39 起的
+    //    旋转清缓存实现直接矛盾, 会把后来人引向错误结论 —— 已按代码现状改写。)
         //   ⚠️ 这【不是死码】: MKDockStrayHide 是两模式共用函数, 不在 `if (!MKHideNames())` 分支内。
         if (!MKHideNames()) return NO;                     // 角标模式: 只认真 dock 子树(dockCtx), 纵带一概不管
         if (lbl.hidden || lbl.alpha <= 0.01f) return NO;   // 已不可见 → 无需判定(最常见早退路径)
@@ -3540,6 +3710,7 @@ static void MKUpdate(SBIconView *self) {
             return;
         }
         CGRect indicatorFrame = MKIndicatorFrameInOverlay(self, overlay, cfg);
+        MKCacheGeoForBid(bundleID, self, overlay, cfg);   // v2.0.66.103: 图标可见时刷新几何缓存(离屏页切模式即时重画用)
 
         // v1.6.64: 统一用「按 bid 索引的 overlay 指示器」作为唯一真相来源（替代旧的 self 子视图关联）。
         indicator = MKFindIndicator(bundleID);
@@ -3717,6 +3888,43 @@ static void MKClearPendingInView(UIView *root) {
 // 刷新所有图标
 // ====================================================================
 
+// ────────────────────────────────────────────────────────────────────
+// v2.0.66.96 (B) 图标遍历根窗口【并集】—— 修「切模式后别页指示器不是每次都回来」
+// ────────────────────────────────────────────────────────────────────
+// 病根不在 .95 的补做时机, 而在【遍历根】: 本工程所有"找全部 SBIconView"的遍历都以
+// [UIApplication sharedApplication].windows 为根, 而这个数组在 iOS 16 SpringBoard 上
+// 返回不全 —— 工程自己在 MKRefreshIconForBundleID 头部(L3818)早有记载。
+// 于是 .95 把重建推迟到 becomeActive 也只是提高了成功率: 那一刻若 windows 仍不含图标窗口,
+// 整趟照样落空 → 用户实测「不是每次成功」。
+//
+// 修法: 根集取并集 —— 官方 windows ∪ 我们自己两张表里视图的 .window。
+//   · sContainerToOverlay 的 key 是图标滚动容器(我们亲手 addSubview 过 overlay), 其 .window 必是图标窗口;
+//   · sBidToIconView 的 value 是图标视图本身, 其 .window 同理。
+// 注意与 .95 已否决的方案的区别: 那个方案是【拿注册表里的实例直接 MKUpdate】(会对已脱离
+//   视图触发 L3570 无上限 dispatch_async 自排期重试, 且注册表非全量实例源); 这里只
+//   【拿它取 window】, 遍历仍是从 window 起的全树 BFS → 实例仍是全量、仍走已验证路径。
+// 只增不减(官方 windows 全部保留 + 去重), 向后完全兼容; 表为空时退化为原行为。
+// 视图已脱离窗口时 .window 返回 nil, 自然被过滤 —— 不会引入野指针根。
+static NSArray *MKIconRootWindows(void) {
+    NSMutableArray *roots = [NSMutableArray array];
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w && ![roots containsObject:w]) [roots addObject:w];
+    }
+    if (sContainerToOverlay) {
+        for (UIView *c in [[sContainerToOverlay keyEnumerator] allObjects]) {
+            UIWindow *w = c.window;
+            if (w && ![roots containsObject:w]) [roots addObject:w];
+        }
+    }
+    if (sBidToIconView) {
+        for (UIView *iv in [[sBidToIconView objectEnumerator] allObjects]) {
+            UIWindow *w = iv.window;
+            if (w && ![roots containsObject:w]) [roots addObject:w];
+        }
+    }
+    return roots;
+}
+
 static void MKRefreshAllIcons() {
     MKSafe(^{
         if (!sInitDone) return;
@@ -3725,7 +3933,7 @@ static void MKRefreshAllIcons() {
         // reset it so main-screen icons are no longer skipped.
         if (sFolderOpen) {
             BOOL hasFolder = NO;
-            NSArray *wins = [UIApplication sharedApplication].windows;
+            NSArray *wins = MKIconRootWindows();   // v2.0.66.96 (B): 与主 BFS 同根集, 判据一致
             for (UIWindow *w in wins) {
                 if (MKFindDescendantView(w, @"SBFolderView")) { hasFolder = YES; break; }
             }
@@ -3734,7 +3942,7 @@ static void MKRefreshAllIcons() {
                 
             }
         }
-        NSArray *windows = [UIApplication sharedApplication].windows;
+        NSArray *windows = MKIconRootWindows();   // v2.0.66.96 (B): 官方 windows 不全 → 并入我方两表的 window
         for (UIWindow *window in windows) {
             NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
             while (stack.count > 0) {
@@ -4091,8 +4299,18 @@ static void MKDelayedInit() {
 static void MKMigrateLocationMode(void) {
     MKSafe(^{
         if (!sInitDone) return;
-        NSArray *windows = [UIApplication sharedApplication].windows;
-        for (UIWindow *window in windows) {
+        // v2.0.66.96 (B): 官方 windows 不全 → 已并入我方两表元素的 window。
+        // v2.0.66.97 (D): 再补一类根 —— sContainerToOverlay 里【window 为 nil】的容器。
+        //   window 非 nil 的容器其 window 已被 (B) 并进根集, 无需重复; window 为 nil 说明
+        //   该容器整棵子树不在任何可达窗口树内(切模式那一刻的典型状态), 这些图标的 label
+        //   若不单独作根就永远等不到迁移 → 名字保持 hidden=YES 永不复原(本函数存在的理由)。
+        NSMutableArray *roots = [NSMutableArray arrayWithArray:MKIconRootWindows()];
+        if (sContainerToOverlay) {
+            for (UIView *c in [[sContainerToOverlay keyEnumerator] allObjects]) {
+                if (c && !c.window && ![roots containsObject:c]) [roots addObject:c];
+            }
+        }
+        for (UIView *window in roots) {
             NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
             while (stack.count > 0) {
                 UIView *current = [stack lastObject];
@@ -4145,12 +4363,194 @@ static void MKMigrateLocationMode(void) {
     });
 }
 
+// ────────────────────────────────────────────────────────────────────
+// v2.0.66.95 跨模式重建「补做」机制
+// ────────────────────────────────────────────────────────────────────
+// 用户实机 .94: 「切换模式时只有返回桌面时的那屏会立马切换, 其他屏的有运行的 App
+// 需要重新点开一下界面才会重新出现指示器」。
+//
+// 根因: 切模式的 Darwin 通知抵达时, 用户人在【设置 App】里 —— SpringBoard 不在前台,
+//   主屏视图树此刻不可用/未布局。而 .92 修法是「MKRemoveAllIndicators() 全删 +
+//   MKRefreshAllIcons() 重建」:
+//     · 删除立刻生效(sBidToIndicator 是内存表, 与视图树无关) → 所有页全空;
+//     · 重建走 [UIApplication windows] BFS → 此刻【一个图标也遍历不到】, 整趟落空。
+//   本工程早在 MKRefreshIconForBundleID 头部就记载过这个坑(iOS 16 SpringBoard 活跃态下
+//   主屏图标视图常不在窗口遍历可达路径), 当时的对策是改用 sBidToIconView 注册表。
+//   删完又建不出来 → 唯一恢复通道退化成每个图标自己的 layoutSubviews(L4582 的
+//   `if (!indicator) { ... MKUpdate(self); }`), 而它只对【用户实际走到的那一页】触发
+//   → 精确对应用户描述。
+//   这正是 .92 注释里作为「可接受代价」记下的二级病灶换了症状: .92 之前是「别页指示器
+//   存在但 frame 是旧模式量级」(巨点/错位小弧), .92 之后变成「别页指示器干脆不存在」。
+//
+// 修法: 【删除仍留在不可见窗口内】(此时删无闪烁, 是 .92 选这个时机的正当理由),
+//   但把【重建】推迟到主屏真正活过来。SpringBoard 回前台必发
+//   UIApplicationDidBecomeActiveNotification(见 %ctor 内该观察者的既有断言 ——
+//   v1.6.72 正是靠它根治「解锁后指示器不回来」), 由它消费 pending 标记补做重建。
+//
+// ⚠️ 为什么不改用 sBidToIconView 注册表补刷(第一直觉方案, 已否决):
+//   ① 若图标视图仍在窗口树内, 窗口 BFS 本就能遍历到, 注册表纯冗余;
+//   ② 若图标视图已脱离(superview == nil), 对它调 MKUpdate 会命中 L3570 的
+//      `if (!overlay) { dispatch_async(^{ MKUpdate(self); }); return; }` ——
+//      该重试【无次数上限】, 对永久脱离的视图就是自我排期的无限循环烧 CPU。
+//   ③ 注册表每个 bid 只存「最后一次 MKUpdate 的实例」, 本就不是全量视图源。
+//   故正解是「等树活过来再走原本那条已验证的路径」, 而不是换遍历源。
+//
+// 三波(立即 + 0.6s + 1.5s)而非一次: becomeActive 抵达时主屏虽已入树, 离屏页的
+//   SBIconListView 可能尚未完成布局 → convertRect 得到的是过渡态几何。首波保证
+//   指示器【存在】(不存在才是用户能看见的 bug), 后两波经 MKUpdate 复用分支
+//   (L3642 `if (!CGRectIsEmpty(indicatorFrame))`) 把 frame 校正到位。
+//   这个「一次即时 + 一次延迟兜底」的形状与 MKUnlockRestore(L490/L495) 完全同构。
+// v2.0.66.104: 废弃上面的 becomeActive / pending / 三波机制 —— 模式切换改在 MKPrefsChangedCallback
+//   的 modeChanged 分支直接调 MKMigrateIndicatorsInPlace(MKConfig sharedConfig), 用几何缓存原地
+//   重画所有指示器(离屏页也命中缓存), 不依赖 becomeActive / 不 BFS / 不波次。下方大段注释描述的
+//   即是被废弃的策略, 仅作考古保留。
+static void MKMigrateIndicatorsInPlace(MKConfig *cfg);
+
+// ────────────────────────────────────────────────────────────────────
+// v2.0.66.96 (C) 反查「与指示器同 overlay 坐标系的图标实例」
+// ────────────────────────────────────────────────────────────────────
+// 修「替换模式拖参数不是每个 App 都即时更新」。
+//
+// 🔴 先坐实一个死码事实: .92 写的护栏 `[iv isDescendantOfView:ov]`(ov = ind.superview = overlay)
+//   【恒为 false】—— MKOverlayForContainer 是 `[container addSubview:ov]`, 图标视图是 container
+//   的另一侧后代, 从来不在 overlay 子树内。所以那段 frame 重算自 .92 引入起【一次都没跑过】。
+//   替换模式参数之所以「有些 App 会更新」, 靠的是回调末尾 MKRefreshAllIcons → MKUpdate 复用分支
+//   (L3642 `indicator.frame = indicatorFrame`) —— 而它只覆盖 BFS 可达的图标 → 当前页更新、别页不更新,
+//   与用户实机描述逐字吻合。
+//
+// 正解: 从 overlay 的【容器】(ov.superview)子树 BFS 反查 bid 匹配的 SBIconView。
+//   这样拿到的实例天然与该指示器同处一个 overlay 坐标系 —— 「防指示器飘到别页」的目的由
+//   【构造方式】保证, 不再需要一个恒假的事后判据。
+//   · 不调 MKOverlayForContainer(不懒建 overlay), 沿用 .92 的这条约束;
+//   · 算不出仍一字不动(下方 !CGRectIsEmpty 守卫), 沿用 .92 的保守原则;
+//   · 顺带覆盖文件夹指示器(key 为 __folder__%p, 永不进 sBidToIconView) —— 键按
+//     MKIsFolderIcon 合成, 与 MKUpdate 文件夹分支(L3195)同款; 它调的正是同一个
+//     MKIndicatorFrameInOverlay + MKIconCornerRadius, 故语义一致、无新风险。
+// 跳过 overlay 自身子树: 那里只有我们的指示器, 不含图标, 顺带省一段遍历。
+// 只在 prefs 变更时调用(非热路径), 每个 overlay 只 BFS 一次(下方 ovCache)。
+// v2.0.66.104: 跨模式(MKMigrateIndicatorsInPlace)已改用几何缓存, 不再调用本函数; 但本函数仍被
+//   「同模式参数变更」循环(下方 L4624 区域)使用 —— 同模式改 dotSize/badgeCorner 等需按【新 cfg】实时
+//   重算 frame, 缓存只存旧尺寸给不了新 frame, 故同模式仍需本 BFS 取 live iv 重算(离屏页取不到 → 跳过,
+//   退化为访问时由 MKUpdate 复位, 与 .97 行为一致)。
+static NSDictionary *MKBidToIconViewUnderOverlay(UIView *ov) {
+    if (!ov) return nil;
+    UIView *container = ov.superview;
+    if (!container) return nil;
+    Class ivCls = MKSBIconViewClass();
+    if (!ivCls) return nil;
+    NSMutableDictionary *map = [NSMutableDictionary dictionary];
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:container];
+    while (stack.count > 0) {
+        UIView *cur = [stack lastObject];
+        [stack removeLastObject];
+        if (cur == ov) continue;   // overlay 子树内只有指示器, 无图标
+        if ([cur isKindOfClass:ivCls]) {
+            SBIconView *iv = (SBIconView *)cur;
+            NSString *key = nil;
+            if (MKIsFolderIcon(iv)) {
+                id fIcon = [iv icon];
+                if (fIcon) key = [NSString stringWithFormat:@"__folder__%p", fIcon];
+            } else {
+                key = MKGetCachedBid(iv);
+            }
+            if (key.length && !map[key]) map[key] = iv;
+        }
+        for (UIView *sub in cur.subviews) [stack addObject:sub];
+    }
+    return map;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// v2.0.66.97 (D) 跨模式「原地迁移」—— 取代 .92 的「全删 + 窗口 BFS 重建」
+// ────────────────────────────────────────────────────────────────────
+// 🔴 .95/.96 都打错了层。.92 那套「MKRemoveAllIndicators() 全删 + MKRefreshAllIcons()
+//   重建」是【天生不对称】的:
+//     · 删除 = 内存表操作(sBidToIndicator), 与视图树无关 → 无条件即时成功;
+//     · 重建 = 依赖视图树可遍历 → 条件成功。
+//   切模式的通知抵达时用户人在设置 App 里 → 重建那一半落空 → 「删了没建回来」。
+//   .95 试图把重建【推迟】到 becomeActive、.96(B) 试图把遍历根【拓宽】, 两者都是在
+//   「让重建变得和删除一样可靠」= 与架构对抗。实机结果: 仍然只有回桌面那一屏立即生效。
+//   (且 .96(C) 的 frame 重算位于 MKPrefsChangedCallback 里 `if (modeChanged) { ... return; }`
+//    的【下方】→ 对跨模式路径根本不可达, 只服务同模式改参数。)
+//
+// 正解: 跨模式【不删除】, 原地把已有指示器改成新模式。三条支撑事实(均已核对源码):
+//  ① 跨模式真正需要改的只有 {frame, iconCornerRadius, badgeCorner} + applyConfig ——
+//     比对 MKUpdate 创建分支(initWithFrame: / setIconCornerRadius: / setBadgeCorner: /
+//     applyConfig), 模式相关的初始化恰好只有这些; tag / 关联 bid / 颜色跨模式不变。
+//     故「不删而是改」是可证完备的, 不是碰运气。
+//  ② 锚点从「窗口」换成「overlay」→ 彻底不依赖前台状态。ind.superview 即 overlay,
+//     ov.superview 即容器, 容器子树含该容器全部图标。视图层级【不因 App 不在前台而拆除】,
+//     故本路径不碰 [UIApplication windows]、不依赖 becomeActive、不依赖 layoutSubviews。
+//  ③ MKContainerForIconView 取的是第一个 UIScrollView 祖先 = 主屏所有页共同的
+//     SBIconScrollView → 【全主屏只有一个 overlay, 所有页的指示器都挂在它上面】→
+//     从 ov.superview 一趟 BFS 即覆盖所有页。这正是 .96(C) 能修好「别页参数不更新」的
+//     机理, 同一机理即可修「别页切模式不生效」。
+//
+// 保守设计:
+//  · 反查不到实例 / 算不出 frame 的【个别】指示器才删(交回 layoutSubviews 重建),
+//    而不是一律全删 —— 最坏退化为 .96 的行为, 不会更差。
+//  · 名字归属按新模式重置: 替换模式重新藏名并重登 sHiddenBids(上一行 MKMigrateLocationMode
+//    刚把两张表清空), 角标模式顺带 MKRestoreBetaOrphan(与 MKRefreshAllIcons L3824 同款)。
+//  · 仍保留 becomeActive pending + 0.6s/1.5s 波次, 降级为【幂等再同步】, 专治离屏页
+//    convertRect 拿到过渡态几何。
+static void MKMigrateIndicatorsInPlace(MKConfig *cfg) {
+    // v2.0.66.104: 回退 .97 风格「原地迁移」, 但用几何缓存替代 .97 的 overlay BFS。
+    //   .97 的 MKBidToIconViewUnderOverlay 在离屏页 SBIconView 不在树时反查落空 → 进 orphans 被删
+    //   → 别页指示器丢失(用户 .97 实机: 只有回桌面那屏更新)。.103 引入几何缓存后, 离屏页
+    //   直接用缓存几何原地重画, 不删、不 BFS、不波次 → 所有屏即时更新。
+    //   缓存几何在图标可见时(MKUpdate L3757 / MKRepositionIndicator L671)已落库, 对离屏页永久有效。
+    //   包禁隐式动画(.100)避免 0.25s 飘移 + 名字重叠。
+    MKWithoutImplicitActions(^{
+    MKSafe(^{
+        if (!sBidToIndicator || !cfg) return;
+        NSArray *bids = [[sBidToIndicator keyEnumerator] allObjects];
+        for (NSString *bid in bids) {
+            UIView *ind = [sBidToIndicator objectForKey:bid];
+            if (![ind isKindOfClass:[MKIndicatorDotView class]]) continue;
+            UIView *ov = ind.superview;   // 指示器 superview 即 overlay, 与缓存同一坐标系
+            if (!ov) continue;
+            CGRect f = MKIndicatorFrameFromCache(bid, ov, cfg);   // 离屏也命中缓存(无需 iv)
+            CGFloat rc = MKIconCornerRadiusFromCache(bid);
+            if (CGRectIsEmpty(f)) continue;   // 缓存未命中(该页自装包后从未可见): 退化为访问时由 MKUpdate 重建, 不删(最坏=原 .97 行为, 不回归)
+            MKIndicatorDotView *dot = (MKIndicatorDotView *)ind;
+            if (rc > 0) [dot setIconCornerRadius:rc];
+            [dot setBadgeCorner:cfg.badgeCorner];
+            dot.frame = f;
+            dot.hidden = NO;
+            [dot applyConfig];   // alpha = cfg.opacity + setNeedsDisplay(按新模式重画)
+            // 名字归属: 离屏无 iv, 由 MKUpdate 在页面可见时按新模式重藏; 此处只管几何/绘制, 不碰 label。
+        }
+    });
+    });
+}
+
+// ────────────────────────────────────────────────────────────────────
+// v2.0.66.96 (A) 模式基线 —— 修「装包后第一次切模式必出巨型圆点/错位小弧」
+// ────────────────────────────────────────────────────────────────────
+// 原实现把这两个变量写成 MKPrefsChangedCallback 的【函数内 static】, 初值
+// (MKLocationReplace, NO)。于是 respring 后【第一次】收到 prefs 通知时 hadOld 恒为 NO
+// → modeChanged 恒为 NO, 无论用户这次是不是真切了模式。
+// 后果: 首次切模式不走下面 .92 的全量重建, 而是掉进「同模式参数变更」循环 ——
+// 那个循环只 setNeedsDisplay(frame 重算还恰好是死码, 见上方 C), 于是精确制造出 .92
+// 注释里写明的病灶「新模式的绘制代码 + 旧模式的 frame」:
+//   · 角标(90x90 frame) → 替换: CGContextFillEllipseInRect 把整个 frame 当圆点本体画
+//     = 约 89pt 的【巨型圆点】(用户实机「切换角标模式后出现过一次巨型圆点」);
+//   · 替换(6~40pt frame) → 角标: W = rect.w - 30 变负 → 兜底 rc≈2pt = 又小又错位的小弧。
+// 之后 sLastModeValid 已为 YES, 重复切换全走正路 → 用户「之后重复切换测试没碰到过」。
+// 症状「只出现一次、之后不复现」正是函数内 static 首次未初始化的指纹。
+//
+// 修法: 提为文件级 static, 在 %ctor 里按【当前真实 locationMode】置好基线。
+// 这样首次通知的判定即准确: 真切模式 → YES 走全量重建; 只拖滑块 → NO 走同模式循环。
+// 与 MKIsDisabled 早退的关系: ctor 若因 disabled 提前 return, 基线保持 (Replace, NO),
+// 但那种情况下插件整体不工作, 无指示器可画错, 无害。
+static MKLocationMode sLastLocationMode = MKLocationReplace;
+static BOOL sLastModeValid = NO;
+
 static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observer,
                                     CFStringRef name, const void *object,
                                     CFDictionaryRef userInfo) {
     // v2.0.66.87: locationMode 变化检测必须在 reload 之前取旧值
-    static MKLocationMode sLastLocationMode = MKLocationReplace;
-    static BOOL sLastModeValid = NO;
+    // v2.0.66.96 (A): 两个 static 已提到函数外并由 %ctor 初始化基线, 见上方说明。
     MKLocationMode oldMode = sLastLocationMode;
     BOOL hadOld = sLastModeValid;
     [[MKConfig sharedConfig] reload];
@@ -4178,10 +4578,39 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     //  离屏残留问题一并消失(指示器直接不存在, 等该图标下次 layout 时按新模式新建)。
     //  MKRemoveAllIndicators 会清 sHiddenBids/sHiddenLabelToBid, 但 MKMigrateLocationMode 上一行
     //  刚跑完、本来就要清这两张表 → 语义不冲突。
+    //
+    // ★ v2.0.66.95: 上面这套【只在 SpringBoard 主屏当前可遍历时才完整成立】。
+    //   切模式的通知几乎总是在用户【还在设置 App 里】时抵达 → 窗口 BFS 一个图标也遍历不到,
+    //   于是「删掉了、没建回来」, 只有用户回桌面后那一页靠 layoutSubviews 补建 →
+    //   别页需要手动翻/点开才出现(用户 .94 实机报告)。故追加 pending 标记, 由
+    //   UIApplicationDidBecomeActiveNotification 在主屏真正活过来时补做重建。
+    //   立即那一趟仍保留: 若通知恰好在桌面态抵达(如从设置返回后再改, 或第三方工具改键),
+    //   它一趟就完事, pending 那次只是幂等重刷。
+    // ★ v2.0.66.97 (D): 跨模式改为【原地迁移】, 不再 MKRemoveAllIndicators 全删。
+    //   上面 .92/.95 那套的病根是「删除无条件成功、重建条件成功」的不对称(详见
+    //   MKMigrateIndicatorsInPlace 上方论证)。现改为按 overlay 锚点原地改写已有指示器。
+    //
+    // ★ v2.0.66.98 (E-2): D 的【执行时机】同样错了 —— 从本回调挪到 becomeActive 消费点。
+    //   .97 把 D 放在这里, 逻辑上不依赖前台状态(不碰 [UIApplication windows]、不等
+    //   layoutSubviews), 但实机证明前提不成立: 通知抵达时用户还在设置 App 内, 【其他页的
+    //   SBIconView 并不在容器子树里】 → MKBidToIconViewUnderOverlay 反查落空 → 那些指示器
+    //   进 orphans 被 MKRemoveIndicatorForBid 删掉 → 回桌面后只剩当前页, 其他页要等自然
+    //   refresh(打开文件夹即触发)才重建 —— 与 .92 同病, 只是换了个触发条件。
+    //   dock 不受影响, 因为 dock 图标在设置 App 期间也不卸载(用户实机: 「dock 不会这样」)。
+    //
+    //   而 becomeActive 那一刻(上滑回桌面)其他页【是可达的】—— 用户实测「打开文件夹就刷新
+    //   出来」证明 refresh 能命中它们; 当前屏能立马好则证明该通知确实派发。把 D 挪到消费点,
+    //   一趟容器子树 BFS 即覆盖所有页; 紧随的三波 refresh 作幂等再同步与补齐。
+    //
+    //   此处只标记 pending, 不迁移也不删除 —— 此刻用户看不见桌面, 晚一点执行零代价,
+    //   而在这里执行的唯一后果就是把反查不到的其他页删掉(.97 的实机症状)。
     if (modeChanged) {
-        MKRemoveAllIndicators();
-        MKRefreshAllIcons();
-        MKRefreshFolderIcons();
+        // v2.0.66.104: 回退 .97 风格「prefs 回调内原地迁移」, 但用几何缓存替代 .97 的
+        //   overlay BFS(离屏页 SBIconView 不在树 → 反查落空 → orphans 被删 → 别页不更新)。
+        //   缓存几何在图标可见时(MKUpdate / MKRepositionIndicator)已落库, 对离屏页永久有效,
+        //   故此处直接按缓存原地重画所有指示器, 无需 becomeActive / BFS / 波次。
+        //   包禁隐式动画(.100)避免 0.25s 飘移 + 名字重叠。
+        MKMigrateIndicatorsInPlace([MKConfig sharedConfig]);
         return;
     }
     // v2.0.66.81: 角标参数(badgeCorner/thickness/inset)变更时刷新已存在的指示器。
@@ -4201,27 +4630,37 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     //   等该图标下次 layout 由 MKRepositionIndicator/MKUpdate 复位) —— 绝不 hidden=YES,
     //   否则文件夹指示器(key 是 __folder__%p, 永不进 sBidToIconView)会被一律藏起来,
     //   而 layoutSubviews 对文件夹指示器只管藏名不管几何 → 可能一直藏到下次 gen 变更, 是回归。
+    // ★ v2.0.66.96 (C): 图标实例来源由 sBidToIconView【改为按 overlay 反查】。
+    //   原实现两个缺陷叠加导致 frame 重算【从未执行过】:
+    //     ① sBidToIconView 每 bid 只存「最后一次 MKUpdate 的实例」, 多页桌面常属别页;
+    //     ② 护栏 [iv isDescendantOfView:ov] 中 ov 是 overlay, 而 overlay 是 container 的子视图、
+    //        与图标视图是兄弟侧分支 —— 图标【永远不可能】是 overlay 的后代 → 条件恒假。
+    //   现改为从 ov.superview(容器)子树反查同 bid 的图标实例: 拿到的实例天然与该指示器
+    //   共处同一 overlay 坐标系, 「防飘页」由构造方式保证, 不再依赖那个恒假判据。
+    //   每个 overlay 只 BFS 一次(ovCache 按 overlay 指针缓存本次回调内的结果)。
     if (sBidToIndicator) {
         MKConfig *cfg = [MKConfig sharedConfig];
         NSArray *bids = [[sBidToIndicator keyEnumerator] allObjects];
+        // overlay(指针) → {bid: SBIconView}; 仅本次回调内有效, 用 NSValue 包指针作 key(不 retain 视图)
+        NSMutableDictionary *ovCache = [NSMutableDictionary dictionary];
         for (NSString *bid in bids) {
             UIView *ind = [sBidToIndicator objectForKey:bid];
             if (![ind isKindOfClass:[MKIndicatorDotView class]]) continue;
             [(MKIndicatorDotView *)ind setBadgeCorner:cfg.badgeCorner];
-            SBIconView *iv = sBidToIconView ? [sBidToIconView objectForKey:bid] : nil;
-            if (iv) {
-                CGFloat rc = MKIconCornerRadius((UIView *)iv);
-                if (rc > 0) [(MKIndicatorDotView *)ind setIconCornerRadius:rc];
-                // ⚠️ sBidToIconView 存的是「最后一次 MKUpdate 的图标实例」, 多页桌面下可能是
-                //   另一页的实例(见 MKIndicatorFrameInOverlay 头部警告) → 用它算出的 frame 属于
-                //   另一个 overlay 坐标系, 直接套上去 = 指示器飘到别页。判据: 该图标必须真的在
-                //   指示器当前所挂的 overlay 子树内。
-                //   直接用 ind.superview 而不调 MKOverlayForContainer —— 后者会懒建 overlay, 在这里
-                //   为一个当前没有 overlay 的容器凭空造一个是纯副作用。
-                UIView *ov = ind.superview;
-                if (ov && [iv isDescendantOfView:ov]) {
+            UIView *ov = ind.superview;
+            if (ov) {
+                NSValue *ovKey = [NSValue valueWithPointer:(__bridge const void *)ov];
+                NSDictionary *m = ovCache[ovKey];
+                if (!m) {
+                    m = MKBidToIconViewUnderOverlay(ov) ?: @{};
+                    ovCache[ovKey] = m;
+                }
+                SBIconView *iv = m[bid];
+                if (iv) {
+                    CGFloat rc = MKIconCornerRadius((UIView *)iv);
+                    if (rc > 0) [(MKIndicatorDotView *)ind setIconCornerRadius:rc];
                     CGRect f = MKIndicatorFrameInOverlay(iv, ov, cfg);
-                    if (!CGRectIsEmpty(f)) ind.frame = f;
+                    if (!CGRectIsEmpty(f)) ind.frame = f;   // 算不出 → 一字不动(绝不 hidden=YES)
                 }
             }
             [ind setNeedsDisplay];
@@ -4229,6 +4668,27 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
     }
     MKRefreshAllIcons();
     MKRefreshFolderIcons();
+}
+
+// ────────────────────────────────────────────────────────────────────
+// v2.0.66.93 注销 SpringBoard（设置页「注销 SpringBoard」按钮）
+// ────────────────────────────────────────────────────────────────────
+// 设置 App 那侧只负责发 Darwin 通知；真正的退出必须在 SpringBoard 进程内做 ——
+// 设置 App 没有杀 SpringBoard 的权限, 而我们的 dylib 就注入在 SpringBoard 里。
+// 用 exit(0): launchd 监管 SpringBoard, 退出后立即重启, 这就是标准 respring。
+//   · 不引入 SpringBoardServices / FBSSystemService(SBSRelaunchAction) 依赖 —— 少一个私有
+//     framework 链接 = 少一处跨版本崩点, 且 Makefile 不用改 PRIVATE_FRAMEWORKS。
+//   · 不用 -performSelector: 打私有 API —— 本工程 ARC + CI 开 -Werror,
+//     -Warc-performSelector-leaks 会直接编译失败(见 MKRootListController.m 同款说明)。
+// 延迟 0.35s 再退出: 让本 CFNotification 回调先返回、设置 App 那侧的确认弹窗收起动画走完,
+// 否则用户观感是「点一下整个界面卡死」而不是「正常注销」。
+static void MKRespringCallback(CFNotificationCenterRef center, void *observer,
+                               CFStringRef name, const void *object,
+                               CFDictionaryRef userInfo) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        exit(0);
+    });
 }
 
 // ====================================================================
@@ -5066,7 +5526,7 @@ static void MKRefreshFolderIcons(void) {
         sFolderContentGen++;
         Class ivCls = MKSBIconViewClass();
         NSInteger total = 0;
-        NSArray *wins = [UIApplication sharedApplication].windows;
+        NSArray *wins = MKIconRootWindows();   // v2.0.66.96 (B): 同 MKRefreshAllIcons, 官方 windows 不全
         for (UIWindow *w in wins) {
             UIView *home = MKFindDescendantView(w, @"SBIconScrollView");
             if (home) total += MKUpdateFolderIconsUnder(home, ivCls);
@@ -5096,11 +5556,26 @@ static void MKRefreshFolderIcons(void) {
         return;
     }
 
+    // ★ v2.0.66.96 (A): locationMode 基线初始化 —— 必须在注册 prefs 观察者【之前】。
+    //   原实现两个变量是 MKPrefsChangedCallback 的函数内 static(初值 Replace/NO) →
+    //   respring 后第一次收到通知时 modeChanged 恒为 NO, 首次切模式因此走进「同模式参数
+    //   变更」分支 = 新模式绘制代码 + 旧模式 frame → 巨型圆点 / 错位小弧(用户实机第②点)。
+    //   此处按当前真实配置置基线, 首次判定即准确。sharedConfig 首次访问会自行 reload。
+    sLastLocationMode = [MKConfig sharedConfig].locationMode;
+    sLastModeValid = YES;
+
     // ─── Darwin 通知 ──────────
     CFNotificationCenterAddObserver(
         CFNotificationCenterGetDarwinNotifyCenter(),
         NULL, MKPrefsChangedCallback,
         CFSTR("com.mk.runningdotindicator.reload"),
+        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+
+    // v2.0.66.93: 设置页「注销 SpringBoard」按钮 → 设置 App 发此通知, 由 SpringBoard 内自行退出。
+    CFNotificationCenterAddObserver(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        NULL, MKRespringCallback,
+        CFSTR("com.mk.runningdotindicator.respring"),
         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
     // ─── 锁屏/解锁通知（v1.6.69）──────────
@@ -5141,6 +5616,8 @@ static void MKRefreshFolderIcons(void) {
                         
                     }
                 }
+                // v2.0.66.104: 跨模式重建不再经此观察者 —— 已改到 MKPrefsChangedCallback 的 modeChanged 分支
+                //   直接 MKMigrateIndicatorsInPlace(几何缓存, 离屏也命中)。下方 `if (!sLocked) return;` 解锁复位逻辑保持不变。
                 if (!sLocked) return;   // 非锁屏态（如普通切 App 回前台），不动
                 sLocked = NO;
                 // v2.0.66.32: 解锁即时 un-hide(原生携带), 圆点随原生锁屏揭开与主屏一同揭示, 统一解锁动画。
