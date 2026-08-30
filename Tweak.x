@@ -4610,7 +4610,12 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
         //   缓存几何在图标可见时(MKUpdate / MKRepositionIndicator)已落库, 对离屏页永久有效,
         //   故此处直接按缓存原地重画所有指示器, 无需 becomeActive / BFS / 波次。
         //   包禁隐式动画(.100)避免 0.25s 飘移 + 名字重叠。
+        // v2.0.66.106: 切模式后补一趟全量刷新(MKRefreshAllIcons, 整树 BFS, 已验证可扛滚动/翻停
+        //   调用) —— 把「从未翻到/未建过指示器」的页(尤其文件夹内部 mini 图标与极少访问页)也建出来,
+        //   消除 .104/.105 残留的「部分 App/文件夹更新慢」(那些页此前只能等你翻到才懒建)。
+        //   代价: 视图树不可达的离屏页仍无能为力(硬下限, 需从图标模型直接算几何的 B 方案)——本版先上低成本 A。
         MKMigrateIndicatorsInPlace([MKConfig sharedConfig]);
+        MKRefreshAllIcons();
         return;
     }
     // v2.0.66.81: 角标参数(badgeCorner/thickness/inset)变更时刷新已存在的指示器。
