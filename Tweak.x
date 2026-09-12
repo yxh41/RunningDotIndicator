@@ -224,6 +224,7 @@ static NSMutableSet<NSString*> *sHiddenBids = nil;          // 当前「有指�
 static void *kMKLabelBidKey = &kMKLabelBidKey;              // v1.6.93: label→bid 直接关联键（藏名时写入，显示名时清 nil）
 // 前向声明（定义见文件后部）
 static NSString *MKLabelToBid(UIView *label);
+static NSString *MKRunningBidForLabel(UIView *label); // v2.0.66.108: 容器无关实时藏名反查
 static void MKInstallLabelHook(void);
 // v2.0.66.103: 几何缓存(定义紧随 MKRepositionIndicator 之后)
 static void MKCacheGeoForBid(NSString *bid, SBIconView *iv, UIView *overlay, MKConfig *cfg);
@@ -2322,6 +2323,34 @@ static NSString *MKLabelToBid(UIView *label) {
     return nil;
 }
 
+// v2.0.66.108: 容器无关实时藏名反查 —— 复用 MKLabelToBid 的反查链(SBIconView 直接持有指针 /
+// 兄弟 / 祖先 / 几何 MKIconViewForLabel), 但【不要求 bid ∈ sHiddenBids】, 改判 MKIsAppRunning(bid)。
+// 针对 dock/关文件夹缩略图/负一屏 label 从没进过 MKUpdate → 不在 sHiddenBids → 源级钩子全不认的死穴。
+static NSString *MKRunningBidForLabel(UIView *label) {
+    if (!label || !MKHideNames()) return nil;
+    Class ivCls = MKSBIconViewClass();
+    if (!ivCls) return nil;
+    NSString *(^bidOf)(UIView *) = ^NSString *(UIView *v){
+        if (!v || ![v isKindOfClass:ivCls]) return nil;
+        SBIconView *siv = (SBIconView *)v;
+        if (MKIsFolderIcon(siv)) { id f = [siv icon]; return f ? [NSString stringWithFormat:@"__folder__%p", f] : nil; }
+        return MKGetCachedBid(siv);
+    };
+    NSString *b = nil;
+    UIView *ivForLabel = objc_getAssociatedObject(label, &kMKLabelIconKey);
+    if (ivForLabel && (UIView *)objc_getAssociatedObject(ivForLabel, &kMKLabelKey) == label) {
+        b = bidOf(ivForLabel);
+    }
+    if (!b.length) {
+        UIView *p = label.superview;
+        if (p) for (UIView *s in p.subviews) { if ((b = bidOf(s)).length) break; }
+    }
+    if (!b.length) { UIView *a = label; while (a) { if ((b = bidOf(a)).length) break; a = a.superview; } }
+    if (!b.length) { UIView *owner = MKIconViewForLabel(label); if (owner) b = bidOf(owner); }
+    if (b.length && ![b hasPrefix:@"__folder__"] && MKIsAppRunning(b)) return b;
+    return nil;
+}
+
 // ====================================================================
 // v2.0.66.12: 几何串名探针(STRAY-NAME) —— 由 v2.0.66.10 纯祖先链判定升级为「几何优先 + 容器兜底」, 覆盖 Dock 与负一屏 Today/Widget; 详见 MKStrayNameProbe
 // --------------------------------------------------------------------
@@ -2673,6 +2702,17 @@ static NSString *MKShouldHideLabel(UIView *label, NSString *bid, BOOL *outMapOnl
         if (outMapOnly) *outMapOnly = (!hasBid && inMap);
         return useBid;
     }
+    // v2.0.66.108: 容器无关实时藏名 —— sHiddenBids 推送收不到 dock/缩略图/负一屏 label,
+    // 改走「label→SBIconView→SBIcon 反查 bid + 实时 MKIsAppRunning」纯函数判定, 绕开死穴。
+    if (MKHideNames()) {
+        NSString *rbid = MKRunningBidForLabel(label);
+        if (rbid.length) {
+            MKAssocLabelBid(label, rbid);
+            [label.layer removeAllAnimations];
+            if (outMapOnly) *outMapOnly = NO;
+            return rbid;
+        }
+    }
     if (outMapOnly) *outMapOnly = NO;
     return nil;
 }
@@ -2727,7 +2767,7 @@ static void MKSetHiddenHook(id self, SEL _cmd, BOOL hidden) {
         } else if (MKHideNames() && MKViewInFolderThumb((UIView *)self)) {
             // v2.0.66.1: 缩略图内运行 App 名称 label 经 setHidden: 复显时兜底钉藏(仅运行 App + 仅缩略图上下文)
             NSString *fb = MKFolderThumbBid((UIView *)self);
-            if (fb.length && sHiddenBids && [sHiddenBids containsObject:fb]) {
+            if (fb.length && ((sHiddenBids && [sHiddenBids containsObject:fb]) || MKIsAppRunning(fb))) { // v2.0.66.109: 缩略图 mini 图标从未进 MKUpdate → 不在 sHiddenBids → 仅凭权威集必漏判 → 改判实时 MKIsAppRunning(文件夹合成 key 恒 NO, 不会误藏文件夹名)
                 hidden = YES;
                 MKAssocLabelBid((UIView *)self, fb);
                 [((UIView *)self).layer removeAllAnimations];
@@ -2789,7 +2829,7 @@ static void MKSetAlphaHook(id self, SEL _cmd, CGFloat a) {
         } else if (MKHideNames() && MKViewInFolderThumb((UIView *)self)) {
             // v2.0.66.1: 缩略图内运行 App 名称 label 经 setAlpha: 复显时兜底钉藏(仅运行 App + 仅缩略图上下文)
             NSString *fb = MKFolderThumbBid((UIView *)self);
-            if (fb.length && sHiddenBids && [sHiddenBids containsObject:fb]) {
+            if (fb.length && ((sHiddenBids && [sHiddenBids containsObject:fb]) || MKIsAppRunning(fb))) { // v2.0.66.109: 缩略图 mini 图标从未进 MKUpdate → 不在 sHiddenBids → 仅凭权威集必漏判 → 改判实时 MKIsAppRunning(文件夹合成 key 恒 NO, 不会误藏文件夹名)
                 a = 0.0f;
                 MKAssocLabelBid((UIView *)self, fb);
                 [((UIView *)self).layer removeAllAnimations];
@@ -3063,13 +3103,16 @@ static void MKSetIconLabelAlphaHook(id self, SEL _cmd, CGFloat a) {
         // 「按容器 default-deny 纠正非法名字」路径(缩略图/dock 原生无名字)。
         if (MKHideNames()) {
         NSString *bid = MKGetCachedBid((SBIconView *)self);
-        BOOL hasBid = (bid.length && sHiddenBids && [sHiddenBids containsObject:bid]);
+        // v2.0.66.109: 本 setter 的 self 是 SBIconView(不是 label) → 不经 MKShouldHideLabel,
+        // 缩略图 mini 图标从未进 MKUpdate → 不在 sHiddenBids → 关文件夹末拍闪名必然漏网;
+        // 改判实时 MKIsAppRunning(与 MKShouldHideLabel 同思路)。文件夹合成 key 恒 NO → 不误藏文件夹名。
+        BOOL hasBid = (bid.length && ((sHiddenBids && [sHiddenBids containsObject:bid]) || MKIsAppRunning(bid)));
         // v2.0.66.1: 关窗缩略图稳态钉藏——迷你图标在 SBFolderIconImageView 内、且属运行中 App(bid∈sHiddenBids)，
         // 即使关窗守卫(sFolderClosing)过期后的周期复显也钉死名称(MKGetCachedBid 瞬态失效时兜底解析)。
         // 仅缩略图上下文 + 仅运行 App，绝不按 FolderIcon 血统 blanket 藏(避免过藏文件夹名)。
         if (!hasBid && MKViewInFolderThumb((UIView *)self)) {
             NSString *fb = MKFolderThumbBid((UIView *)self);
-            if (fb.length && sHiddenBids && [sHiddenBids containsObject:fb]) {
+            if (fb.length && ((sHiddenBids && [sHiddenBids containsObject:fb]) || MKIsAppRunning(fb))) { // v2.0.66.109: 缩略图 mini 图标从未进 MKUpdate → 不在 sHiddenBids → 仅凭权威集必漏判 → 改判实时 MKIsAppRunning(文件夹合成 key 恒 NO, 不会误藏文件夹名)
                 bid = fb;
                 hasBid = YES;
             }
