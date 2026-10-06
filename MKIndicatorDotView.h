@@ -25,4 +25,8 @@ extern const CGFloat MKBadgeFrameExtra;
 @property (nonatomic, assign) CGFloat iconCornerRadius;  // 图标图片真实圆角
 @property (nonatomic, assign) MKBadgeCorner badgeCorner; // 角标所在角落
 
+// v2.0.66.121: 混搭模式 —— 该指示器所属分区的模式, 绘制时取代全局 [MKConfig sharedConfig].locationMode
+//   (同一桌面三种模式并存时, 每个指示器按自己分区的模式画: 替换=圆点/横条, 角标=弧线, 下划线=横线)。
+@property (nonatomic, assign) MKLocationMode mkLocationMode;
+
 @end
