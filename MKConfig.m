@@ -125,6 +125,21 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
     id v = _prefs[@"locationMode"];
     return v ? (MKLocationMode)[v integerValue] : MKLocationReplace;
 }
+// v2.0.66.121: 混搭模式三分区独立模式键 —— 默认均 MKLocationReplace(= 现状单模式行为, 旧用户无需迁移)。
+//   locationMode 仍作「主屏」别名; 新用户/新配置走 locationModeHome / Dock / Folder 三键。
+- (MKLocationMode)locationModeHome {
+    id v = _prefs[@"locationModeHome"];
+    if (!v) v = _prefs[@"locationMode"];   // v2.0.66.121: 兼容旧单模式键(升级用户, 旧键即主屏模式)
+    return v ? (MKLocationMode)[v integerValue] : MKLocationReplace;
+}
+- (MKLocationMode)locationModeDock {
+    id v = _prefs[@"locationModeDock"];
+    return v ? (MKLocationMode)[v integerValue] : MKLocationReplace;
+}
+- (MKLocationMode)locationModeFolder {
+    id v = _prefs[@"locationModeFolder"];
+    return v ? (MKLocationMode)[v integerValue] : MKLocationReplace;
+}
 // v2.0.66.80: 角标角落，默认左上
 - (MKBadgeCorner)badgeCorner {
     id v = _prefs[@"badgeCorner"];
@@ -152,6 +167,26 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
     CGFloat p = v ? [v floatValue] : 90.0f;
     if (p < 60.0f) p = 60.0f; else if (p > 100.0f) p = 100.0f;
     return p / 100.0f;
+}
+
+// v2.0.66.114: 底沿下划线几何三参数。钳制形态照抄 badgeThickness/badgeInset(L136-146) 同款。
+// ⚠️ underlineWidthRatio 的 plist 存【百分数 30~90】(滑块直观, 与 badgeArcLength 同款约定),
+//    此处换算为 0.30~0.90 小数。漏掉这次 /100 会让 55 被钳成 0.30(永远最窄)。
+- (CGFloat)underlineWidthRatio {
+    id v = _prefs[@"underlineWidthRatio"];
+    CGFloat p = v ? [v floatValue] : 55.0f;
+    if (p < 30.0f) p = 30.0f; else if (p > 90.0f) p = 90.0f;
+    return p / 100.0f;
+}
+- (CGFloat)underlineThickness {
+    id v = _prefs[@"underlineThickness"];
+    CGFloat t = v ? [v floatValue] : 2.0f;
+    return (t < 1.0f) ? 1.0f : (t > 4.0f ? 4.0f : t);
+}
+- (CGFloat)underlineGap {
+    id v = _prefs[@"underlineGap"];
+    CGFloat g = v ? [v floatValue] : 1.0f;
+    return (g < 0.0f) ? 0.0f : (g > 4.0f ? 4.0f : g);
 }
 
 + (UIColor *)colorFromHex:(NSString *)hex {

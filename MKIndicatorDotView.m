@@ -106,7 +106,26 @@ static void MKBezierSub(const CGPoint p[4], CGFloat t0, CGFloat t1, CGPoint out[
     //   (.87 太长 / .88 太短 / .82 好 / 又要再短 10%), 说明它是纯审美变量、无客观正解,
     //   故一次性做成可调滑块并把默认设为 90, 终结「改死值 → 推送 → 装包 → 再改」的循环。
     //   实现是沿曲线两端等量裁剪(见 MKBezierSub), 曲率不变 → 依旧贴合图标圆角。
-    if (cfg.locationMode == MKLocationBadge) {
+    // v2.0.66.114: 底沿下划线 —— 直填矩形, 【不加 MKBadgeFrameExtra 扩边】(那是角标弧线
+    //   容纳圆头用的; 本分支 frame 已是精确的下划线矩形, 扩边会导致偏移)。
+    //   线粗 <3 画直角、>=3 画 pill 圆角 —— 细线加圆角会显得发虚, 粗线直角则过于生硬。
+    if (self.mkLocationMode == MKLocationUnderline) {
+        CGContextRef uc = UIGraphicsGetCurrentContext();
+        if (!uc) return;
+        CGRect ur = CGRectInset(rect, 0.5f, 0.5f);
+        if (ur.size.width < 1.0f || ur.size.height < 1.0f) return;
+        UIBezierPath *up;
+        if (cfg.underlineThickness < 3.0f) {
+            up = [UIBezierPath bezierPathWithRect:ur];
+        } else {
+            up = [UIBezierPath bezierPathWithRoundedRect:ur
+                                             cornerRadius:ur.size.height / 2.0f];
+        }
+        [color setFill];
+        [up fill];
+        return;
+    }
+    if (self.mkLocationMode == MKLocationBadge) {
         // v2.0.66.105: 线宽随预览同构缩放 52/60 —— 原不缩放会让桌面弧线比预览粗 15%, 显得"重、不贴"
         CGFloat t = cfg.badgeThickness * (52.0f / 60.0f);
         CGFloat inset = cfg.badgeInset;
