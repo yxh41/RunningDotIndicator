@@ -10,7 +10,7 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
-			<string>RunningDotIndicator 2.0.66.111</string>
+			<string>RunningDotIndicator 2.0.66.129</string>
 			<key>footerText</key>
 			<string>为运行中的 App 图标添加指示器。App 运行时自动替换图标下方的名称文字，退出后恢复原名称。支持系统：iOS 16.x（roothide / rootless）；iOS 15 及更低不挂钩。</string>
 		</dict>
@@ -362,42 +362,139 @@
 	<string>修改后即时生效，无需注销或重启。</string>
 	</dict>
 
-		<!-- ===== 位置模式 ===== -->
-		<dict>
-			<key>cell</key>
-			<string>PSGroupCell</string>
-			<key>label</key>
-			<string>位置模式</string>
-			<key>footerText</key>
-			<string>替换名称：保留原行为，指示器替换 App 图标下方的名称文字。角标模式：指示器贴在图标四角之一（一条带圆角的弧线），不占用名称位置，名称正常显示。</string>
-		</dict>
+	<!-- ===== 位置模式 (v2.0.66.129) ===== -->
+	<dict>
+		<key>cell</key>
+		<string>PSGroupCell</string>
+		<key>label</key>
+		<string>位置模式</string>
+		<key>footerText</key>
+		<string>指示器在 App 图标上的位置。可选：替换名称 / 角标模式 / 底沿下划线 / 混搭模式。选中「混搭模式」后，可分别为「主屏 App / Dock / 文件夹」设置不同的位置模式，三者可任意混搭（例如主屏替换名称、Dock 角标、文件夹下划线）。未选中混搭模式时，三个区域共用同一位置模式，与旧版一致。修改后立即生效。</string>
+	</dict>
 
-		<dict>
-			<key>cell</key>
-			<string>PSLinkListCell</string>
-			<key>detail</key>
-			<string>PSListItemsController</string>
-			<key>label</key>
-			<string>指示器位置</string>
-			<key>defaults</key>
-			<string>com.mk.runningdotindicatorprefs</string>
-			<key>key</key>
-			<string>locationMode</string>
-			<key>default</key>
+	<dict>
+		<key>cell</key>
+		<string>PSLinkListCell</string>
+		<key>detail</key>
+		<string>PSListItemsController</string>
+		<key>label</key>
+		<string>位置模式</string>
+		<key>defaults</key>
+		<string>com.mk.runningdotindicatorprefs</string>
+		<key>key</key>
+		<string>locationMode</string>
+		<key>default</key>
+		<integer>0</integer>
+		<key>PostNotification</key>
+		<string>com.mk.runningdotindicator.reload</string>
+		<key>validTitles</key>
+		<array>
+			<string>替换名称</string>
+			<string>角标模式</string>
+			<string>底沿下划线</string>
+			<string>混搭模式</string>
+		</array>
+		<key>validValues</key>
+		<array>
 			<integer>0</integer>
-			<key>PostNotification</key>
-			<string>com.mk.runningdotindicator.reload</string>
-			<key>validTitles</key>
-			<array>
-				<string>替换名称</string>
-				<string>角标模式</string>
-			</array>
-			<key>validValues</key>
-			<array>
-				<integer>0</integer>
-				<integer>1</integer>
-			</array>
-		</dict>
+			<integer>1</integer>
+			<integer>2</integer>
+			<integer>3</integer>
+		</array>
+	</dict>
+
+	<dict>
+		<key>cell</key>
+		<string>PSLinkListCell</string>
+		<key>detail</key>
+		<string>PSListItemsController</string>
+		<key>label</key>
+		<string>主屏 App 位置模式</string>
+		<key>id</key>
+		<string>locationModeHome</string>
+		<key>defaults</key>
+		<string>com.mk.runningdotindicatorprefs</string>
+		<key>key</key>
+		<string>locationModeHome</string>
+		<key>default</key>
+		<integer>0</integer>
+		<key>PostNotification</key>
+		<string>com.mk.runningdotindicator.reload</string>
+		<key>validTitles</key>
+		<array>
+			<string>替换名称</string>
+			<string>角标模式</string>
+			<string>底沿下划线</string>
+		</array>
+		<key>validValues</key>
+		<array>
+			<integer>0</integer>
+			<integer>1</integer>
+			<integer>2</integer>
+		</array>
+	</dict>
+
+	<dict>
+		<key>cell</key>
+		<string>PSLinkListCell</string>
+		<key>detail</key>
+		<string>PSListItemsController</string>
+		<key>label</key>
+		<string>Dock 位置模式</string>
+		<key>id</key>
+		<string>locationModeDock</string>
+		<key>defaults</key>
+		<string>com.mk.runningdotindicatorprefs</string>
+		<key>key</key>
+		<string>locationModeDock</string>
+		<key>default</key>
+		<integer>0</integer>
+		<key>PostNotification</key>
+		<string>com.mk.runningdotindicator.reload</string>
+		<key>validTitles</key>
+		<array>
+			<string>替换名称</string>
+			<string>角标模式</string>
+			<string>底沿下划线</string>
+		</array>
+		<key>validValues</key>
+		<array>
+			<integer>0</integer>
+			<integer>1</integer>
+			<integer>2</integer>
+		</array>
+	</dict>
+
+	<dict>
+		<key>cell</key>
+		<string>PSLinkListCell</string>
+		<key>detail</key>
+		<string>PSListItemsController</string>
+		<key>label</key>
+		<string>文件夹位置模式</string>
+		<key>id</key>
+		<string>locationModeFolder</string>
+		<key>defaults</key>
+		<string>com.mk.runningdotindicatorprefs</string>
+		<key>key</key>
+		<string>locationModeFolder</string>
+		<key>default</key>
+		<integer>0</integer>
+		<key>PostNotification</key>
+		<string>com.mk.runningdotindicator.reload</string>
+		<key>validTitles</key>
+		<array>
+			<string>替换名称</string>
+			<string>角标模式</string>
+			<string>底沿下划线</string>
+		</array>
+		<key>validValues</key>
+		<array>
+			<integer>0</integer>
+			<integer>1</integer>
+			<integer>2</integer>
+		</array>
+	</dict>
 
 		<!-- ===== 角标设置 ===== -->
 		<dict>
@@ -501,6 +598,85 @@
 			<real>0</real>
 			<key>max</key>
 			<real>12</real>
+			<key>isContinuous</key>
+			<true/>
+			<key>showValue</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+		</dict>
+
+		<!-- ===== 下划线设置 (v2.0.66.114) ===== -->
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>下划线设置</string>
+			<key>footerText</key>
+			<string>仅在「底沿下划线」模式下生效。指示器画在图标底沿与名称之间的窄缝里，名称保持可见（不隐藏）。宽度按图标宽度比例缩放；间隙为距图标底沿的距离，0=紧贴图标。Dock 位置使用相同的宽度、粗细与距离。</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>label</key>
+			<string>下划线宽度 %</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>underlineWidthRatio</string>
+			<key>default</key>
+			<real>55</real>
+			<key>min</key>
+			<real>30</real>
+			<key>max</key>
+			<real>90</real>
+			<key>isContinuous</key>
+			<true/>
+			<key>showValue</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>label</key>
+			<string>下划线粗细</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>underlineThickness</string>
+			<key>default</key>
+			<real>2</real>
+			<key>min</key>
+			<real>1</real>
+			<key>max</key>
+			<real>4</real>
+			<key>isContinuous</key>
+			<true/>
+			<key>showValue</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.mk.runningdotindicator.reload</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
+			<string>PSSliderCell</string>
+			<key>label</key>
+			<string>与图标距离</string>
+			<key>defaults</key>
+			<string>com.mk.runningdotindicatorprefs</string>
+			<key>key</key>
+			<string>underlineGap</string>
+			<key>default</key>
+			<real>1</real>
+			<key>min</key>
+			<real>0</real>
+			<key>max</key>
+			<real>4</real>
 			<key>isContinuous</key>
 			<true/>
 			<key>showValue</key>
