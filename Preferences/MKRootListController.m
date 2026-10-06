@@ -7,6 +7,7 @@
 #import "MKRootListController.h"
 #import <UIKit/UIKit.h>
 #import <Preferences/PSSpecifier.h>
+#import <math.h>
 
 // v2.0.66.86: PSTableCell / PSControlTableCell 的两个私有访问器。
 // ⚠️ 必须用【类别声明】而不是 -performSelector: —— ARC 下 performSelector 会触发
@@ -34,10 +35,16 @@ static NSArray *MKAllPrefKeys(void) {
     if (!keys) keys = @[ @"enabled", @"shape", @"dotSize", @"barWidth", @"barHeight",
                          @"colorMode", @"color", @"customColor",
                          @"folderIndicators", @"keepBetaDot", @"opacity",
-                         @"locationMode", @"badgeCorner", @"badgeThickness",
-                         @"badgeArcLength", @"badgeInset" ];
+                         @"locationMode", @"locationModeHome", @"locationModeDock", @"locationModeFolder",
+                         @"badgeCorner", @"badgeThickness",
+                         @"badgeArcLength", @"badgeInset",
+                         @"underlineWidthRatio", @"underlineThickness", @"underlineGap" ];
     return keys;
 }
+
+// v2.0.66.122: 前向声明(定义在文件后部), 供上方 specifiers getter / 预览方法调用, 避免隐式声明(-Werror)。
+static NSInteger MKReadIntPref(NSString *key);
+static NSInteger MKEffectiveMode(void);
 
 // ── 2026 玻璃风格常量 ──
 static const CGFloat kHeroHeight = 150.0f;
@@ -63,6 +70,8 @@ static const CGFloat kLabelAreaH = 14.0f; // 图标下方名称区域典型高�
 @property (nonatomic, strong) UILabel  *previewTitle;    // 头图标题行
 @property (nonatomic, strong) UILabel  *previewCaption;   // 头图副标题
 @property (nonatomic, assign) BOOL      heroAnimated;     // 入场动画只播一次
+// v2.0.66.117: 滑块行的实际行高缓存(indexPath → 78)。见 -tableView:heightForRowAtIndexPath:
+@property (nonatomic, strong) NSMutableDictionary *rowHeights;
 @end
 
 @implementation MKRootListController
@@ -70,8 +79,94 @@ static const CGFloat kLabelAreaH = 14.0f; // 图标下方名称区域典型高�
 - (NSArray *)specifiers {
     if (!_specifiers) {
         _specifiers = [self loadSpecifiersFromPlistName:@"Root" target:self];
+        // v2.0.66.117: 规格重载(切换模式/恢复默认后 reloadSpecifiers)时清掉行高缓存,
+        //   避免旧的 indexPath→78 落到结构变了的行上。
+        [self.rowHeights removeAllObjects];
+        // v2.0.66.117: 给滑块行打 height 标记。
+        //   PSListController 自己实现了 -tableView:heightForRowAtIndexPath:, 会【完全忽略】
+        //   tableView.rowHeight(.116 就是栽在这: 行仍是 44pt, 而滑块被写在 y=44 处 → 整条被裁掉)。
+        //   若它读 specifier 的 height 属性, 这里就能一步到位(首帧即 78, 无跳变);
+        //   若不读, 下面 -tableView:heightForRowAtIndexPath: 的缓存兜底仍会把高度抬起来。
+        for (id obj in _specifiers) {
+            if (![obj isKindOfClass:[PSSpecifier class]]) continue;
+            PSSpecifier *spec = (PSSpecifier *)obj;
+            NSString *cls = [spec propertyForKey:@"cell"] ?: @"";
+            if ([cls rangeOfString:@"Slider"].location != NSNotFound) {
+                [spec setProperty:[NSNumber numberWithFloat:78.0f] forKey:@"height"];
+            }
+        }
+        // v2.0.66.124: 非混搭(主模式!=3)时, 从数据源【原地】移除三个分区子选择器(按 key 属性匹配)。
+        //   表格数据源读的是 _specifiers ivar 本体 —— .122 只改 getter 返回值无效; .123 的「按 plist id 定位子选择器」
+        //   按 plist id 键查找实测落空(id 键未必映射进 specifier identifier), 移除循环空转。
+        //   故双保险: ①此处 getter 载入时改 _specifiers 本体; ②reloadSpecifiers 里按同一 key 口径再过滤一次
+        //   (reloadSpecifiers 会先 self.specifiers=nil 让 super 从 plist 还原全量, 须重新过滤才能隐藏)。
+        if (MKReadIntPref(@"locationMode") != 3) {
+            NSMutableArray *kept = [NSMutableArray arrayWithCapacity:[_specifiers count]];
+            for (id obj in _specifiers) {
+                if ([obj isKindOfClass:[PSSpecifier class]]) {
+                    NSString *k = [(PSSpecifier *)obj propertyForKey:@"key"];
+                    if (k && ([k isEqualToString:@"locationModeHome"]
+                           || [k isEqualToString:@"locationModeDock"]
+                           || [k isEqualToString:@"locationModeFolder"])) {
+                        continue;
+                    }
+                }
+                [kept addObject:obj];
+            }
+            _specifiers = kept;
+        }
     }
     return _specifiers;
+}
+
+// v2.0.66.124: 条件隐藏三分区子选择器 —— 仅当主模式为混搭(=3)时才显示 locationModeHome/Dock/Folder。
+//   双保险(与 specifiers getter 同口径): 直接在【数据源 _specifiers ivar 本体】里按「key 属性」原地过滤,
+//   而非依赖「按 plist id 定位子选择器」的私有方法(.123 实测: id 键未必映射进 specifier 的 identifier,
+//   查找落空, 移除循环静默空转, 三子选择器仍显示)。
+//   ⚠️ 不用「定位后逐个删」的私有方法: 它会在删除同时直接动表格视图, 与 reloadSpecifiers 的整表重载
+//      时序打架; 直接原地重建 _specifiers 数组, super 随后的 reload 自然按新计数刷新, 无任何表格副作用。
+- (void)reloadSpecifiers {
+    // 先清空, 让 super 从 plist 重新载入(还原上一次被我们过滤掉、但当前应显示的子选择器),
+    // 否则切回混搭时子选择器不会回来。
+    self.specifiers = nil;
+    [super reloadSpecifiers];
+    // 非混搭(主模式!=3)时, 从数据源【原地】移除三个分区子选择器(按 key 属性匹配, 与 getter 同法)。
+    if (MKReadIntPref(@"locationMode") != 3) {
+        NSMutableArray *kept = [NSMutableArray arrayWithCapacity:[_specifiers count]];
+        for (id obj in _specifiers) {
+            if ([obj isKindOfClass:[PSSpecifier class]]) {
+                NSString *k = [(PSSpecifier *)obj propertyForKey:@"key"];
+                if (k && ([k isEqualToString:@"locationModeHome"]
+                       || [k isEqualToString:@"locationModeDock"]
+                       || [k isEqualToString:@"locationModeFolder"])) {
+                    continue;
+                }
+            }
+            [kept addObject:obj];
+        }
+        _specifiers = kept;
+    }
+}
+
+// v2.0.66.117: 逐行行高 —— 只把滑块行抬到 78pt, 其余行保持系统默认。
+// 🔴 绝不能再写 `tableView.rowHeight = 78`: 那是【全局】的, 会把开关/下拉/按钮/分组行
+//    一起撑成 78pt; 而且 PSListController 若实现了本回调, rowHeight 会被无视。
+// 判定顺序: 先看首帧是否已知该行是滑块(缓存) → 否则问 super(它可能已读 height 属性返 78)。
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    CGFloat base = 44.0f;
+    @try {
+        if ([[self superclass] instancesRespondToSelector:_cmd]) {
+            base = [super tableView:tableView heightForRowAtIndexPath:indexPath];
+        } else if (tableView.rowHeight > 0.0f) {
+            base = tableView.rowHeight;
+        }
+    } @catch (NSException *e) {
+        base = (tableView.rowHeight > 0.0f) ? tableView.rowHeight : 44.0f;
+    }
+    if (base <= 0.0f) base = 44.0f;
+    NSNumber *h = [self.rowHeights objectForKey:indexPath];
+    // v2.0.66.117: 滑块行取 78(缓存命中时) —— 缓存由 willDisplayCell 首帧写入。
+    return h ? [h floatValue] : base;
 }
 
 #pragma mark - 配置读取 / 颜色解析
@@ -217,12 +312,33 @@ static UIColor *MKColorFromHex(NSString *hex) {
     if (!self.previewIndicator || !self.previewIcon) return;
 
     // v2.0.66.84: 角标模式 —— 隐藏圆点/横条，改在图标角落画 squircle 1/4 弧，名称保留
-    NSInteger locMode = [[self readValueForKey:@"locationMode" default:@0 expectedClass:[NSNumber class]] integerValue];
+    // v2.0.66.122: 非混搭读主模式, 混搭读主屏子键(预览单图标反映主屏分区)。
+    NSInteger locMode = MKEffectiveMode();
     if (locMode == 1) {
         self.previewIndicator.hidden = YES;
         self.previewName.hidden      = NO;
         self.previewBadge.hidden     = NO;
         [self updateBadgePreview];
+        return;
+    }
+    // v2.0.66.114: 底沿下划线 —— 名称保留(不藏), 指示器复用 previewIndicator 画在图标底沿下方。
+    //   与 drawRect 同构: 宽 = 图标宽 × ratio, 粗 = thickness, y = 图标底沿 + gap;
+    //   粗细 <3 画直角(与 drawRect 的分支判据一致), >=3 画 pill 圆角。
+    if (locMode == 2) {
+        self.previewIndicator.hidden = NO;
+        self.previewName.hidden      = NO;
+        self.previewBadge.hidden     = YES;
+        CGFloat ratio = [[self readValueForKey:@"underlineWidthRatio" default:@55 expectedClass:[NSNumber class]] floatValue];
+        if (ratio < 30.0f) ratio = 30.0f; else if (ratio > 90.0f) ratio = 90.0f;
+        CGFloat th    = [[self readValueForKey:@"underlineThickness" default:@2  expectedClass:[NSNumber class]] floatValue];
+        if (th < 1.0f) th = 1.0f; else if (th > 4.0f) th = 4.0f;
+        CGFloat gap   = [[self readValueForKey:@"underlineGap" default:@1 expectedClass:[NSNumber class]] floatValue];
+        if (gap < 0.0f) gap = 0.0f; else if (gap > 4.0f) gap = 4.0f;
+        CGFloat iconW = self.previewIcon.frame.size.width;
+        CGFloat uy = CGRectGetMaxY(self.previewIcon.frame) + gap;
+        CGFloat ux = CGRectGetMidX(self.previewIcon.frame) - (iconW * ratio / 100.0f) / 2.0f;
+        self.previewIndicator.frame = CGRectMake(ux, uy, iconW * ratio / 100.0f, th);
+        self.previewIndicator.layer.cornerRadius = (th < 3.0f) ? 0.0f : th / 2.0f;
         return;
     }
     self.previewIndicator.hidden = NO;
@@ -392,7 +508,7 @@ static void MKPvSub(const CGPoint p[4], CGFloat t0, CGFloat t1, CGPoint out[4]) 
         // 图标也用强调色，整体更协调
         self.previewIcon.backgroundColor = col;
 
-        NSInteger locMode = [[self readValueForKey:@"locationMode" default:@0 expectedClass:[NSNumber class]] integerValue];
+        NSInteger locMode = MKEffectiveMode(); // v2.0.66.122: 非混搭读主模式, 混搭读主屏子键
         if (locMode == 1) {
             NSInteger corner = [[self readValueForKey:@"badgeCorner" default:@0 expectedClass:[NSNumber class]] integerValue];
             NSArray *names = @[@"左上", @"右上", @"左下", @"右下"];
@@ -505,7 +621,7 @@ static void MKPvSub(const CGPoint p[4], CGFloat t0, CGFloat t1, CGPoint out[4]) 
 #pragma mark - 按 locationMode 置灰无关控件 (v2.0.66.86)
 
 // 当前显示位置模式下，哪些偏好项是【无作用】的 → 置灰 + 禁交互。
-//   locationMode: 0 = 替换名称(MKLocationReplace)  1 = 角标(MKLocationBadge)
+//   locationMode: 0 = 替换名称(MKLocationReplace)  1 = 角标(MKLocationBadge)  2 = 底沿下划线(MKLocationUnderline)
 //
 // 角标模式无关项:
 //   shape/dotSize/barWidth/barHeight —— 角标只画弧线, 形状与点/横条尺寸全不读取。
@@ -514,20 +630,73 @@ static void MKPvSub(const CGPoint p[4], CGFloat t0, CGFloat t1, CGPoint out[4]) 
 // 替换名称模式无关项:
 //   badgeCorner/badgeThickness/badgeInset/badgeArcLength —— 角标专属几何参数。
 //
-// ⚠️ 不置灰 enabled/colorMode/color/customColor/opacity/locationMode: 两模式共用。
+// ⚠️ 不置灰 enabled/colorMode/color/customColor/opacity/locationMode/locationModeHome/locationModeDock/locationModeFolder: 三模式共用 (下划线模式已含替换模式专属参数)。
 static BOOL MKKeyDisabledForMode(NSString *key, NSInteger mode) {
     if (!key.length) return NO;
     if (mode == 1) { // 角标模式
         static NSSet *badgeOff = nil;
         if (!badgeOff) badgeOff = [NSSet setWithArray:@[ @"shape", @"dotSize", @"barWidth",
                                                         @"barHeight", @"keepBetaDot",
-                                                        @"folderIndicators" ]];
+                                                        @"folderIndicators",
+                                                        @"underlineWidthRatio",
+                                                        @"underlineThickness",
+                                                        @"underlineGap" ]];
         return [badgeOff containsObject:key];
+    }
+    // v2.0.66.114: 底沿下划线模式 —— 专属参数是 underline*; 角标 + 替换模式专属参数都用不到。
+    //   注: 三种模式都【不藏名】, 故与角标共用「不置灰」名单(enabled/colorMode/color/
+    //   customColor/opacity/locationMode)。⚠️ 2026-10-06 修正: 之前漏掉替换模式专属参数
+    //   → 下划线模式下替换模式的开关仍亮着; 现补 shape/dotSize/barWidth/barHeight/keepBetaDot/
+    //   folderIndicators, 与角标模式(mode 1)一致地整组置灰。
+    if (mode == 2) { // 底沿下划线
+        static NSSet *underlineOff = nil;
+        if (!underlineOff) underlineOff = [NSSet setWithArray:@[ @"badgeCorner", @"badgeThickness",
+                                                                @"badgeInset", @"badgeArcLength",
+                                                                @"shape", @"dotSize", @"barWidth",
+                                                                @"barHeight", @"keepBetaDot",
+                                                                @"folderIndicators" ]];
+        return [underlineOff containsObject:key];
     }
     static NSSet *replaceOff = nil;
     if (!replaceOff) replaceOff = [NSSet setWithArray:@[ @"badgeCorner", @"badgeThickness",
-                                                         @"badgeInset", @"badgeArcLength" ]];
+                                                         @"badgeInset", @"badgeArcLength",
+                                                         @"underlineWidthRatio",
+                                                         @"underlineThickness",
+                                                         @"underlineGap" ]];
     return [replaceOff containsObject:key];
+}
+
+// v2.0.66.121: 混搭模式 —— 置灰按【三个分区模式的并集】判定: 某控件仅当它在「所有」当前生效的
+//   分区模式下都无作用时才置灰(否则只要有一个分区用到它就该亮)。例: shape(替换专属) 仅当没有任何
+//   分区为替换模式时才灰; badgeCorner(角标专属) 仅当没有任何分区为角标模式时才灰; 三模式共用项
+//   (enabled/color/opacity/三分区模式键) 因各模式下 MKKeyDisabledForMode 均返 NO → 永不灰。
+static NSInteger MKReadIntPref(NSString *key) {
+    CFPropertyListRef v = CFPreferencesCopyAppValue(
+        (__bridge CFStringRef)key,
+        (__bridge CFStringRef)kPrefsDomain);
+    if (v) {
+        id obj = (__bridge_transfer id)v;
+        if ([obj isKindOfClass:[NSNumber class]]) return [obj integerValue];
+    }
+    return 0;
+}
+// v2.0.66.122: 预览/读取用的「当前生效主模式」。非混搭 → 主模式; 混搭 → 主屏子键(预览单图标反映主屏)。
+static NSInteger MKEffectiveMode(void) {
+    NSInteger master = MKReadIntPref(@"locationMode");
+    if (master != 3) return master;
+    return MKReadIntPref(@"locationModeHome");
+}
+static BOOL MKKeyDisabledForAnyMode(NSString *key) {
+    if (!key.length) return NO;
+    // v2.0.66.122: 非混搭 → 按主模式单键判定; 混搭 → 三分区并集(与前版一致)。
+    NSInteger master = MKReadIntPref(@"locationMode");
+    if (master != 3) return MKKeyDisabledForMode(key, master);
+    NSInteger home   = MKReadIntPref(@"locationModeHome");
+    NSInteger dock   = MKReadIntPref(@"locationModeDock");
+    NSInteger folder = MKReadIntPref(@"locationModeFolder");
+    return MKKeyDisabledForMode(key, home)
+        && MKKeyDisabledForMode(key, dock)
+        && MKKeyDisabledForMode(key, folder);
 }
 
 // 对一个 cell 施加/解除「灰化」。
@@ -565,7 +734,164 @@ static void MKApplyDimmed(UITableViewCell *cell, BOOL dimmed) {
     }
 }
 
+// v2.0.66.119: 大号滑块卡片 —— 把 PSSliderCell 重排成「标题左 / 数值右 / 通栏滑块」卡片。
+//   动机: 原来 10 个滑块外观完全一致, 用户看不出哪条调哪个参数(尤其下划线三条
+//   宽度/粗细/距离)。分行布局 + 常显数值后, 每条滑块自解释。
+// ⚠️ v2.0.66.119 起改为【自建 UISlider】: 原生滑块藏死不再复用(见函数内注释),
+//    持久化仍走 PSSliderCell 原生链路(拖动值转发回去触发它自己的 value-changed)。
+static NSString *MKSliderDisplayValue(PSSpecifier *spec, id current) {
+    CGFloat v = [current respondsToSelector:@selector(floatValue)] ? [current floatValue] : 0.0f;
+    NSString *k = [spec propertyForKey:@"key"] ?: @"";
+    // 比例类参数(%) 显示百分号; 其余显示 pt, 去掉无意义的 .0
+    if ([k hasSuffix:@"Ratio"] || [k hasSuffix:@"Length"]) {
+        return [NSString stringWithFormat:@"%.0f%%", v];
+    }
+    if (fabs(v - (long)v) < 0.005f) return [NSString stringWithFormat:@"%ld", (long)v];
+    return [NSString stringWithFormat:@"%.1f", v];
+}
+
+// v2.0.66.119: 自建滑块拖动 —— 数值 label 同步 + 转发给 PSSliderCell 的原生滑块。
+// ⚠️ 写入绝不自己做: 把值塞回原生滑块再 sendActions, 由 PSSliderCell 自己的
+//    value-changed 链路完成「写偏好 + 发 Darwin 通知 + 头图实时预览」, 行为零差异。
+- (void)mk_ownSliderChanged:(UISlider *)sender {
+    @try {
+        UITableViewCell *cell = nil;
+        UIView *v = sender;
+        while (v && !cell) {
+            if ([v isKindOfClass:[UITableViewCell class]]) cell = (UITableViewCell *)v;
+            v = v.superview;
+        }
+        if (!cell) return;
+        // 1) 转发给原生滑块(它在 PSSliderCell 里挂着真正的持久化 target)
+        UISlider *orig = nil;
+        @try {
+            if ([cell respondsToSelector:@selector(control)]) {
+                id c = [(NSObject *)cell control];
+                if ([c isKindOfClass:[UISlider class]]) orig = (UISlider *)c;
+            }
+        } @catch (NSException *e) {}
+        if (orig && orig != sender) {
+            orig.value = sender.value;
+            [orig sendActionsForControlEvents:UIControlEventValueChanged];
+            // 若 PSSliderCell 在自己的处理器里做了分段吸附, 把吸附结果回贴到自建滑块
+            if (fabs(orig.value - sender.value) > 0.0001f) sender.value = orig.value;
+        }
+        // 2) 同步右上角数值
+        PSSpecifier *spec = nil;
+        if ([cell respondsToSelector:@selector(specifier)]) {
+            id s = [(NSObject *)cell specifier];
+            if ([s isKindOfClass:[PSSpecifier class]]) spec = (PSSpecifier *)s;
+        }
+        for (UIView *sub in [cell.contentView subviews]) {
+            if (sub.tag == 8611 && [sub isKindOfClass:[UILabel class]]) {
+                ((UILabel *)sub).text = MKSliderDisplayValue(spec, @(sender.value));
+            }
+        }
+    } @catch (NSException *e) {}
+}
+
 #pragma mark - 玻璃卡片（同 section 多行共用一张卡片）
+
+// v2.0.66.118: 按【cell 实际高度】摆放四件套(标题/数值/滑块) —— 绝不写死 y=44。
+// 🔴 .116 把滑块写死在 y=44: 一旦行高没真的抬到 78(PSListController 无视 rowHeight),
+//    滑块整条落在 contentView 之外被裁掉 = 「滑块不见了」。这里按 H 自适应:
+//      H >= 66 → 两行卡片(标题/数值在上, 通栏滑块在下)
+//      H <  66 → 退化成单行紧凑(标题左/滑块中/数值右), 宁可小也绝不出界。
+// 🔴 标题必须用【自建 label】: .116 实机截图证实 PSSliderCell 的标题跟滑块同住
+//    accessoryView 容器, 摘走滑块 + accessoryView=nil 时标题被一起扔掉 → 只剩数值。
+//    cell.textLabel 里根本没有字, 不能指望它。
+static void MKApplyBigSliderFrames(UITableViewCell *cell, UISlider *slider, UILabel *val, UILabel *title) {
+    if (!cell || !slider) return;
+    CGFloat W = cell.contentView.bounds.size.width;
+    CGFloat H = cell.contentView.bounds.size.height;
+    if (W <= 0.0f) W = 320.0f;
+    if (H <= 0.0f) H = 44.0f;
+    if (H >= 66.0f) {
+        if (title) title.frame = CGRectMake(16.0f, 10.0f, W * 0.58f, 24.0f);
+        if (val)   val.frame   = CGRectMake(W * 0.62f, 12.0f, W * 0.38f - 16.0f, 20.0f);
+        slider.frame = CGRectMake(16.0f, H - 34.0f, W - 32.0f, 28.0f);
+    } else {
+        if (title) title.frame = CGRectMake(16.0f, (H - 22.0f) / 2.0f, W * 0.30f, 22.0f);
+        slider.frame = CGRectMake(W * 0.36f, (H - 28.0f) / 2.0f, W * 0.38f, 28.0f);
+        if (val)   val.frame   = CGRectMake(W * 0.76f, (H - 20.0f) / 2.0f, W * 0.24f - 16.0f, 20.0f);
+    }
+}
+
+// 把一个 PSSliderCell 改造成大号两行卡片布局。返回 NO 表示不是滑块行, 调用方走原逻辑。
+// owner = 本控制器(static 函数里没有 self, target 要靠它传进来)。
+static BOOL MKLayoutBigSliderCell(id owner, UITableViewCell *cell, PSSpecifier *spec) {
+    NSString *cellCls = [spec propertyForKey:@"cell"] ?: @"";
+    if ([cellCls rangeOfString:@"Slider"].location == NSNotFound) return NO;
+    if (![cell respondsToSelector:@selector(control)]) return NO;
+
+    UISlider *slider = nil;
+    @try {
+        id c = [(NSObject *)cell control];
+        if ([c isKindOfClass:[UISlider class]]) slider = (UISlider *)c;
+    } @catch (NSException *e) {}
+    if (!slider) return NO;
+
+    // 行高由 -tableView:heightForRowAtIndexPath: 抬到 78(见文件上方)。
+    // ⚠️ UITableViewCell 没有 .height 属性(误用会编译失败), 高度只能在 tableView 侧决定。
+    // 🔴 v2.0.66.118: 标题一律【自建 label】, 不用 cell.textLabel ——
+    //    PSSliderCell 的标题与滑块同住 accessoryView 容器, 摘滑块时标题已被一起扔掉
+    //    (实机截图: 行里只剩数值)。自带的 textLabel 若有内容反而会造成重复, 藏掉。
+    cell.textLabel.hidden = YES;
+    cell.textLabel.text   = nil;
+    cell.textLabel.numberOfLines = 1;
+
+    // 自建标题：左上。字重/颜色对齐其他设置行(systemFont regular + labelColor), 字号 14(比 15 再小一档)
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectZero];
+    title.tag = 8613;
+    title.font = [UIFont systemFontOfSize:14.0f weight:UIFontWeightRegular];
+    title.textColor = [UIColor labelColor];
+    title.backgroundColor = [UIColor clearColor];
+    title.numberOfLines = 1;
+    title.text = [spec propertyForKey:@"label"] ?: @"";
+    [cell.contentView addSubview:title];
+    title.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleBottomMargin;
+
+    // 数值：右上, 15pt 等宽数字, 次级色。值直接取滑块当前位置 —— 与拖动天然同步,
+    // 无需另挂 KVO/target(避免与 PSSliderCell 自身的 value-changed 链路打架)。
+    UILabel *val = [[UILabel alloc] initWithFrame:CGRectZero];
+    val.tag = 8611;
+    val.font = [UIFont monospacedDigitSystemFontOfSize:15.0f weight:UIFontWeightRegular];
+    val.textColor = [UIColor secondaryLabelColor];
+    val.textAlignment = NSTextAlignmentRight;
+    val.backgroundColor = [UIColor clearColor];
+    val.text = MKSliderDisplayValue(spec, @(slider.value));
+    [cell.contentView addSubview:val];
+    val.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleBottomMargin;
+
+    // 🔴 v2.0.66.119: 滑块一律【自建 UISlider】, 不再复用 PSSliderCell 的原生滑块。
+    //    .118 实机: 即便把原生滑块摘进 contentView 摆好, 它随后仍被 PSSliderCell 自己的
+    //    布局/容器接管(摘走或藏掉) → 行里只剩标题+数值。自建的它动不了。
+    //    拖动经 mk_ownSliderChanged: 转发给原生滑块 → 持久化/通知/头图预览零差异。
+    UISlider *mine = [[UISlider alloc] initWithFrame:CGRectZero];
+    mine.tag = 8614;
+    mine.minimumValue = slider.minimumValue;
+    mine.maximumValue = slider.maximumValue;
+    mine.value        = slider.value;
+    mine.continuous   = slider.continuous;
+    [mine addTarget:owner action:@selector(mk_ownSliderChanged:)
+   forControlEvents:UIControlEventValueChanged];
+    mine.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
+    [cell.contentView addSubview:mine];
+
+    // 原生滑块: 摘下来并藏死, 防止它的布局把它递回来造成重复
+    [slider removeFromSuperview];
+    slider.hidden = YES;
+    cell.accessoryView = nil;
+
+    // 已填充轨道用 tintColor, 未填充轨道淡灰; 保留系统默认大圆钮
+    mine.minimumTrackTintColor = [UIColor systemBlueColor];
+    mine.maximumTrackTintColor = [[UIColor systemFillColor] colorWithAlphaComponent:0.35f];
+
+    // ⚠️ 坐标一律走自适应函数, 不写死 —— 行高没抬起来时退化为单行, 滑块绝不越界。
+    MKApplyBigSliderFrames(cell, mine, val, title);
+
+    return YES;
+}
 
 - (void)tableView:(UITableView *)tableView
   willDisplayCell:(UITableViewCell *)cell
@@ -621,20 +947,9 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
             bg.layer.cornerRadius = kCardRadius;
         }
 
-        // 非末行加底部分隔线，让同 section 多行看起来像一张卡片内的多行
-        if (!isLast) {
-            UIView *sep = [[UIView alloc] init];
-            if (@available(iOS 13.0, *)) {
-                sep.backgroundColor = [[UIColor separatorColor] colorWithAlphaComponent:0.30f];
-            } else {
-                sep.backgroundColor = [UIColor colorWithWhite:0.0f alpha:0.08f];
-            }
-            // 初始按 44pt 标准 cell 高 + 320pt 宽，靠 autoresizing 适配真实尺寸
-            sep.frame = CGRectMake(16.0f, 43.5f, 288.0f, 0.5f);
-            sep.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
-            [bg addSubview:sep];
-        }
-
+        // v2.0.66.125: 移除卡片内部分隔黑线 —— 原 `.117` 给非末行加的 sep(tag 8612) 在半透明
+        //   玻璃卡 + 模糊暗背景上被看成一条黑线, 且只画在非末行(分组标题下 + 同组倒数第二行),
+        //   导致「部分设置项底部有黑线」。现整段删除: 卡片改为无缝玻璃, 仅靠圆角拼出分组整体性。
         cell.backgroundView = bg;
 
         // label 背景透明，文字才浮在玻璃上
@@ -650,16 +965,71 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
             if ([s isKindOfClass:[PSSpecifier class]]) spec = (PSSpecifier *)s;
         }
         NSString *rowKey = spec ? [spec propertyForKey:@"key"] : nil;
+        // v2.0.66.116: 滑块行改造成大号两行卡片(标题/数值/通栏滑块三层)。
+        //   放在灰化判定【之前】—— 灰化只改 userInteractionEnabled + alpha, 与布局正交。
+        if (spec) {
+            // 先清掉上一次布局可能残留的自建视图(cell 复用), 再重建 ——
+            //   顺序反了会把刚建好的那个也删掉。(8611=数值, 8613=标题, 8614=自建滑块)
+            for (UIView *v in [cell.contentView subviews]) {
+                if (v.tag == 8611 || v.tag == 8613 || v.tag == 8614) [v removeFromSuperview];
+            }
+            if (MKLayoutBigSliderCell(self, cell, spec)) {
+                // v2.0.66.117: 行高走【逐行回调 + 缓存】, 不再碰全局 rowHeight。
+                //   首帧 super 可能仍返 44(即它没读 specifier 的 height 属性) → 记下
+                //   「本行=滑块, 要 78」, 再让 tableView 重算一次高度
+                //   (空 beginUpdates/endUpdates 即触发重查)。缓存命中后不再触发, 不会自激循环。
+                if (!self.rowHeights) self.rowHeights = [NSMutableDictionary dictionary];
+                if (![self.rowHeights objectForKey:indexPath]) {
+                    [self.rowHeights setObject:[NSNumber numberWithFloat:78.0f] forKey:indexPath];
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        @try {
+                            [tableView beginUpdates];
+                            [tableView endUpdates];
+                        } @catch (NSException *e) {}
+                    });
+                }
+                // v2.0.66.119: 行高变化后(44→78)再贴一次坐标, 让滑块从紧凑行切换到通栏。
+                //   自建滑块(tag 8614)谁也动不了, 这里纯粹是几何刷新。
+                UISlider *sl = nil;
+                for (UIView *v in [cell.contentView subviews]) {
+                    if (v.tag == 8614 && [v isKindOfClass:[UISlider class]]) sl = (UISlider *)v;
+                }
+                if (sl) {
+                    UITableViewCell *theCell = cell;
+                    UISlider *theSlider = sl;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        @try {
+                            if (theSlider.superview != theCell.contentView) return;
+                            UILabel *v = nil, *t = nil;
+                            for (UIView *sub in [theCell.contentView subviews]) {
+                                if (![sub isKindOfClass:[UILabel class]]) continue;
+                                if (sub.tag == 8611) v = (UILabel *)sub;
+                                else if (sub.tag == 8613) t = (UILabel *)sub;
+                            }
+                            MKApplyBigSliderFrames(theCell, theSlider, v, t);
+                        } @catch (NSException *e) {}
+                    });
+                }
+            }
+        }
         // v2.0.66.93: 无 key 的行 = 操作按钮(PSButtonCell「恢复默认 / 注销」)。
         //   MKApplyDimmed(cell, NO) 会把 textLabel.textColor 强写成 labelColor,
         //   把按钮文字画成普通黑字, 失去「这是可点操作」的视觉线索(PSButtonCell 本应用 tintColor)。
         //   故这类行【整段跳过灰化逻辑】, 保留系统默认外观。
         //   现有 16 个偏好行全部带 key, 此分支对它们无影响。
         if (rowKey != nil) {
-            NSInteger mode = [[self readValueForKey:@"locationMode"
-                                            default:@0
-                                      expectedClass:[NSNumber class]] integerValue];
-            MKApplyDimmed(cell, MKKeyDisabledForMode(rowKey, mode));
+            BOOL dimmed = MKKeyDisabledForAnyMode(rowKey);
+            MKApplyDimmed(cell, dimmed);
+            // v2.0.66.119: 自建标题/数值/滑块不在 -control 链路上, 灰化要单独跟上,
+            //   否则滑块已半透明而标题仍是全黑, 视觉上不成一组。
+            for (UIView *v in [cell.contentView subviews]) {
+                if (v.tag == 8611 || v.tag == 8613) v.alpha = dimmed ? 0.40f : 1.0f;
+                if (v.tag == 8614 && [v isKindOfClass:[UIControl class]]) {
+                    UIControl *c = (UIControl *)v;
+                    c.enabled = !dimmed;
+                    c.alpha   = dimmed ? 0.40f : 1.0f;
+                }
+            }
         }
 
         // v2.0.24: folderIndicatorMode 选择已移除，代表 App 固定为位置靠前活跃（原 mode 0）。
@@ -753,7 +1123,8 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
 
     // v2.0.66.86: 切换「显示位置」模式 → 整表重载, 让 willDisplayCell: 重新按新模式
     //   计算灰化状态 (仅 reloadSpecifier 只刷本行, 其他行的灰/亮不会跟着变)。
-    if ([key isEqualToString:@"locationMode"]) {
+    if ([key isEqualToString:@"locationMode"] || [key isEqualToString:@"locationModeHome"]
+        || [key isEqualToString:@"locationModeDock"] || [key isEqualToString:@"locationModeFolder"]) {
         @try { [self reloadSpecifiers]; } @catch (NSException *e) {}
     }
 

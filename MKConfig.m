@@ -120,10 +120,34 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
     return YES;
 }
 
-// v2.0.66.80: 位置模式，默认替换名称
+// v2.0.66.80: 位置模式(主模式选择器), 默认替换名称
+// v2.0.66.122: 钳制 [0,3] —— 0=替换 1=角标 2=下划线 3=混搭(第4项)。越界/缺省一律回落 MKLocationReplace。
 - (MKLocationMode)locationMode {
     id v = _prefs[@"locationMode"];
-    return v ? (MKLocationMode)[v integerValue] : MKLocationReplace;
+    if (!v) return MKLocationReplace;
+    NSInteger m = [v integerValue];
+    return (m >= 0 && m <= 3) ? (MKLocationMode)m : MKLocationReplace;
+}
+// v2.0.66.122: 混搭模式三分区独立子键 —— 仅当主模式(locationMode)为 MKLocationMixed 时生效;
+//   非混搭时三分区共用主模式, 子键不参与计算(故移除旧键「locationMode 作主屏别名」的回落,
+//   避免主模式==3 被误读为某分区模式)。各子键钳制 [0,2]。
+- (MKLocationMode)locationModeHome {
+    id v = _prefs[@"locationModeHome"];
+    if (!v) return MKLocationReplace;
+    NSInteger m = [v integerValue];
+    return (m >= 0 && m <= 2) ? (MKLocationMode)m : MKLocationReplace;
+}
+- (MKLocationMode)locationModeDock {
+    id v = _prefs[@"locationModeDock"];
+    if (!v) return MKLocationReplace;
+    NSInteger m = [v integerValue];
+    return (m >= 0 && m <= 2) ? (MKLocationMode)m : MKLocationReplace;
+}
+- (MKLocationMode)locationModeFolder {
+    id v = _prefs[@"locationModeFolder"];
+    if (!v) return MKLocationReplace;
+    NSInteger m = [v integerValue];
+    return (m >= 0 && m <= 2) ? (MKLocationMode)m : MKLocationReplace;
 }
 // v2.0.66.80: 角标角落，默认左上
 - (MKBadgeCorner)badgeCorner {
@@ -152,6 +176,26 @@ static NSString * const kPrefsDomain = @"com.mk.runningdotindicatorprefs";
     CGFloat p = v ? [v floatValue] : 90.0f;
     if (p < 60.0f) p = 60.0f; else if (p > 100.0f) p = 100.0f;
     return p / 100.0f;
+}
+
+// v2.0.66.114: 底沿下划线几何三参数。钳制形态照抄 badgeThickness/badgeInset(L136-146) 同款。
+// ⚠️ underlineWidthRatio 的 plist 存【百分数 30~90】(滑块直观, 与 badgeArcLength 同款约定),
+//    此处换算为 0.30~0.90 小数。漏掉这次 /100 会让 55 被钳成 0.30(永远最窄)。
+- (CGFloat)underlineWidthRatio {
+    id v = _prefs[@"underlineWidthRatio"];
+    CGFloat p = v ? [v floatValue] : 55.0f;
+    if (p < 30.0f) p = 30.0f; else if (p > 90.0f) p = 90.0f;
+    return p / 100.0f;
+}
+- (CGFloat)underlineThickness {
+    id v = _prefs[@"underlineThickness"];
+    CGFloat t = v ? [v floatValue] : 2.0f;
+    return (t < 1.0f) ? 1.0f : (t > 4.0f ? 4.0f : t);
+}
+- (CGFloat)underlineGap {
+    id v = _prefs[@"underlineGap"];
+    CGFloat g = v ? [v floatValue] : 1.0f;
+    return (g < 0.0f) ? 0.0f : (g > 4.0f ? 4.0f : g);
 }
 
 + (UIColor *)colorFromHex:(NSString *)hex {
