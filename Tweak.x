@@ -227,7 +227,7 @@ static NSString *MKLabelToBid(UIView *label);
 static NSString *MKRunningBidForLabel(UIView *label); // v2.0.66.108: 容器无关实时藏名反查
 static void MKInstallLabelHook(void);
 // v2.0.66.103: 几何缓存(定义紧随 MKRepositionIndicator 之后)
-static void MKCacheGeoForBid(NSString *bid, SBIconView *iv, UIView *overlay, MKConfig *cfg);
+static void MKCacheGeoForBid(NSString *bid, SBIconView *iv, UIView *overlay, MKConfig *cfg, BOOL persist);
 static CGRect MKIndicatorFrameFromCache(NSString *bid, UIView *overlay, MKConfig *cfg);
 static CGFloat MKIconCornerRadiusFromCache(NSString *bid);
 static void MKScheduleGeoCacheSave(void);   // v2.0.66.107: 几何缓存去抖落盘(定义在 MKIconCornerRadiusFromCache 之后)
@@ -730,7 +730,7 @@ static void MKRepositionIndicator(NSString *bid, SBIconView *iv, MKConfig *cfg) 
     UIView *container = MKContainerForIconView((UIView *)iv);
     UIView *overlay = MKOverlayForContainer(container);
     if (!overlay) return;
-    MKCacheGeoForBid(bid, iv, overlay, cfg);   // v2.0.66.103: 每次重定位都刷新几何缓存(图标可见时)
+    MKCacheGeoForBid(bid, iv, overlay, cfg, YES);   // v2.0.66.103: 每次重定位都刷新几何缓存(图标可见时)
     CGRect f = MKIndicatorFrameInOverlay(iv, overlay, cfg);
     if (!CGRectIsEmpty(f)) {
         ind.frame = f; ind.hidden = NO;
@@ -747,7 +747,7 @@ static void MKRepositionIndicator(NSString *bid, SBIconView *iv, MKConfig *cfg) 
 
 // v2.0.66.103: 几何缓存写入 —— 在图标可见(必经 MKUpdate / MKRepositionIndicator)时, 把「overlay 坐标系下的图标几何」落库。
 //   图标位置在页内固定, 不随滚动/卸载变化 → 缓存值对离屏页永久有效, 切模式时可原地重画。
-static void MKCacheGeoForBid(NSString *bid, SBIconView *iv, UIView *overlay, MKConfig *cfg) {
+static void MKCacheGeoForBid(NSString *bid, SBIconView *iv, UIView *overlay, MKConfig *cfg, BOOL persist) {
     if (!bid || !iv || !overlay || !cfg) return;
     if (!sBidToMode) sBidToMode = [NSMutableDictionary dictionary];
     sBidToMode[bid] = @(MKLocationModeForIconView((UIView *)iv)); // v2.0.66.121: 离屏几何缓存同时记分区模式
@@ -774,7 +774,10 @@ static void MKCacheGeoForBid(NSString *bid, SBIconView *iv, UIView *overlay, MKC
         if (!sBidToReplaceR) sBidToReplaceR = [NSMutableDictionary dictionary];
         sBidToReplaceR[bid] = [NSValue valueWithCGRect:rr];
     }
-    MKScheduleGeoCacheSave();   // v2.0.66.107: 去抖落盘(跨 respring 保留几何缓存)
+    // v2.0.66.130: persist=NO 时只写内存缓存、不调度落盘 —— 供文件夹指示器(__folder__%p 指针键)使用:
+    //   指针键跨 respring 会变, 落盘后指针复用会撞库(旧模式/旧几何套到新文件夹上)。文件夹图标位置
+    //   在会话内稳定, 内存缓存已足够支撑切模式时的原地迁移; 跨 respring 由首次 MKUpdate 重新落库。
+    if (persist) MKScheduleGeoCacheSave();   // v2.0.66.107: 去抖落盘(跨 respring 保留几何缓存)
 }
 // v2.0.66.103: 离屏图标(反查失败)用缓存几何原地重画, 不删。overlay 即指示器当前 superview(坐标一致)。
 static CGRect MKIndicatorFrameFromCache(NSString *bid, UIView *overlay, MKConfig *cfg) {
@@ -3710,6 +3713,13 @@ static void MKUpdate(SBIconView *self) {
                 dispatch_async(dispatch_get_main_queue(), ^{ MKUpdate(self); });
                 return;
             }
+            // v2.0.66.130: 文件夹指示器也落几何/分区缓存(仅内存 persist=NO)。此前 FICON 分支从不调
+            //   MKCacheGeoForBid → 文件夹 bid(__folder__%p) 无 sBidToSection/sBidToReplaceR/sBidToBadgeR
+            //   → MKMigrateIndicatorsInPlace 对文件夹 bid 必缓存未命中而 continue 跳过, 且 .127 的 migBids
+            //   并集根本不含文件夹 bid → 切模式后离屏文件夹指示器停留旧模式, 只能等 live refresh 够到才纠正
+            //   (常规 App 有缓存可原地迁移, 文件夹不能 —— 鲁棒性不对称)。放在 create/reuse 分叉前,
+            //   创建与复用两条路都覆盖; 该路径仅在首次布局/内容变更时进入(gen-skip 已是热路径捷径), 非每帧。
+            MKCacheGeoForBid(fBid, (SBIconView *)self, overlay, fCfg, NO);
             CGRect indicatorFrame = MKIndicatorFrameInOverlay((SBIconView *)self, overlay, fCfg);
             UIView *indicator = MKFindIndicator(fBid);
             if (!indicator) {
@@ -3987,7 +3997,7 @@ static void MKUpdate(SBIconView *self) {
             return;
         }
         CGRect indicatorFrame = MKIndicatorFrameInOverlay(self, overlay, cfg);
-        MKCacheGeoForBid(bundleID, self, overlay, cfg);   // v2.0.66.103: 图标可见时刷新几何缓存(离屏页切模式即时重画用)
+        MKCacheGeoForBid(bundleID, self, overlay, cfg, YES);   // v2.0.66.103: 图标可见时刷新几何缓存(离屏页切模式即时重画用)
 
         // v1.6.64: 统一用「按 bid 索引的 overlay 指示器」作为唯一真相来源（替代旧的 self 子视图关联）。
         indicator = MKFindIndicator(bundleID);
@@ -5047,6 +5057,11 @@ static void MKPrefsChangedCallback(CFNotificationCenterRef center, void *observe
             UIView *ind = [sBidToIndicator objectForKey:bid];
             if (![ind isKindOfClass:[MKIndicatorDotView class]]) continue;
             [(MKIndicatorDotView *)ind setBadgeCorner:cfg.badgeCorner];
+            // v2.0.66.130: 同模式参数变更也要同步 alpha —— applyConfig(唯一设 self.alpha=cfg.opacity 处)
+            //   只在创建/切模式/迁移调用, 拖「不透明度」滑块(模式不变)走本循环时无 alpha 更新 →
+            //   已存在指示器保持旧透明度, 直到切模式/respring/重建才变。与 setBadgeCorner 同层级(覆盖所有
+            //   指示器, 与 iv 可达性无关)。稳态下 alpha 已等于 cfg.opacity, 赋值是幂等空操作。
+            ind.alpha = cfg.opacity;
             UIView *ov = ind.superview;
             if (ov) {
                 NSValue *ovKey = [NSValue valueWithPointer:(__bridge const void *)ov];
